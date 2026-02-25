@@ -1,0 +1,140 @@
+# =================================================================
+# FastAPI 보일러플레이트 - .gitignore
+# =================================================================
+
+# ===== Python 관련 =====
+# 컴파일된 Python 파일
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 배포 / 패키징
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# ===== 환경 설정 =====
+# 가상환경
+.env/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 환경 변수 (보안 중요!)
+.env
+.env.*
+.env.local
+.env.production
+!.env.example
+
+# Python 버전 관리
+.python-version
+.pip-cache/
+
+# ===== Claude Code 관련 =====
+.claude
+.mcp.json
+CLAUDE.md
+*_custom_prompt.md
+compact_custom_prompt.md
+
+# ===== 로그 및 데이터베이스 =====
+# 로그 파일
+*.log
+logs/
+
+# 데이터베이스 파일
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# ===== 테스트 및 커버리지 =====
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# ===== IDE/에디터 =====
+# Visual Studio Code
+.vscode/
+
+# IntelliJ IDEA / PyCharm
+.idea/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 타입 체커
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ===== OS 생성 파일 =====
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+ehthumbs.db
+Thumbs.db
+
+# ===== 보안 파일 =====
+# SSL 인증서 및 키
+*.key
+*.pem
+*.crt
+*.cert
+
+# ===== 임시 파일 =====
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ===== Alembic 마이그레이션 (로컬 개발용) =====
+alembic/versions/
+
+# ===== Docker =====
+docker-compose.override.yml
