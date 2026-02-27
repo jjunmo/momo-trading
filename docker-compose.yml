@@ -1,0 +1,44 @@
+services:
+  momo-trading:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: momo-trading
+    ports:
+      - "9000:9000"
+    env_file:
+      - .env
+    environment:
+      - KIS_MCP_URL=http://kis-mcp:3000/sse
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      kis-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+
+  kis-mcp:
+    build:
+      context: ./docker/kis-mcp
+      dockerfile: Dockerfile
+    container_name: kis-mcp-server
+    ports:
+      - "3100:3000"
+    environment:
+      - KIS_APP_KEY=${KIS_PAPER_APP_KEY:-${KIS_APP_KEY}}
+      - KIS_APP_SECRET=${KIS_PAPER_APP_SECRET:-${KIS_APP_SECRET}}
+      - KIS_ACCOUNT_TYPE=${KIS_ACCOUNT_TYPE:-VIRTUAL}
+      - KIS_CANO=${KIS_PAPER_STOCK:-${KIS_ACCT_STOCK}}
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf --max-time 2 http://localhost:3000/sse || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

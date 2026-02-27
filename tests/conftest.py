@@ -1,53 +1,55 @@
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import StaticPool, create_engine
-from sqlalchemy.orm import sessionmaker
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import StaticPool
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from core.database import get_db, get_db_with_transaction
-from main import app
+from core.database import get_async_db, get_async_db_with_transaction
 from models.base import Base
 
-# ── Sync Test DB ──
-SYNC_TEST_DB_URL = "sqlite://"
+# ── Async Test DB (in-memory SQLite) ──
+ASYNC_TEST_DB_URL = "sqlite+aiosqlite://"
 
-test_engine = create_engine(
-    SYNC_TEST_DB_URL,
+test_async_engine = create_async_engine(
+    ASYNC_TEST_DB_URL,
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
-TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+TestAsyncSessionLocal = async_sessionmaker(
+    test_async_engine, expire_on_commit=False
+)
 
 
-def override_get_db():
-    db = TestSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+async def override_get_async_db():
+    async with TestAsyncSessionLocal() as session:
+        yield session
 
 
-def override_get_db_with_transaction():
-    db = TestSessionLocal()
-    try:
-        with db.begin():
-            yield db
-    except Exception:
-        raise
-    finally:
-        db.close()
-
-
-app.dependency_overrides[get_db] = override_get_db
-app.dependency_overrides[get_db_with_transaction] = override_get_db_with_transaction
+async def override_get_async_db_with_transaction():
+    async with TestAsyncSessionLocal() as session:
+        async with session.begin():
+            yield session
 
 
 @pytest.fixture(scope="session", autouse=True)
-def create_tables():
-    Base.metadata.create_all(bind=test_engine)
+async def create_tables():
+    async with test_async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     yield
-    Base.metadata.drop_all(bind=test_engine)
+    async with test_async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
 
 
 @pytest.fixture()
-def client():
-    return TestClient(app)
+async def client():
+    from main import app
+
+    app.dependency_overrides[get_async_db] = override_get_async_db
+    app.dependency_overrides[get_async_db_with_transaction] = (
+        override_get_async_db_with_transaction
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
