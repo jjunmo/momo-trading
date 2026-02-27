@@ -10,3 +10,18 @@ loguru>=0.7.0
 httpx>=0.28.0
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
+
+# 기술적 분석
+pandas>=2.2.0
+numpy>=1.26.0
+pandas-ta>=0.3.14b1
+
+# 실시간 통신
+websockets>=15.0.0
+
+# 스케줄러
+apscheduler>=3.10.0
+holidays>=0.60
+
+# Admin SSE
+sse-starlette>=2.0.0

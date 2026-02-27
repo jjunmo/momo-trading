@@ -133,8 +133,8 @@ temp/
 *.tmp
 *.bak
 
-# ===== Alembic 마이그레이션 (로컬 개발용) =====
-alembic/versions/
+# ===== Alembic 마이그레이션 =====
+alembic/versions/__pycache__/
 
 # ===== Docker =====
 docker-compose.override.yml

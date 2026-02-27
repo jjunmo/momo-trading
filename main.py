@@ -1,27 +1,82 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from api.router import api_router
 from core.config import settings
-from core.database import engine
+from core.events import event_bus
 from core.logging import setup_logging
 from exceptions.common import ServiceException
 from middleware.request_id import RequestIDMiddleware
-from models.base import Base
+from models import Base  # noqa: F401 - 모든 모델 import하여 metadata에 등록
 from schemas.common import BasicErrorResponse
+from trading.mcp_client import mcp_client
 from util.time_util import now_kst
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
-    Base.metadata.create_all(bind=engine)
+    settings.validate_on_startup()
+    # DB 스키마는 Alembic으로 관리: python -m alembic upgrade head
     logger.info("애플리케이션 시작 (ENVIRONMENT={})", settings.ENVIRONMENT)
+
+    # 이벤트 버스 시작
+    await event_bus.start()
+
+    # MCP 클라이언트 연결 (실패해도 서버는 기동)
+    try:
+        await mcp_client.connect()
+        tools = await mcp_client.list_tools()
+        logger.info("MCP 도구 목록 ({}개): {}", len(tools), [t.get("name") for t in tools])
+    except Exception as e:
+        logger.warning("MCP 서버 연결 실패 (나중에 재시도): {}", str(e))
+
+    # 실시간 모니터 시작 (WebSocket, 실패해도 서버 기동)
+    from realtime.monitor import realtime_monitor
+    try:
+        await realtime_monitor.start()
+    except Exception as e:
+        logger.warning("실시간 모니터 시작 실패: {}", str(e))
+
+    # AI Trading Agent 시작
+    from agent.trading_agent import trading_agent
+    try:
+        await trading_agent.start()
+    except Exception as e:
+        logger.warning("Trading Agent 시작 실패: {}", str(e))
+
+    # 스케줄러 시작
+    from scheduler.scheduler import trading_scheduler
+    try:
+        await trading_scheduler.start()
+    except Exception as e:
+        logger.warning("스케줄러 시작 실패: {}", str(e))
+
+    logger.info("모든 서브시스템 초기화 완료")
+
     yield
+
+    # 종료 처리 (역순)
+    try:
+        await trading_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        await trading_agent.stop()
+    except Exception:
+        pass
+    try:
+        await realtime_monitor.stop()
+    except Exception:
+        pass
+    await mcp_client.disconnect()
+    await event_bus.stop()
     logger.info("애플리케이션 종료")
 
 
@@ -45,6 +100,17 @@ app.add_middleware(
 
 # ── 라우터 ──
 app.include_router(api_router)
+
+# ── Admin 정적 파일 서빙 ──
+ADMIN_STATIC = Path(__file__).parent / "admin" / "static"
+app.mount("/admin/static", StaticFiles(directory=str(ADMIN_STATIC)), name="admin-static")
+
+
+@app.get("/admin")
+@app.get("/admin/")
+async def admin_dashboard():
+    """관리자 대시보드 UI"""
+    return FileResponse(str(ADMIN_STATIC / "index.html"))
 
 
 # ── 예외 핸들러 ──

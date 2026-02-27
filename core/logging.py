@@ -51,3 +51,7 @@ def setup_logging() -> None:
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
     for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "sqlalchemy.engine"]:
         logging.getLogger(name).handlers = [InterceptHandler()]
+
+    # 노이즈 라이브러리 DEBUG 로그 억제
+    for name in ["httpcore", "httpx", "hpack", "h11"]:
+        logging.getLogger(name).setLevel(logging.WARNING)
