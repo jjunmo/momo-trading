@@ -8,7 +8,7 @@ let autoScroll = true;
 let accountPollTimer = null;
 
 // Stock card tracking: key = "cycleId:symbol" → { element, headerEl, bodyEl, stepsEl, activities[], outcome }
-const stockCards = {};
+let stockCards = {};
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
@@ -64,14 +64,17 @@ function connectSSE() {
 // ── Account Info ──
 async function loadAccountInfo() {
   try {
-    const [balResp, holdResp] = await Promise.all([
+    const [balResp, holdResp, pendResp] = await Promise.all([
       fetch(`${API}/account/balance`),
       fetch(`${API}/account/holdings`),
+      fetch(`${API}/account/pending-orders`),
     ]);
     const balJson = await balResp.json();
     const holdJson = await holdResp.json();
+    const pendJson = await pendResp.json();
     renderAccountBalance(balJson.data);
     renderAccountHoldings(holdJson.data);
+    renderPendingOrders(pendJson.data);
   } catch (err) {
     console.error('Account info error:', err);
     const el = document.getElementById('account-info');
@@ -110,18 +113,78 @@ function renderAccountBalance(data) {
 
 function renderAccountHoldings(data) {
   const el = document.getElementById('holdings-info');
+  const countEl = document.getElementById('holdings-count');
+  const sectionEl = document.getElementById('holdings-section');
   if (!el) return;
   if (!data || !data.length) {
-    el.innerHTML = '<div class="text-gray-600 text-xs">보유 종목 없음</div>';
+    if (sectionEl) sectionEl.style.display = 'none';
     return;
   }
+  if (sectionEl) sectionEl.style.display = '';
+  if (countEl) countEl.textContent = `${data.length}종목`;
   el.innerHTML = data.map(h => {
     const pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
-    return `<div class="flex justify-between items-center py-0.5">
-      <span class="text-gray-300 truncate" title="${h.name}">${h.name}</span>
-      <span class="${pnlColor}">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(1)}%</span>
+    const evalAmt = h.current_price * h.quantity;
+    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5">
+      <div class="flex justify-between items-center">
+        <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}</span>
+        <span class="${pnlColor} font-medium">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>${h.quantity}주 | 평단 ${Number(h.avg_buy_price).toLocaleString()}원</span>
+        <span>현재 ${Number(h.current_price).toLocaleString()}원</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>평가 ${formatKRW(evalAmt)}</span>
+        <span class="${pnlColor}">${h.pnl >= 0 ? '+' : ''}${formatKRW(h.pnl)}</span>
+      </div>
     </div>`;
   }).join('');
+}
+
+function renderPendingOrders(data) {
+  const el = document.getElementById('pending-orders-info');
+  const countEl = document.getElementById('pending-count');
+  const sectionEl = document.getElementById('pending-section');
+  if (!el) return;
+  if (!data || !data.length) {
+    if (sectionEl) sectionEl.style.display = 'none';
+    return;
+  }
+  if (sectionEl) sectionEl.style.display = '';
+  if (countEl) {
+    const totalAmt = data.reduce((s, o) => s + o.order_price * o.remaining_qty, 0);
+    countEl.textContent = `${data.length}건 (${formatKRW(totalAmt)})`;
+  }
+  el.innerHTML = data.map(o => {
+    const sideColor = o.side === '매수' ? 'text-red-400' : 'text-blue-400';
+    const borderColor = o.side === '매수' ? 'border-yellow-700/60' : 'border-yellow-700/60';
+    const orderAmt = o.order_price * o.remaining_qty;
+    const timeStr = o.order_time ? o.order_time.slice(0,2) + ':' + o.order_time.slice(2,4) + ':' + o.order_time.slice(4,6) : '';
+    return `<div class="border ${borderColor} bg-yellow-900/10 rounded p-1.5 space-y-0.5">
+      <div class="flex justify-between items-center">
+        <span class="text-gray-200 font-medium truncate" title="${o.symbol}">${o.name}</span>
+        <span class="${sideColor} font-medium text-xs px-1.5 py-0.5 rounded ${o.side === '매수' ? 'bg-red-900/30' : 'bg-blue-900/30'}">${o.side}</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>미체결 ${o.remaining_qty}주 / ${o.order_qty}주</span>
+        <span>${Number(o.order_price).toLocaleString()}원</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>${formatKRW(orderAmt)}</span>
+        <span>${timeStr}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function toggleSettings() {
+  const body = document.getElementById('settings-body');
+  const arrow = document.getElementById('settings-arrow');
+  if (!body) return;
+  const isHidden = body.classList.contains('hidden');
+  body.classList.toggle('hidden');
+  if (arrow) arrow.style.transform = isHidden ? '' : 'rotate(-90deg)';
 }
 
 function formatKRW(amount) {
@@ -176,6 +239,18 @@ function appendActivity(data) {
     // Symbol-specific → route to stock card
     const cardKey = `${data.cycle_id || 'ev'}:${symbol}`;
     let card = stockCards[cardKey];
+
+    // 정확한 키 매칭 실패 시 → 같은 종목의 진행 중인 카드에 합류
+    if (!card) {
+      for (const [key, existing] of Object.entries(stockCards)) {
+        if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress')) {
+          card = existing;
+          stockCards[cardKey] = card;  // alias 등록
+          break;
+        }
+      }
+    }
+
     if (!card) {
       card = createStockCard(symbol, data);
       stockCards[cardKey] = card;
@@ -376,48 +451,67 @@ function updateCardHeader(card) {
       outcomeBg = 'bg-yellow-900/40 text-yellow-300';
     }
 
-    // Tier1 HOLD
+    // SKIP (데이터 부족, 리스크 차단 등) → HOLD 처리
+    if (a.phase === 'SKIP' && outcome !== 'error') {
+      outcome = 'hold';
+      outcomeText = '⏭ 스킵';
+      outcomeBg = 'bg-gray-700/60 text-gray-400';
+    }
+
+    // Tier1 result — 방향 결정
     if (a.activity_type === 'TIER1_ANALYSIS' && a.phase === 'COMPLETE') {
       const summ = a.summary || '';
-      if (summ.includes('HOLD')) {
+      if (summ.includes('HOLD') || summ.includes('실패')) {
+        outcome = 'hold';
+        outcomeText = summ.includes('실패') ? '⚠ 분석 실패' : '⏸ HOLD';
+        outcomeBg = 'bg-gray-700/60 text-gray-400';
+      } else if (summ.includes('BUY')) {
+        outcome = 'buy';
+        outcomeText = '📈 매수';
+        outcomeBg = 'bg-red-900/40 text-red-300';
+      } else if (summ.includes('SELL')) {
+        outcome = 'sell';
+        outcomeText = '📉 매도';
+        outcomeBg = 'bg-blue-900/40 text-blue-300';
+      }
+    }
+
+    // Tier2 — 미승인만 뒤집음, 승인은 기존 방향 유지
+    if (a.activity_type === 'TIER2_REVIEW' && a.phase === 'COMPLETE') {
+      const summ = a.summary || '';
+      if (summ.includes('미승인')) {
+        outcome = outcome !== 'error' ? 'hold' : outcome;
+        outcomeText = '⛔ 미승인';
+        outcomeBg = 'bg-gray-700/60 text-gray-400';
+      }
+    }
+
+    // Strategy eval — HOLD/스킵
+    if (a.activity_type === 'STRATEGY_EVAL' && a.phase === 'COMPLETE') {
+      const summ = a.summary || '';
+      if ((summ.includes('HOLD') || summ.includes('스킵')) && outcome !== 'error') {
         outcome = 'hold';
         outcomeText = '⏸ HOLD';
         outcomeBg = 'bg-gray-700/60 text-gray-400';
       }
     }
 
-    // Tier2 result
-    if (a.activity_type === 'TIER2_REVIEW' && a.phase === 'COMPLETE') {
+    // 주문 실행/체결 — 방향 유지, 상태만 갱신
+    if (a.activity_type === 'DECISION' || a.activity_type === 'ORDER') {
       const summ = a.summary || '';
-      if (summ.includes('승인')) {
-        outcome = outcome !== 'error' ? 'buy' : outcome;
-        outcomeText = '✅ 승인';
-        outcomeBg = 'bg-green-900/40 text-green-300';
-      } else if (summ.includes('미승인')) {
-        outcome = outcome !== 'error' ? 'hold' : outcome;
-        outcomeText = '⛔ 미승인';
-        outcomeBg = 'bg-red-900/40 text-red-300';
-      }
-    }
-
-    // Strategy eval with action
-    if (a.activity_type === 'STRATEGY_EVAL' && a.phase === 'COMPLETE') {
-      const summ = a.summary || '';
-      if (summ.includes('HOLD') || summ.includes('스킵')) {
-        if (outcome !== 'error') {
-          outcome = 'hold';
-          outcomeText = '⏸ 전략 HOLD';
-          outcomeBg = 'bg-gray-700/60 text-gray-400';
+      const isSell = outcome === 'sell' || summ.includes('SELL') || summ.includes('매도');
+      if (a.phase === 'COMPLETE' && (summ.includes('주문 접수') || summ.includes('체결'))) {
+        outcome = isSell ? 'sell' : 'buy';
+        outcomeText = isSell ? '📉 매도 완료' : '📈 매수 완료';
+        outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
+      } else if (summ.includes('주문 실행')) {
+        // 주문 접수 전 — 방향만 표시
+        if (outcome !== 'buy' && outcome !== 'sell') {
+          outcome = isSell ? 'sell' : 'buy';
+          outcomeText = isSell ? '📉 매도' : '📈 매수';
+          outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
         }
       }
-    }
-
-    // Order execution
-    if (a.activity_type === 'ORDER' && a.phase === 'COMPLETE') {
-      const summ = a.summary || '';
-      outcome = summ.includes('매도') ? 'sell' : 'buy';
-      outcomeText = summ.includes('매도') ? '📉 매도' : '📈 매수';
-      outcomeBg = summ.includes('매도') ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
     }
 
     // Confidence
@@ -556,11 +650,21 @@ async function loadTodayActivities() {
       const activities = filterResolvedStarts(json.data);
       activities.forEach(a => appendActivity(a));
 
-      // Stop timers for completed cards (history load, not live)
+      // History load: stop all timers and finalize stuck cards
       for (const card of Object.values(stockCards)) {
-        if (card.outcome && card.outcome !== 'progress' && card.liveTimer) {
+        if (card.liveTimer) {
           clearInterval(card.liveTimer);
           card.liveTimer = null;
+        }
+        // 히스토리 로드 후 여전히 progress면 → 종료된 분석으로 처리
+        if (card.outcome === 'progress') {
+          card.outcome = 'hold';
+          const outcomeEl = card.headerEl.querySelector('.stock-outcome');
+          if (outcomeEl) {
+            outcomeEl.className = 'stock-outcome text-xs px-2 py-0.5 rounded bg-gray-700/60 text-gray-400';
+            outcomeEl.innerHTML = '⏸ 완료';
+          }
+          card.element.className = 'stock-card outcome-hold';
         }
       }
 
@@ -607,7 +711,7 @@ function cleanupStockCards() {
   for (const card of Object.values(stockCards)) {
     if (card.liveTimer) clearInterval(card.liveTimer);
   }
-  cleanupStockCards();
+  stockCards = {};
 }
 
 // ── Reports ──
@@ -671,7 +775,12 @@ function createReportCard(report) {
   const winRate = (report.win_count + report.loss_count) > 0
     ? ((report.win_count / (report.win_count + report.loss_count)) * 100).toFixed(1)
     : '-';
-  const pnlColor = report.total_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const realizedPnlColor = report.total_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const unrealizedPnl = report.unrealized_pnl || 0;
+  const unrealizedPnlColor = unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const buyCount = report.buy_count || 0;
+  const sellCount = report.sell_count || 0;
+  const openCount = report.open_position_count || 0;
   let topPicks = '';
   try {
     const picks = JSON.parse(report.top_picks || '[]');
@@ -680,7 +789,7 @@ function createReportCard(report) {
 
   div.innerHTML = `
     <div class="text-lg font-bold text-white mb-4">📋 ${report.report_date} 일일 리포트</div>
-    <div class="grid grid-cols-4 gap-3 mb-4">
+    <div class="grid grid-cols-3 gap-3 mb-3">
       <div class="bg-dark-900 rounded-lg p-3 text-center">
         <div class="text-2xl font-bold text-blue-400">${report.total_cycles}</div>
         <div class="text-xs text-gray-500">사이클</div>
@@ -690,12 +799,18 @@ function createReportCard(report) {
         <div class="text-xs text-gray-500">분석</div>
       </div>
       <div class="bg-dark-900 rounded-lg p-3 text-center">
-        <div class="text-2xl font-bold text-yellow-400">${report.total_recommendations}</div>
-        <div class="text-xs text-gray-500">추천</div>
+        <div class="text-2xl font-bold text-yellow-400">${buyCount}<span class="text-xs text-gray-500">매수</span> / ${sellCount}<span class="text-xs text-gray-500">매도</span></div>
+        <div class="text-xs text-gray-500">주문 (보유 ${openCount}종목)</div>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div class="bg-dark-900 rounded-lg p-3 text-center">
+        <div class="text-xl font-bold ${realizedPnlColor}">${report.total_pnl >= 0 ? '+' : ''}${report.total_pnl.toLocaleString()}원</div>
+        <div class="text-xs text-gray-500">실현 손익 (승률 ${winRate}%)</div>
       </div>
       <div class="bg-dark-900 rounded-lg p-3 text-center">
-        <div class="text-2xl font-bold ${pnlColor}">${report.total_pnl >= 0 ? '+' : ''}${report.total_pnl.toLocaleString()}원</div>
-        <div class="text-xs text-gray-500">손익 (승률 ${winRate}%)</div>
+        <div class="text-xl font-bold ${unrealizedPnlColor}">${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toLocaleString()}원</div>
+        <div class="text-xs text-gray-500">미실현 손익</div>
       </div>
     </div>
     ${report.market_summary ? `
@@ -959,7 +1074,7 @@ function formatTime(ts) {
   if (!ts) return '';
   try {
     const d = new Date(ts);
-    return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return d.toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit' });
   } catch { return ts; }
 }
 
@@ -986,6 +1101,7 @@ function getTypeColor(type) {
     RISK_TUNING: 'purple',
     DECISION: 'green', EVENT: 'gray', REPORT: 'purple',
     LLM_CALL: 'cyan', ORDER: 'red', DAILY_PLAN: 'purple',
+    TRADE_RESULT: 'green', RISK_GATE: 'red',
   };
   return map[type] || 'gray';
 }

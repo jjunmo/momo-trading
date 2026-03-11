@@ -104,50 +104,71 @@
       <div class="border-t border-gray-700 my-2"></div>
 
       <!-- Account Info -->
-      <div class="p-3 space-y-2">
-        <div class="text-xs text-gray-500 font-medium">계좌 정보</div>
+      <div class="p-3 space-y-2 flex-1 overflow-y-auto">
+        <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
         <div id="account-info" class="text-xs space-y-1">
           <div class="text-gray-600">로딩 중...</div>
         </div>
-        <div id="holdings-info" class="text-xs space-y-0.5 max-h-24 overflow-y-auto"></div>
+
+        <!-- 보유종목 -->
+        <div id="holdings-section">
+          <div id="holdings-header" class="flex items-center justify-between mt-3 mb-1">
+            <span class="text-xs text-green-400 font-medium">보유종목</span>
+            <span id="holdings-count" class="text-xs text-gray-600">0종목</span>
+          </div>
+          <div id="holdings-info" class="text-xs space-y-1 max-h-60 overflow-y-auto"></div>
+        </div>
+
+        <!-- 미체결 주문 -->
+        <div id="pending-section">
+          <div id="pending-header" class="flex items-center justify-between mt-3 mb-1">
+            <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
+            <span id="pending-count" class="text-xs text-gray-600">0건</span>
+          </div>
+          <div id="pending-orders-info" class="text-xs space-y-1 max-h-40 overflow-y-auto"></div>
+        </div>
       </div>
 
       <div class="border-t border-gray-700 my-2"></div>
 
-      <!-- Settings -->
-      <div class="p-3 space-y-3 flex-1 overflow-y-auto">
-        <div class="text-xs text-gray-500 font-medium">설정</div>
+      <!-- Settings (접이식) -->
+      <div class="p-3 shrink-0">
+        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition">
+          <span>설정</span>
+          <span id="settings-arrow" class="transition-transform" style="transform:rotate(-90deg)">&#x25BC;</span>
+        </button>
+        <div id="settings-body" class="space-y-3 mt-2 hidden">
+          <label class="flex items-center justify-between">
+            <span class="text-sm">매매 활성화</span>
+            <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
+              class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
+              after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
+          </label>
 
-        <label class="flex items-center justify-between">
-          <span class="text-sm">&#xb9e4;&#xb9e4; &#xd65c;&#xc131;&#xd654;</span>
-          <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
-            class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
-            after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
-        </label>
+          <div>
+            <label class="text-sm block mb-1">모드</label>
+            <select id="set-mode" onchange="updateSetting('AUTONOMY_MODE', this.value)"
+              class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
+              <option value="SEMI_AUTO">SEMI_AUTO</option>
+              <option value="AUTONOMOUS">AUTONOMOUS</option>
+            </select>
+          </div>
 
-        <div>
-          <label class="text-sm block mb-1">&#xbaa8;&#xb4dc;</label>
-          <select id="set-mode" onchange="updateSetting('AUTONOMY_MODE', this.value)"
-            class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-            <option value="SEMI_AUTO">SEMI_AUTO</option>
-            <option value="AUTONOMOUS">AUTONOMOUS</option>
-          </select>
-        </div>
+          <div>
+            <label class="text-sm block mb-1">리스크 성향</label>
+            <select id="set-risk-appetite" onchange="updateSetting('RISK_APPETITE', this.value)"
+              class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
+              <option value="CONSERVATIVE">보수적 (CONSERVATIVE)</option>
+              <option value="MODERATE">중립 (MODERATE)</option>
+              <option value="AGGRESSIVE">공격적 (AGGRESSIVE)</option>
+            </select>
+          </div>
 
-        <div class="border-t border-gray-700 my-1 pt-2">
-          <label class="text-sm block mb-1">리스크 성향</label>
-          <select id="set-risk-appetite" onchange="updateSetting('RISK_APPETITE', this.value)"
-            class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-            <option value="CONSERVATIVE">보수적 (CONSERVATIVE)</option>
-            <option value="MODERATE">중립 (MODERATE)</option>
-            <option value="AGGRESSIVE">공격적 (AGGRESSIVE)</option>
-          </select>
-        </div>
-
-        <div class="border-t border-gray-700 my-1 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-2">LLM</div>
-          <div class="text-xs text-gray-400">Claude Code (로컬 CLI)</div>
-          <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+          <div class="border-t border-gray-700 pt-2">
+            <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
+            <div class="text-xs text-gray-400">Claude Code (로컬 CLI)</div>
+            <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+          </div>
         </div>
       </div>
 

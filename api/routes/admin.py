@@ -17,6 +17,7 @@ from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
+from trading.enums import ActivityPhase, ActivityType
 from trading.mcp_client import mcp_client
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -177,6 +178,30 @@ async def get_account_holdings():
         return SuccessResponse(data=[], message=f"보유 종목 조회 실패: {str(e)[:100]}")
 
 
+@router.get("/account/pending-orders")
+async def get_pending_orders():
+    """미체결 주문 조회"""
+    try:
+        orders = await account_manager.get_pending_orders()
+        return SuccessResponse(data=[
+            {
+                "order_id": o.order_id,
+                "symbol": o.symbol,
+                "name": o.name,
+                "side": o.side,
+                "order_qty": o.order_qty,
+                "filled_qty": o.filled_qty,
+                "remaining_qty": o.remaining_qty,
+                "order_price": o.order_price,
+                "order_time": o.order_time,
+            }
+            for o in orders
+        ])
+    except Exception as e:
+        logger.error("미체결 주문 조회 실패: {}", str(e))
+        return SuccessResponse(data=[], message=f"미체결 주문 조회 실패: {str(e)[:100]}")
+
+
 # ── 설정 조회/변경 ──
 MUTABLE_SETTINGS = [
     "TRADING_ENABLED", "AUTONOMY_MODE",
@@ -216,7 +241,7 @@ async def update_settings(updates: dict):
 
     if changed:
         await activity_logger.log(
-            "EVENT", "PROGRESS",
+            ActivityType.EVENT, ActivityPhase.PROGRESS,
             f"\u2699\ufe0f 설정 변경: {', '.join(changed.keys())}",
             detail=changed,
         )
@@ -279,7 +304,7 @@ async def get_system_status():
         "mcp_connected": mcp_client.is_connected,
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,
-        "last_cycle_time": str(trading_agent.last_cycle_time) if trading_agent.last_cycle_time else None,
+        "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
         "market_open": market_calendar.is_krx_trading_hours(),
@@ -295,7 +320,7 @@ async def trigger_agent_cycle():
     from agent.trading_agent import trading_agent
 
     await activity_logger.log(
-        "EVENT", "PROGRESS",
+        ActivityType.EVENT, ActivityPhase.PROGRESS,
         "\U0001f3ae 수동 사이클 트리거 (관리자)",
     )
 
