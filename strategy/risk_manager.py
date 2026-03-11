@@ -4,7 +4,7 @@ from loguru import logger
 from core.config import settings
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
-from trading.enums import SignalAction
+from trading.enums import ActivityPhase, ActivityType, SignalAction
 
 
 class RiskManager:
@@ -23,6 +23,8 @@ class RiskManager:
         self.max_single_order_usd = settings.MAX_SINGLE_ORDER_USD
         self.min_cash_ratio = settings.MIN_CASH_RATIO  # 기본 5%
 
+    RR_FLOOR = {"THEME": 1.0, "BULL": 1.0}
+
     async def check(
         self,
         signal: TradeSignal,
@@ -33,6 +35,7 @@ class RiskManager:
         max_position_pct: float = 20.0,
         cycle_id: str | None = None,
         dynamic_limits: dict | None = None,
+        market_regime: str = "",
     ) -> dict:
         """
         리스크 검사
@@ -71,8 +74,8 @@ class RiskManager:
             await self._log_result(symbol, result, today_trade_count, cycle_id)
             return result
 
-        # 일일 매매 한도 검사
-        if today_trade_count >= eff_max_daily:
+        # 일일 매매 한도 검사 (0 = 무제한)
+        if eff_max_daily > 0 and today_trade_count >= eff_max_daily:
             logger.warning("일일 매매 한도 초과: {}/{}", today_trade_count, eff_max_daily)
             result = {"approved": False, "reason": f"일일 매매 한도 초과 ({eff_max_daily}회)"}
             await self._log_result(symbol, result, today_trade_count, cycle_id)
@@ -98,10 +101,11 @@ class RiskManager:
             risk = abs(entry - stop)
             if risk > 0:
                 rr_ratio = reward / risk
-                if rr_ratio < 1.5:
+                min_rr = self.RR_FLOOR.get(market_regime, 1.2)
+                if rr_ratio < min_rr:
                     result = {
                         "approved": False,
-                        "reason": f"리스크:보상 비율 부족 ({rr_ratio:.1f}:1, 최소 1.5:1 필요)",
+                        "reason": f"리스크:보상 비율 부족 ({rr_ratio:.1f}:1, 최소 {min_rr}:1 필요)",
                         "adjusted_quantity": None,
                     }
                     await self._log_result(symbol, result, today_trade_count, cycle_id)
@@ -122,7 +126,12 @@ class RiskManager:
             await self._log_result(symbol, result, today_trade_count, cycle_id)
             return result
 
-        # 현금 부족 검사
+        # 현금 부족 검사 (음수 현금 방어 포함)
+        if portfolio_cash <= 0:
+            result = {"approved": False, "reason": "가용 현금 없음"}
+            await self._log_result(symbol, result, today_trade_count, cycle_id)
+            return result
+
         if total_amount > portfolio_cash:
             adjusted_qty = int(portfolio_cash / price)
             if adjusted_qty < eff_min_qty:
@@ -194,7 +203,7 @@ class RiskManager:
             summary = f"\U0001f6e1\ufe0f [{symbol}] 리스크 검사 미통과: {reason}"
 
         await activity_logger.log(
-            "RISK_CHECK", "COMPLETE",
+            ActivityType.RISK_CHECK, ActivityPhase.COMPLETE,
             summary,
             cycle_id=cycle_id,
             symbol=symbol,

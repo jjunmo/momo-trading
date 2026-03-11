@@ -85,10 +85,13 @@ class StrategyTuner:
         sl_ratio = len(sl_trades) / len(trades)
 
         if sl_ratio > 0.4:
+            # 평균 손절 수익률에서 20% 여유를 둔 값 제안
+            suggested = round(avg_sl * 1.2, 1)
             return {
                 "param": "stop_loss_pct",
                 "issue": f"손절 비율 과다 ({sl_ratio * 100:.0f}%)",
                 "suggestion": "손절 폭을 넓히거나 진입 조건을 강화하세요",
+                "suggested_value": max(-8.0, min(-1.0, suggested)),
                 "avg_sl_return": round(avg_sl, 2),
                 "sl_count": len(sl_trades),
             }
@@ -118,10 +121,12 @@ class StrategyTuner:
         # → 정확한 판단은 불가능하지만, 대부분 익절가에서 정확히 청산된다면 익절 확대 고려
         tp_ratio = len(tp_trades) / len(trades)
         if tp_ratio > 0.3 and avg_tp < 3.0:
+            suggested = round(avg_tp * 1.5, 1)
             return {
                 "param": "take_profit_pct",
                 "issue": f"익절 비율 {tp_ratio * 100:.0f}%, 평균 익절 수익 {avg_tp:.1f}%",
                 "suggestion": "익절 폭을 약간 확대하여 수익 극대화 고려",
+                "suggested_value": max(2.0, min(15.0, suggested)),
                 "tp_count": len(tp_trades),
                 "avg_tp_return": round(avg_tp, 2),
             }
@@ -181,6 +186,7 @@ class StrategyTuner:
                     "param": "min_confidence",
                     "issue": f"신뢰도 0.6 미만 거래 승률 {low_wr * 100:.0f}% (낮음)",
                     "suggestion": "최소 신뢰도를 0.6 이상으로 상향 권장",
+                    "suggested_value": 0.65,
                     "confidence_breakdown": results,
                 }
 

@@ -12,23 +12,29 @@ class AggressiveShortStrategy:
     공격형 단기 매매 전략 (AGGRESSIVE_SHORT)
     - 대상: 모멘텀 급등주, 거래량 급증 종목
     - 보유 기간: 수시간~3일
-    - 손절: -4%, 익절: +8%
+    - 손절: -4%, 익절: +8% (기본값, 시장 국면별 동적 조정)
     - 판단: AI recommendation + confidence 기반
     """
 
     strategy_type = "AGGRESSIVE_SHORT"
 
+    REGIME_PARAMS = {
+        "BULL":  {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},
+        "THEME": {"stop_loss_pct": -5.0, "take_profit_pct": 12.0},
+        "BEAR":  {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
+    }
+
     def __init__(
         self,
         stop_loss_pct: float = -4.0,
         take_profit_pct: float = 8.0,
-        min_confidence: float = 0.65,
+        min_confidence: float = 0.55,
     ):
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.min_confidence = min_confidence
 
-    async def evaluate(self, analysis: dict) -> TradeSignal | None:
+    async def evaluate(self, analysis: dict, market_regime: str = "") -> TradeSignal | None:
         """AI 분석 결과 기반 시그널 생성 — 실행 파라미터 제공"""
         recommendation = analysis.get("recommendation", "HOLD")
         confidence = analysis.get("confidence", 0)
@@ -36,6 +42,11 @@ class AggressiveShortStrategy:
         symbol = analysis.get("symbol", "")
         stock_id = analysis.get("stock_id", "")
         current_price = analysis.get("current_price", 0)
+
+        # 국면별 동적 파라미터 (기본값 폴백)
+        params = self.REGIME_PARAMS.get(market_regime, {})
+        eff_stop = params.get("stop_loss_pct", self.stop_loss_pct)
+        eff_target = params.get("take_profit_pct", self.take_profit_pct)
 
         # 최소 신뢰도 미달 → 스킵
         if confidence < self.min_confidence:
@@ -74,8 +85,8 @@ class AggressiveShortStrategy:
             if trend_alignment >= 0.75:
                 reasons.append(f"추세 정렬도 {trend_alignment:.0%}")
 
-            target_price = current_price * (1 + self.take_profit_pct / 100)
-            stop_loss = current_price * (1 + self.stop_loss_pct / 100)
+            target_price = current_price * (1 + eff_target / 100)
+            stop_loss = current_price * (1 + eff_stop / 100)
 
             return TradeSignal(
                 symbol=symbol,
@@ -99,8 +110,8 @@ class AggressiveShortStrategy:
             if cross_signal == "DEAD_CROSS":
                 reasons.append("데드크로스 감지")
 
-            target_price = current_price * (1 + self.stop_loss_pct / 100)
-            stop_loss = current_price * (1 - self.stop_loss_pct / 100)
+            target_price = current_price * (1 + eff_stop / 100)
+            stop_loss = current_price * (1 - eff_stop / 100)
 
             return TradeSignal(
                 symbol=symbol,

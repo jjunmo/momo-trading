@@ -12,23 +12,29 @@ class StableShortStrategy:
     안정형 단기 매매 전략 (STABLE_SHORT)
     - 대상: 대형 우량주, ETF (변동성 낮은 종목)
     - 보유 기간: 1~5일
-    - 손절: -2.5%, 익절: +4%
+    - 손절: -2.5%, 익절: +4% (기본값, 시장 국면별 동적 조정)
     - 판단: AI recommendation + confidence 기반
     """
 
     strategy_type = "STABLE_SHORT"
 
+    REGIME_PARAMS = {
+        "BULL":  {"stop_loss_pct": -2.5, "take_profit_pct": 5.0},
+        "THEME": {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
+        "BEAR":  {"stop_loss_pct": -2.0, "take_profit_pct": 3.0},
+    }
+
     def __init__(
         self,
         stop_loss_pct: float = -2.5,
         take_profit_pct: float = 4.0,
-        min_confidence: float = 0.6,
+        min_confidence: float = 0.5,
     ):
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.min_confidence = min_confidence
 
-    async def evaluate(self, analysis: dict) -> TradeSignal | None:
+    async def evaluate(self, analysis: dict, market_regime: str = "") -> TradeSignal | None:
         """AI 분석 결과 기반 시그널 생성 — 실행 파라미터 제공"""
         recommendation = analysis.get("recommendation", "HOLD")
         confidence = analysis.get("confidence", 0)
@@ -36,6 +42,11 @@ class StableShortStrategy:
         symbol = analysis.get("symbol", "")
         stock_id = analysis.get("stock_id", "")
         current_price = analysis.get("current_price", 0)
+
+        # 국면별 동적 파라미터 (기본값 폴백)
+        params = self.REGIME_PARAMS.get(market_regime, {})
+        eff_stop = params.get("stop_loss_pct", self.stop_loss_pct)
+        eff_target = params.get("take_profit_pct", self.take_profit_pct)
 
         # 최소 신뢰도 미달 → 스킵
         if confidence < self.min_confidence:
@@ -66,8 +77,8 @@ class StableShortStrategy:
             if signal_summary.get("direction") == "BULLISH":
                 reasons.append("차트 매수 시그널")
 
-            target_price = current_price * (1 + self.take_profit_pct / 100)
-            stop_loss = current_price * (1 + self.stop_loss_pct / 100)
+            target_price = current_price * (1 + eff_target / 100)
+            stop_loss = current_price * (1 + eff_stop / 100)
 
             return TradeSignal(
                 symbol=symbol,
@@ -85,8 +96,8 @@ class StableShortStrategy:
 
         # === SELL ===
         if recommendation == "SELL":
-            target_price = current_price * (1 + self.stop_loss_pct / 100)
-            stop_loss = current_price * (1 - self.stop_loss_pct / 100)
+            target_price = current_price * (1 + eff_stop / 100)
+            stop_loss = current_price * (1 - eff_stop / 100)
             return TradeSignal(
                 symbol=symbol,
                 stock_id=stock_id,

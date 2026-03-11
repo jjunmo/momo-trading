@@ -1,7 +1,7 @@
 """AI 자율 한도 결정 - 계좌 상태 + 성과 + 리스크 성향 기반"""
-import json
-
 from loguru import logger
+
+from core.json_utils import parse_llm_json
 
 from analysis.feedback.performance_tracker import PerformanceTracker
 from analysis.llm.llm_factory import llm_factory
@@ -14,6 +14,7 @@ from core.config import settings
 from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
+from trading.enums import ActivityPhase, ActivityType
 
 
 class AIRiskTuner:
@@ -86,7 +87,7 @@ class AIRiskTuner:
             elapsed = activity_logger.elapsed_ms(timer)
 
             await activity_logger.log(
-                "RISK_TUNING", "COMPLETE",
+                ActivityType.RISK_TUNING, ActivityPhase.COMPLETE,
                 f"\U0001f3af AI 한도 결정 ({risk_appetite}): "
                 f"일일거래 {limits['max_daily_trades']}회, "
                 f"주문한도 {limits['max_single_order_krw']:,.0f}원",
@@ -107,43 +108,37 @@ class AIRiskTuner:
         """AI 결정값 정규화 (최소 안전값만 적용, 상한선 없음)"""
         return {
             "max_daily_trades": max(
-                int(parsed.get("max_daily_trades", settings.MAX_DAILY_TRADES)), 1
-            ),
+                int(parsed.get("max_daily_trades", settings.MAX_DAILY_TRADES)), 0
+            ),  # 0 = 무제한
             "max_single_order_krw": max(
-                int(parsed.get("max_single_order_krw", 10_000_000)), 100_000
-            ),
+                int(parsed.get("max_single_order_krw", 0)), 0
+            ),  # 0 = 무제한
             "min_buy_quantity": max(
                 int(parsed.get("min_buy_quantity", settings.MIN_BUY_QUANTITY)), 1
             ),
             "max_position_pct": max(
-                min(float(parsed.get("max_position_pct", 20.0)), 50.0), 5.0
-            ),
+                float(parsed.get("max_position_pct", 25.0)), 5.0
+            ),  # 상한선 없음
             "min_cash_ratio": max(
-                float(parsed.get("min_cash_ratio", 0.2)), 0.1
-            ),
+                float(parsed.get("min_cash_ratio", 0.05)), 0.05
+            ),  # 최소 5%
             "reasoning": parsed.get("reasoning", ""),
         }
 
     def _default_limits(self) -> dict:
-        """기본 한도값 (AI 실패 시 — 보수적 기본값)"""
+        """기본 한도값 (AI 실패 시)"""
         return {
-            "max_daily_trades": settings.MAX_DAILY_TRADES,
-            "max_single_order_krw": 5_000_000,
+            "max_daily_trades": settings.MAX_DAILY_TRADES,  # 0 = 무제한
+            "max_single_order_krw": settings.MAX_SINGLE_ORDER_KRW,  # 0 = 무제한
             "min_buy_quantity": settings.MIN_BUY_QUANTITY,
-            "max_position_pct": 15.0,
-            "min_cash_ratio": 0.3,
-            "reasoning": "AI 한도 결정 실패, 보수적 기본값 사용",
+            "max_position_pct": 25.0,
+            "min_cash_ratio": 0.05,
+            "reasoning": "AI 한도 결정 실패, 기본값 사용",
         }
 
     def _parse_json(self, text: str) -> dict | None:
-        try:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
-        return None
+        result = parse_llm_json(text)
+        return result or None
 
 
 ai_risk_tuner = AIRiskTuner()
