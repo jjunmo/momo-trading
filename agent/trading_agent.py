@@ -434,7 +434,29 @@ class TradingAgent:
             )
             return result
 
-        if analysis.get("recommendation") == "HOLD":
+        recommendation = analysis.get("recommendation", "HOLD")
+
+        # 스캔 파이프라인은 매수 기회 탐색 전용 — SELL 추천은 무시
+        # (매도는 손절/익절/강제청산/보유종목 모니터링 경로에서만 실행)
+        if recommendation == "SELL":
+            reason = analysis.get("reason") or "AI SELL 추천"
+            await activity_logger.log(
+                ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
+                f"\U0001f4ca [{name}] Tier1: SELL → 스캔 경로에서 매도 스킵 | {reason[:100]}",
+                cycle_id=cycle_id, symbol=symbol,
+                detail={
+                    "recommendation": "SELL",
+                    "reason": reason,
+                    "confidence": analysis.get("confidence") or 0,
+                },
+                llm_provider=analysis.get("provider"),
+                llm_tier="TIER1",
+                execution_time_ms=t1_elapsed,
+                confidence=analysis.get("confidence") or 0,
+            )
+            return result
+
+        if recommendation == "HOLD":
             reason = analysis.get("reason") or analysis.get("summary", "판단 근거 없음")
             await activity_logger.log(
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
