@@ -3,6 +3,7 @@
 MCP를 거치지 않고 KIS API를 직접 호출하여
 분봉, 거래량순위, 등락률순위 등 MCP 미지원 데이터를 조회한다.
 """
+import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,11 @@ from core.config import settings
 DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
 TOKEN_FILE = Path("data/kis_token.json")
+
+# 토큰 동시 발급 방지용 Lock + 메모리 캐시
+_token_lock = asyncio.Lock()
+_cached_token: str | None = None
+_cached_expires_at: datetime | None = None
 
 
 def _get_domain() -> str:
@@ -35,18 +41,57 @@ def _get_app_secret() -> str:
 
 
 async def _get_access_token(client: httpx.AsyncClient) -> str:
-    """토큰 발급 (파일 캐싱)"""
-    # 캐시된 토큰 확인
-    if TOKEN_FILE.exists():
-        try:
-            token_data = json.loads(TOKEN_FILE.read_text())
-            expires_at = datetime.fromisoformat(token_data["expires_at"])
-            if datetime.now() < expires_at:
-                return token_data["token"]
-        except Exception:
-            pass
+    """토큰 발급 (메모리 캐시 + Lock으로 동시 발급 방지)
 
-    # 새 토큰 발급
+    asyncio.gather()로 병렬 호출 시 Lock으로 직렬화하여
+    KIS 1분당 1회 토큰 발급 제한(EGW00133) 에러를 방지한다.
+    EGW00133 시 Lock을 해제한 뒤 60초 대기 → 재시도 (Lock 점유 최소화).
+    """
+    global _cached_token, _cached_expires_at
+
+    # 빠른 경로: 메모리 캐시에 유효한 토큰이 있으면 즉시 반환 (Lock 불필요)
+    if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
+        return _cached_token
+
+    for attempt in range(2):
+        async with _token_lock:
+            # Double-check: 다른 태스크가 Lock 대기 중 이미 발급했을 수 있음
+            if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
+                return _cached_token
+
+            # 파일 캐시 확인
+            if TOKEN_FILE.exists():
+                try:
+                    token_data = json.loads(TOKEN_FILE.read_text())
+                    expires_at = datetime.fromisoformat(token_data["expires_at"])
+                    if datetime.now() < expires_at:
+                        _cached_token = token_data["token"]
+                        _cached_expires_at = expires_at
+                        logger.debug("KIS 토큰: 파일 캐시에서 로드")
+                        return _cached_token
+                except Exception:
+                    pass
+
+            # 새 토큰 발급
+            token = await _issue_new_token(client)
+            if token is not None:
+                return token
+
+        # EGW00133 발급 제한 → Lock 해제 후 대기 (다른 API 호출 차단 안 함)
+        if attempt == 0:
+            logger.warning("KIS 토큰 발급 제한(EGW00133), 60초 대기 후 재시도")
+            await asyncio.sleep(60)
+
+    raise Exception("KIS 토큰 발급 실패: 재시도 횟수 초과")
+
+
+async def _issue_new_token(client: httpx.AsyncClient) -> str | None:
+    """실제 토큰 발급 요청 (_token_lock 내부에서 호출)
+
+    성공 시 토큰 반환, EGW00133 시 None 반환 (호출자가 Lock 해제 후 재시도).
+    """
+    global _cached_token, _cached_expires_at
+
     resp = await client.post(
         f"{DOMAIN}/oauth2/tokenP",
         headers={"content-type": "application/json"},
@@ -56,20 +101,29 @@ async def _get_access_token(client: httpx.AsyncClient) -> str:
             "appsecret": _get_app_secret(),
         },
     )
+
     if resp.status_code != 200:
-        raise Exception(f"KIS 토큰 발급 실패: {resp.text}")
+        resp_text = resp.text
+        if "EGW00133" in resp_text:
+            return None  # 호출자가 Lock 해제 후 대기·재시도
+        raise Exception(f"KIS 토큰 발급 실패: {resp_text}")
 
     data = resp.json()
     token = data["access_token"]
     expires_at = datetime.now() + timedelta(hours=23)
 
-    # 캐시 저장
+    # 메모리 캐시 갱신
+    _cached_token = token
+    _cached_expires_at = expires_at
+
+    # 파일 캐시 저장
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_FILE.write_text(json.dumps({
         "token": token,
         "expires_at": expires_at.isoformat(),
     }))
 
+    logger.info("KIS 토큰 신규 발급 완료")
     return token
 
 
@@ -160,7 +214,7 @@ async def get_volume_rank(market: str = "J") -> dict:
                     "FID_DIV_CLS_CODE": "0",             # 전체 (보통주+우선주)
                     "FID_BLNG_CLS_CODE": "0",            # 평균거래량 기준
                     "FID_TRGT_CLS_CODE": "111111111",    # 전체 대상
-                    "FID_TRGT_EXLS_CLS_CODE": "0000000000",  # 제외 없음
+                    "FID_TRGT_EXLS_CLS_CODE": "0000000110",  # 관리종목·감리종목 제외
                     "FID_INPUT_PRICE_1": "",              # 가격 필터 없음
                     "FID_INPUT_PRICE_2": "",
                     "FID_VOL_CNT": "",                   # 거래량 필터 없음
@@ -238,7 +292,7 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
                     "fid_input_price_2": "",
                     "fid_vol_cnt": "",                    # 거래량 필터 없음
                     "fid_trgt_cls_code": "111111111",     # 전체 대상
-                    "fid_trgt_exls_cls_code": "0000000000",  # 제외 없음
+                    "fid_trgt_exls_cls_code": "0000000110",  # 관리종목·감리종목 제외
                     "fid_div_cls_code": "0",              # 전체 (보통주+우선주)
                     "fid_rsfl_rate1": "",                  # 등락률 필터 없음
                     "fid_rsfl_rate2": "",

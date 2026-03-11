@@ -1,8 +1,9 @@
-"""MCP를 통한 잔고/체결내역 조회"""
+"""MCP를 통한 잔고/체결내역 조회 — 장외 시간 폴링 차단 + 캐시"""
 from loguru import logger
 
+from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
-from trading.models import AccountBalance, HoldingInfo
+from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
 
 
 class AccountManager:
@@ -13,27 +14,50 @@ class AccountManager:
     - output2: 계좌 총합 [{dnca_tot_amt, scts_evlu_amt, tot_evlu_amt, nass_amt, ...}]
     """
 
-    async def get_balance(self) -> AccountBalance:
-        """계좌 잔고 조회"""
-        response = await mcp_client.get_account_balance()
-        if not response.success:
-            logger.error("잔고 조회 실패: {}", response.error)
-            return AccountBalance(
-                total_asset=0, cash=0, stock_value=0,
-                total_pnl=0, total_pnl_rate=0,
-                is_valid=False,
-            )
+    def __init__(self):
+        self._balance_cache: AccountBalance | None = None
+        self._holdings_cache: list[HoldingInfo] | None = None
+        self._pending_orders_cache: list[PendingOrderInfo] | None = None
 
-        data = response.data or {}
-        logger.debug("잔고 MCP 응답: {}", str(data)[:500])
+    def _empty_balance(self) -> AccountBalance:
+        return AccountBalance(
+            total_asset=0, cash=0, stock_value=0,
+            total_pnl=0, total_pnl_rate=0,
+            is_valid=False,
+        )
 
-        # KIS API 형식 (output2에 계좌 총합)
+    def _parse_balance(self, data: dict, holdings: list["HoldingInfo"] | None = None) -> AccountBalance:
+        """MCP 응답에서 AccountBalance 파싱
+
+        holdings가 전달되면 stock_value를 보유종목 평가합계로 계산하여
+        화면 표시값과 일치시킵니다.
+        """
         output2 = data.get("output2", [])
         if output2 and isinstance(output2, list):
             summary = output2[0] if output2 else {}
             cash = float(summary.get("dnca_tot_amt", 0))
-            stock_value = float(summary.get("scts_evlu_amt", 0))
-            total_asset = float(summary.get("tot_evlu_amt", 0)) or (cash + stock_value)
+
+            # 보유종목 평가합계 사용 (화면 일관성), 없으면 KIS output2 값 사용
+            if holdings:
+                stock_value = sum(
+                    h.current_price * h.quantity for h in holdings
+                )
+            else:
+                stock_value = float(summary.get("scts_evlu_amt", 0))
+
+            total_asset = cash + stock_value
+
+            # 디버그 로깅: KIS 원본 필드값 기록
+            kis_scts = float(summary.get("scts_evlu_amt", 0))
+            logger.debug(
+                "KIS 잔고 원본: tot_evlu={} scts_evlu={:,.0f} "
+                "dnca={:,.0f} nass={} pchs={} | 보유종목 평가합={:,.0f}",
+                summary.get("tot_evlu_amt", "N/A"), kis_scts, cash,
+                summary.get("nass_amt", "N/A"),
+                summary.get("pchs_amt_smtl_amt", "N/A"),
+                stock_value,
+            )
+
             total_pnl = float(summary.get("evlu_pfls_smtl_amt", 0))
             total_pnl_rate = 0.0
             pchs_amt = float(summary.get("pchs_amt_smtl_amt", 0))
@@ -57,17 +81,10 @@ class AccountManager:
             total_pnl_rate=float(data.get("total_pnl_rate", 0)),
         )
 
-    async def get_holdings(self) -> list[HoldingInfo]:
-        """보유 종목 목록 조회"""
-        response = await mcp_client.get_account_balance()
-        if not response.success:
-            logger.error("보유종목 조회 실패: {}", response.error)
-            return []
-
-        data = response.data or {}
+    def _parse_holdings(self, data: dict) -> list[HoldingInfo]:
+        """MCP 응답에서 HoldingInfo 리스트 파싱"""
         holdings = []
 
-        # KIS API 형식 (output1에 보유종목)
         output1 = data.get("output1", [])
         if output1 and isinstance(output1, list):
             for item in output1:
@@ -97,6 +114,95 @@ class AccountManager:
                 pnl_rate=float(item.get("pnl_rate", 0)),
             ))
         return holdings
+
+    async def get_account_snapshot(self) -> tuple[AccountBalance, list[HoldingInfo]]:
+        """잔고 + 보유종목을 단일 MCP 호출로 조회
+
+        장중: 매번 MCP 호출 → 양쪽 캐시 갱신
+        장외 + 캐시 있음: 캐시 반환, MCP 미호출
+        장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
+        """
+        # 장외 + 양쪽 캐시 모두 있음 → MCP 호출 없이 캐시 반환
+        if not market_calendar.is_krx_trading_hours():
+            if self._balance_cache and self._holdings_cache is not None:
+                logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
+                return self._balance_cache, self._holdings_cache
+
+        response = await mcp_client.get_account_balance()
+        if not response.success:
+            logger.warning("계좌 조회 실패: {}", response.error)
+            balance = self._balance_cache if self._balance_cache else self._empty_balance()
+            holdings = self._holdings_cache if self._holdings_cache is not None else []
+            return balance, holdings
+
+        data = response.data or {}
+        logger.debug("계좌 MCP 응답: {}", str(data)[:500])
+
+        holdings = self._parse_holdings(data)
+        balance = self._parse_balance(data, holdings=holdings)
+
+        self._balance_cache = balance
+        self._holdings_cache = holdings
+        return balance, holdings
+
+    async def get_balance(self) -> AccountBalance:
+        """계좌 잔고 조회 (하위 호환)"""
+        balance, _ = await self.get_account_snapshot()
+        return balance
+
+    async def get_holdings(self) -> list[HoldingInfo]:
+        """보유 종목 목록 조회 (하위 호환)"""
+        _, holdings = await self.get_account_snapshot()
+        return holdings
+
+    def _parse_pending_orders(self, data: dict) -> list[PendingOrderInfo]:
+        """MCP 응답에서 미체결 주문 리스트 파싱"""
+        orders = []
+        output = data.get("output", [])
+        if not output or not isinstance(output, list):
+            return orders
+
+        for item in output:
+            rmn_qty = int(item.get("rmn_qty", 0))
+            if rmn_qty <= 0:
+                continue
+            # sll_buy_dvsn_cd: 01=매도, 02=매수
+            side_code = item.get("sll_buy_dvsn_cd", "")
+            side = "매수" if side_code == "02" else "매도"
+            orders.append(PendingOrderInfo(
+                order_id=item.get("odno", ""),
+                symbol=item.get("pdno", ""),
+                name=item.get("prdt_name", ""),
+                side=side,
+                order_qty=int(item.get("ord_qty", 0)),
+                filled_qty=int(item.get("tot_ccld_qty", 0)),
+                remaining_qty=rmn_qty,
+                order_price=float(item.get("ord_unpr", 0)),
+                order_time=item.get("ord_tmd", ""),
+            ))
+        return orders
+
+    async def get_pending_orders(self) -> list[PendingOrderInfo]:
+        """미체결 주문 목록 조회
+
+        장중: 매번 MCP 호출 → 캐시 갱신
+        장외 + 캐시 있음: 캐시 반환
+        장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
+        """
+        if not market_calendar.is_krx_trading_hours():
+            if self._pending_orders_cache is not None:
+                logger.debug("장외 시간 → 미체결 주문 캐시 반환")
+                return self._pending_orders_cache
+
+        response = await mcp_client.get_order_list()
+        if not response.success:
+            logger.warning("미체결 주문 조회 실패: {}", response.error)
+            return self._pending_orders_cache if self._pending_orders_cache is not None else []
+
+        data = response.data or {}
+        orders = self._parse_pending_orders(data)
+        self._pending_orders_cache = orders
+        return orders
 
     async def get_available_cash(self) -> float:
         """투자 가용 현금 조회"""

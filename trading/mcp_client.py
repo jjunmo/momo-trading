@@ -567,11 +567,33 @@ class MCPClient:
             })
         if resp.success and resp.data:
             d = resp.data
+            # KIS rt_cd='1' → 주문 실패 (잔고 부족 등)
+            if d.get("rt_cd") == "1":
+                error_msg = d.get("msg1", "KIS 주문 실패")
+                logger.warning("KIS 주문 거부: {}", error_msg)
+                resp.success = False
+                resp.error = error_msg
+                return resp
+            # KIS 주문번호: 최상위 또는 output 중첩, 대소문자 혼용
+            output = d.get("output", {}) if isinstance(d.get("output"), dict) else {}
+            order_id = (
+                d.get("ODNO") or d.get("odno")
+                or output.get("ODNO") or output.get("odno")
+                or d.get("order_id", "")
+            )
+            if not order_id:
+                logger.warning("주문 응답에서 주문번호 미발견, 원본: {}", str(d)[:500])
             resp.data = {
                 **d,
-                "order_id": d.get("odno") or d.get("order_id", ""),
-                "filled_quantity": self._to_int(d.get("exec_qty") or d.get("filled_quantity")),
-                "filled_price": self._to_float(d.get("exec_prc") or d.get("filled_price")),
+                "order_id": order_id,
+                "filled_quantity": self._to_int(
+                    d.get("exec_qty") or output.get("exec_qty")
+                    or d.get("filled_quantity")
+                ),
+                "filled_price": self._to_float(
+                    d.get("exec_prc") or output.get("exec_prc")
+                    or d.get("filled_price")
+                ),
             }
         return resp
 
@@ -617,8 +639,13 @@ class MCPClient:
         return await self.call_tool("inquery-stock-ask", {"symbol": symbol})
 
     async def get_order_list(self) -> MCPResponse:
-        """주문 체결 내역 조회"""
-        return await self.call_tool("inquery-order-list")
+        """주문 체결 내역 조회 (당일 미체결)"""
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        return await self.call_tool("inquery-order-list", {
+            "start_date": today,
+            "end_date": today,
+        })
 
 
 # 싱글톤 MCP 클라이언트

@@ -76,3 +76,16 @@ class HoldingInfo(BaseModel):
     current_price: float
     pnl: float
     pnl_rate: float
+
+
+class PendingOrderInfo(BaseModel):
+    """미체결 주문 정보"""
+    order_id: str           # odno (주문번호)
+    symbol: str             # pdno (종목코드)
+    name: str               # prdt_name (종목명)
+    side: str               # 매수/매도
+    order_qty: int          # 주문수량
+    filled_qty: int         # 체결수량
+    remaining_qty: int      # 미체결수량
+    order_price: float      # 주문단가
+    order_time: str         # 주문시각
