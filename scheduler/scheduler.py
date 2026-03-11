@@ -20,6 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
 
 from core.config import settings
+from trading.enums import ActivityPhase, ActivityType
 
 
 class TradingScheduler:
@@ -178,14 +179,14 @@ class TradingScheduler:
             holiday_name = market_calendar.get_holiday_name() or "공휴일"
             logger.info("오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", holiday_name)
             await activity_logger.log(
-                "SCHEDULE", "PROGRESS",
+                ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                 f"\U0001f3d6\ufe0f 오늘은 휴장일 ({holiday_name}) — 매매 스킵",
             )
             return
 
         logger.info("=== 장 시작 전 준비 (08:50) ===")
         await activity_logger.log(
-            "SCHEDULE", "PROGRESS",
+            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             "\u2615 장 시작 전 준비 — 10분 후 KRX 개장",
         )
 
@@ -213,11 +214,46 @@ class TradingScheduler:
                 report = await repo.get_by_date(yesterday)
                 if report and report.lessons_learned:
                     await activity_logger.log(
-                        "SCHEDULE", "PROGRESS",
+                        ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                         f"\U0001f4cb 어제 리뷰 피드백: {report.lessons_learned[:200]}",
                     )
         except Exception as e:
             logger.debug("어제 리뷰 로드 실패: {}", str(e))
+
+        # 3. 활성 트레이딩 규칙 로드 + 적용 (일일 리뷰 피드백 자동 학습)
+        try:
+            from analysis.feedback.trading_rules import trading_rule_engine
+            from agent.trading_agent import trading_agent
+            from strategy.risk_manager import risk_manager
+
+            active_rules = await trading_rule_engine.load_active_rules()
+            rules = active_rules.get("rules", [])
+
+            if rules:
+                trading_rule_engine.apply_to_strategies(
+                    trading_agent.strategies, active_rules,
+                )
+                trading_rule_engine.apply_to_risk_manager(
+                    risk_manager, active_rules,
+                )
+                trading_agent._active_trading_rules = active_rules
+
+                rule_summary = ", ".join(
+                    f"{r.param_name}={r.param_value}" for r in rules[:5]
+                )
+                await activity_logger.log(
+                    ActivityType.TRADING_RULE, ActivityPhase.COMPLETE,
+                    f"📋 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
+                )
+                await trading_rule_engine.record_application(
+                    [r.id for r in rules]
+                )
+
+            expired = await trading_rule_engine.expire_old_rules()
+            if expired:
+                logger.info("만료된 트레이딩 규칙 {}건 비활성화", expired)
+        except Exception as e:
+            logger.warning("트레이딩 규칙 로드 실패: {}", str(e))
 
     async def _market_open_scan(self) -> None:
         """장 시작 직후 (09:05) — 전체 시장 스캔 → 종목 선정 → 매매
@@ -235,7 +271,7 @@ class TradingScheduler:
 
         logger.info("=== 장 시작 첫 스캔 (09:05) — 전체 시장 분석 + 매매 시작 ===")
         await activity_logger.log(
-            "SCHEDULE", "PROGRESS",
+            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             "\U0001f514 장 시작! 전체 시장 스캔 → AI 종목 선정 → 분석/매매 시작",
         )
 
@@ -259,7 +295,7 @@ class TradingScheduler:
                 await stream_manager.update_subscriptions(all_symbols)
 
             await activity_logger.log(
-                "SCHEDULE", "PROGRESS",
+                ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                 f"\u2705 장 시작 완료 — 분석 {result.get('analyzed', 0)}건, "
                 f"매매 {result.get('executed', 0)}건, "
                 f"실시간 감시 {len(all_symbols)}종목 → 모니터링 돌입",
@@ -291,7 +327,7 @@ class TradingScheduler:
 
         logger.info("=== 장중 재스캔 시작 ({}) ===", now_kst().strftime("%H:%M"))
         await activity_logger.log(
-            "SCHEDULE", "PROGRESS",
+            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             f"\U0001f504 장중 재스캔 시작 ({now_kst().strftime('%H:%M')}) — 새로운 기회 탐색",
         )
 
@@ -310,7 +346,7 @@ class TradingScheduler:
                     await stream_manager.update_subscriptions(all_symbols)
 
             await activity_logger.log(
-                "SCHEDULE", "PROGRESS",
+                ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                 f"\u2705 장중 재스캔 완료 — 분석 {result.get('analyzed', 0)}건, "
                 f"매매 {result.get('executed', 0)}건",
             )
@@ -436,7 +472,7 @@ class TradingScheduler:
 
             if alerts:
                 await activity_logger.log(
-                    "HOLDINGS_CHECK", "PROGRESS",
+                    ActivityType.HOLDINGS_CHECK, ActivityPhase.PROGRESS,
                     f"\U0001f50d 보유종목 점검 (잔여 {minutes_left}분):\n" + "\n".join(alerts),
                 )
         except Exception as e:
@@ -454,7 +490,7 @@ class TradingScheduler:
 
         logger.info("=== 장 마감 리뷰 시작 (15:40) ===")
         await activity_logger.log(
-            "SCHEDULE", "PROGRESS",
+            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             "\U0001f319 장 마감 — 오늘 매매 성과 리뷰 시작",
         )
 
@@ -508,7 +544,7 @@ class TradingScheduler:
 
         logger.warning("=== 장 마감 전 강제 청산 시작 ===")
         await activity_logger.log(
-            "SCHEDULE", "PROGRESS",
+            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             "\U0001f6a8 데이트레이딩 강제 청산 — 보유종목 전량 시장가 매도 (병렬)",
         )
 
@@ -519,7 +555,7 @@ class TradingScheduler:
             holdings = await account_manager.get_holdings()
             if not holdings:
                 await activity_logger.log(
-                    "SCHEDULE", "PROGRESS",
+                    ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                     "\u2705 보유종목 없음 — 청산 불필요",
                 )
                 return
@@ -556,7 +592,7 @@ class TradingScheduler:
                     sold_count += 1
                     pnl_text = f"{h.pnl_rate:+.1f}%" if hasattr(h, "pnl_rate") else ""
                     await activity_logger.log(
-                        "ORDER", "COMPLETE",
+                        ActivityType.ORDER, ActivityPhase.COMPLETE,
                         f"\U0001f6a8 강제 청산: {h.name}({h.symbol}) "
                         f"{h.quantity}주 시장가 매도 {pnl_text}",
                         symbol=h.symbol,
@@ -568,7 +604,7 @@ class TradingScheduler:
                         h.name, h.symbol, resp.error or "알 수 없는 오류",
                     )
                     await activity_logger.log(
-                        "ORDER", "ERROR",
+                        ActivityType.ORDER, ActivityPhase.ERROR,
                         f"\u274c 강제 청산 실패: {h.name}({h.symbol}) — {resp.error or ''}",
                         symbol=h.symbol,
                     )
@@ -577,7 +613,7 @@ class TradingScheduler:
             if failed_holdings:
                 logger.warning("강제 청산 {}건 실패 → 5초 후 재시도", len(failed_holdings))
                 await activity_logger.log(
-                    "SCHEDULE", "PROGRESS",
+                    ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
                     f"\u26a0\ufe0f 강제 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
                 )
                 await asyncio.sleep(5)
@@ -600,7 +636,7 @@ class TradingScheduler:
             summary = f"\U0001f6a8 강제 청산 완료: {sold_count}건 매도"
             if fail_count:
                 summary += f", {fail_count}건 실패 (재시도 포함)"
-            await activity_logger.log("SCHEDULE", "PROGRESS", summary)
+            await activity_logger.log(ActivityType.SCHEDULE, ActivityPhase.PROGRESS, summary)
 
             # 청산 후 이벤트 감시 임계값 제거
             from realtime.event_detector import event_detector
@@ -610,7 +646,7 @@ class TradingScheduler:
         except Exception as e:
             logger.error("강제 청산 오류: {}", str(e))
             await activity_logger.log(
-                "SCHEDULE", "ERROR",
+                ActivityType.SCHEDULE, ActivityPhase.ERROR,
                 f"\u274c 강제 청산 오류: {str(e)[:100]}",
             )
 

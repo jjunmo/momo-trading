@@ -6,6 +6,7 @@ from loguru import logger
 from analysis.llm.llm_factory import llm_factory
 from analysis.llm.prompts.market_scan import STOCK_SCREENING_PROMPT
 from services.activity_logger import activity_logger
+from trading.enums import ActivityPhase, ActivityType
 
 
 class StockScreener:
@@ -29,7 +30,7 @@ class StockScreener:
 
         timer = activity_logger.timer()
         await activity_logger.log(
-            "SCREENING", "START",
+            ActivityType.SCREENING, ActivityPhase.START,
             f"\U0001f50d AI 스크리닝 시작: {len(candidates)}종목 분석 중",
             cycle_id=cycle_id,
         )
@@ -68,7 +69,7 @@ class StockScreener:
                 summary_text += "\n" + "\n".join(selected_lines)
 
             await activity_logger.log(
-                "SCREENING", "COMPLETE",
+                ActivityType.SCREENING, ActivityPhase.COMPLETE,
                 summary_text,
                 cycle_id=cycle_id,
                 detail={
@@ -85,7 +86,7 @@ class StockScreener:
             elapsed = activity_logger.elapsed_ms(timer)
             logger.error("종목 스크리닝 실패: {}", str(e))
             await activity_logger.log(
-                "SCREENING", "ERROR",
+                ActivityType.SCREENING, ActivityPhase.ERROR,
                 f"\u274c 스크리닝 실패, 상위 3종목 Fallback: {str(e)[:80]}",
                 cycle_id=cycle_id,
                 error_message=str(e),

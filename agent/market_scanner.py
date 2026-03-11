@@ -9,7 +9,11 @@ from analysis.llm.prompts.market_scan import MARKET_SCAN_PROMPT, MARKET_SCAN_SYS
 from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
+from trading.enums import ActivityPhase, ActivityType
 from trading.mcp_client import mcp_client
+
+# 모의투자 매매불가 종목 필터 키워드
+_EXCLUDE_NAME_KEYWORDS = ("ETN", "스팩", "SPAC")
 
 
 class MarketScanner:
@@ -18,34 +22,60 @@ class MarketScanner:
     (기존 scan → screening 2단계를 1단계로 통합하여 LLM 호출 1건 절약)
     """
 
-    async def scan(self, cycle_id: str | None = None) -> dict:
+    def __init__(self):
+        self._untradeable_symbols: set[str] = set()
+
+    def add_untradeable(self, symbol: str) -> None:
+        """매매불가 종목을 런타임 블록리스트에 등록 (당일 스캔에서 제외)"""
+        self._untradeable_symbols.add(symbol)
+        logger.info("매매불가 블록리스트 등록: {} (총 {}건)", symbol, len(self._untradeable_symbols))
+
+    def _filter_untradeable(self, stocks: list[dict]) -> list[dict]:
+        """매매불가 종목 필터링 (런타임 블록리스트 + 이름 키워드)"""
+        filtered = []
+        for s in stocks:
+            name = s.get("name", "")
+            symbol = s.get("symbol", "")
+            if symbol in self._untradeable_symbols:
+                continue
+            if any(kw in name for kw in _EXCLUDE_NAME_KEYWORDS):
+                continue
+            filtered.append(s)
+        if len(filtered) < len(stocks):
+            logger.info("매매불가 종목 필터: {}건 → {}건", len(stocks), len(filtered))
+        return filtered
+
+    async def scan(self, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
         logger.info("시장 스캔 시작")
         timer = activity_logger.timer()
 
         await activity_logger.log(
-            "SCAN", "START",
+            ActivityType.SCAN, ActivityPhase.START,
             "\U0001f4e1 시장 스캔 중... 거래량/등락 상위 종목 조회",
             cycle_id=cycle_id,
         )
 
-        # 1. 데이터 수집 병렬화 (MCP 4건 + DB 1건 + 계좌 2건)
+        # 1. 데이터 수집 병렬화 (MCP 3건 + DB 1건 + 계좌 1건)
         (
-            available_cash,
+            account_snapshot,
             volume_rank,
             surge_data,
             drop_data,
-            holdings,
             performance_summary,
         ) = await asyncio.gather(
-            account_manager.get_available_cash(),
+            account_manager.get_account_snapshot(),
             self._get_volume_rank(),
             self._get_fluctuation_rank("top"),
             self._get_fluctuation_rank("bottom"),
-            account_manager.get_holdings(),
             self._get_performance_summary(),
         )
-        max_per_stock = available_cash * 0.2
+        balance, holdings = account_snapshot
+        available_cash = balance.cash
+        max_pos_pct = 0.2
+        if dynamic_limits:
+            max_pos_pct = dynamic_limits.get("max_position_pct", 20.0) / 100
+        max_per_stock = available_cash * max_pos_pct
 
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
@@ -107,7 +137,7 @@ class MarketScanner:
                 summary_text += f"\n   시장: {market_analysis}"
 
             await activity_logger.log(
-                "SCAN", "COMPLETE",
+                ActivityType.SCAN, ActivityPhase.COMPLETE,
                 summary_text,
                 cycle_id=cycle_id,
                 detail={
@@ -137,7 +167,7 @@ class MarketScanner:
             err_msg = str(e) or repr(e)
             logger.error("시장 스캔 AI 분석 실패 ({}): {}", type(e).__name__, err_msg)
             await activity_logger.log(
-                "SCAN", "ERROR",
+                ActivityType.SCAN, ActivityPhase.ERROR,
                 f"\u274c 시장 스캔 실패: [{type(e).__name__}] {err_msg[:100]}",
                 cycle_id=cycle_id,
                 error_message=err_msg,
@@ -179,13 +209,15 @@ class MarketScanner:
     async def _get_volume_rank(self) -> list[dict]:
         resp = await mcp_client.get_volume_rank()
         if resp.success and resp.data:
-            return resp.data.get("stocks", resp.data.get("items", []))
+            stocks = resp.data.get("stocks", resp.data.get("items", []))
+            return self._filter_untradeable(stocks)
         return []
 
     async def _get_fluctuation_rank(self, sort: str) -> list[dict]:
         resp = await mcp_client.get_fluctuation_rank(sort=sort)
         if resp.success and resp.data:
-            return resp.data.get("stocks", resp.data.get("items", []))
+            stocks = resp.data.get("stocks", resp.data.get("items", []))
+            return self._filter_untradeable(stocks)
         return []
 
     def _format_data(self, data: list[dict]) -> str:
