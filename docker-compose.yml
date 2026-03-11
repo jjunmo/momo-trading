@@ -25,10 +25,13 @@ services:
     ports:
       - "3100:3000"
     environment:
-      - KIS_APP_KEY=${KIS_PAPER_APP_KEY:-${KIS_APP_KEY}}
-      - KIS_APP_SECRET=${KIS_PAPER_APP_SECRET:-${KIS_APP_SECRET}}
+      - KIS_APP_KEY=${KIS_APP_KEY}
+      - KIS_APP_SECRET=${KIS_APP_SECRET}
+      - KIS_PAPER_APP_KEY=${KIS_PAPER_APP_KEY}
+      - KIS_PAPER_APP_SECRET=${KIS_PAPER_APP_SECRET}
+      - KIS_CANO=${KIS_ACCT_STOCK}
+      - KIS_PAPER_CANO=${KIS_PAPER_STOCK}
       - KIS_ACCOUNT_TYPE=${KIS_ACCOUNT_TYPE:-VIRTUAL}
-      - KIS_CANO=${KIS_PAPER_STOCK:-${KIS_ACCT_STOCK}}
       - PYTHONUNBUFFERED=1
     logging:
       driver: json-file

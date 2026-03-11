@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
     RECOMMENDATION_EXPIRE_MIN: int = 60
-    MIN_BUY_QUANTITY: int = 5
+    MIN_BUY_QUANTITY: int = 1
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     BUY_CUTOFF_MINUTE: int = 30
     FORCE_LIQUIDATION_HOUR: int = 15  # 강제 청산 시각 (종가경매 전)
     FORCE_LIQUIDATION_MINUTE: int = 10
-    MAX_DAILY_TRADES: int = 20
+    MAX_DAILY_TRADES: int = 0  # 0 = 무제한
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정 (시스템 하드 리밋 없음)
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
 
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
 
     @property
     def is_paper_trading(self) -> bool:
-        return bool(self.KIS_PAPER_APP_KEY)
+        return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
 
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""

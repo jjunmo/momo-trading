@@ -60,8 +60,8 @@ class KISWebSocket:
                     "https://openapi.koreainvestment.com:9443/oauth2/Approval",
                     json={
                         "grant_type": "client_credentials",
-                        "appkey": settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY,
-                        "secretkey": settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET,
+                        "appkey": settings.KIS_PAPER_APP_KEY if settings.is_paper_trading else settings.KIS_APP_KEY,
+                        "secretkey": settings.KIS_PAPER_APP_SECRET if settings.is_paper_trading else settings.KIS_APP_SECRET,
                     },
                 )
                 if resp.status_code == 200:
