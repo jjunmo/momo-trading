@@ -9,3 +9,4 @@ from models.recommendation import Recommendation
 from models.trade_result import TradeResult
 from models.agent_activity import AgentActivityLog
 from models.daily_report import DailyReport
+from models.trading_rule import TradingRule

@@ -72,6 +72,17 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
 - 리스크: 손절/익절 기준이 적절했는지
 - 시스템 개선: 스캔/분석/매매 과정에서 개선할 점
 
+### 4. 액션 아이템 (내일 코드에 자동 적용될 규칙)
+위 피드백에서 도출된 **구체적 파라미터 변경**을 action_items에 기록하세요.
+- 시스템이 코드 레벨에서 자동으로 강제 적용합니다 (프롬프트 제안이 아닌 하드 강제)
+- 사용 가능한 param_name:
+  - min_confidence: 최소 신뢰도 임계값 (0.50~0.90) — Tier1 결과가 이 값 미만이면 Tier2 진행 차단
+  - stop_loss_pct: 손절 % (음수, -8.0~-1.0)
+  - take_profit_pct: 익절 % (2.0~15.0)
+  - rr_floor: 최소 리스크:보상 비율 (0.8~3.0)
+- 변경이 불필요하면 빈 배열 []로 두세요
+- 예시: 오늘 62% 신뢰도 종목이 손실 → {{"param_name": "min_confidence", "param_value": 0.75}}
+
 JSON 형식으로 답변:
 ```json
 {{
@@ -100,6 +111,16 @@ JSON 형식으로 답변:
   "risk_alerts": [
     "HIGH/MEDIUM/LOW: 내일 주의할 리스크"
   ],
-  "confidence_score": 0.0
+  "confidence_score": 0.0,
+  "action_items": [
+    {{
+      "rule_type": "PARAM_OVERRIDE",
+      "strategy_type": "ALL 또는 STABLE_SHORT 또는 AGGRESSIVE_SHORT",
+      "param_name": "min_confidence | stop_loss_pct | take_profit_pct | rr_floor",
+      "param_value": 0.0,
+      "reason": "구체적 근거 (오늘 어떤 문제에서 이 규칙이 필요한지)",
+      "priority": "HIGH/MEDIUM/LOW"
+    }}
+  ]
 }}
 ```"""

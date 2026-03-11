@@ -20,9 +20,13 @@ class DailyReport(Base, TimestampMixin):
     total_analyses: Mapped[int] = mapped_column(Integer, default=0)
     total_recommendations: Mapped[int] = mapped_column(Integer, default=0)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)
+    buy_count: Mapped[int] = mapped_column(Integer, default=0)
+    sell_count: Mapped[int] = mapped_column(Integer, default=0)
     win_count: Mapped[int] = mapped_column(Integer, default=0)
     loss_count: Mapped[int] = mapped_column(Integer, default=0)
-    total_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    total_pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 실현 손익
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 미실현 손익
+    open_position_count: Mapped[int] = mapped_column(Integer, default=0)
 
     # AI 요약 (LLM 생성)
     market_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
