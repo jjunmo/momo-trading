@@ -87,19 +87,18 @@ class TradingAgent:
 
         async with self._cycle_lock:
             if market_calendar.is_krx_trading_hours():
-                # 데이트레이딩: 매수 마감 시간 이후엔 신규 매수 차단
-                if settings.DAY_TRADING_ONLY:
-                    from datetime import time as _time
-                    from util.time_util import now_kst
-                    cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-                    if now_kst().time() >= cutoff:
-                        logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
-                        await activity_logger.log(
-                            ActivityType.CYCLE, ActivityPhase.COMPLETE,
-                            f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — "
-                            "신규 매수 차단, 보유종목 모니터링만 유지",
-                        )
-                        return {"skipped": True, "reason": "buy_cutoff"}
+                # 매수 마감 시간 이후엔 신규 매수 차단 (DAY_TRADING/스윙 모두 적용)
+                from datetime import time as _time
+                from util.time_util import now_kst
+                cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
+                if now_kst().time() >= cutoff:
+                    logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
+                    await activity_logger.log(
+                        ActivityType.CYCLE, ActivityPhase.COMPLETE,
+                        f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — "
+                        "신규 매수 차단, 보유종목 모니터링만 유지",
+                    )
+                    return {"skipped": True, "reason": "buy_cutoff"}
                 return await self._run_trading_cycle()
             else:
                 return await self._run_after_hours_cycle()
@@ -857,7 +856,36 @@ class TradingAgent:
             except Exception as e:
                 logger.warning("성과 요약 실패: {}", str(e))
 
-            # 5. LLM으로 성과 리뷰
+            # 5. 오버나이트 보유종목 현황 (스윙 모드)
+            overnight_holdings_text = "없음 (당일 청산 모드)" if settings.DAY_TRADING_ONLY else "없음"
+            if not settings.DAY_TRADING_ONLY:
+                try:
+                    async with AsyncSessionLocal() as session:
+                        from repositories.trade_result_repository import TradeResultRepository
+                        from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
+                        repo = TradeResultRepository(session)
+                        open_positions = await repo.get_all_open()
+                        if open_positions:
+                            lines = []
+                            for tr in open_positions:
+                                hold_days = _calc_hold_days(tr)
+                                max_days = _get_max_hold_days(tr.strategy_type, settings)
+                                conf = tr.ai_confidence or 0.0
+                                target_pct = ""
+                                if tr.ai_target_price and tr.entry_price > 0:
+                                    target_pct = f", 목표 도달률 {(tr.entry_price / tr.ai_target_price) * 100:.0f}%"
+                                lines.append(
+                                    f"- {tr.stock_name}({tr.stock_symbol}): "
+                                    f"보유 {hold_days}/{max_days}일, "
+                                    f"신뢰도 {conf:.2f}, "
+                                    f"전략 {tr.strategy_type}"
+                                    f"{target_pct}"
+                                )
+                            overnight_holdings_text = "\n".join(lines)
+                except Exception as e:
+                    logger.warning("오버나이트 보유종목 조회 실패: {}", str(e))
+
+            # 6. LLM으로 성과 리뷰
             t1_timer = activity_logger.timer()
             await activity_logger.log(
                 ActivityType.DAILY_PLAN, ActivityPhase.START,
@@ -883,6 +911,7 @@ class TradingAgent:
                 today_orders=today_orders,
                 activity_summary=activity_summary,
                 performance_summary=performance_summary,
+                overnight_holdings_text=overnight_holdings_text,
             )
 
             result_text, provider = await llm_factory.generate_tier1(
@@ -1223,13 +1252,21 @@ class TradingAgent:
         # 오늘 매매 성적
         stats = await self._get_today_trade_stats()
 
-        return (
+        context = (
             f"현재 시각: {now.strftime('%H:%M')} | "
             f"강제 청산까지: {minutes_left}분\n"
             f"오늘 누적 손익: {daily_pnl_pct:+.2f}% | "
             f"매매 성적: {stats['wins']}승 {stats['losses']}패 "
             f"(총 {stats['total']}건)"
         )
+
+        if not settings.DAY_TRADING_ONLY:
+            context += (
+                f"\n모드: 스윙 (STABLE {settings.MAX_HOLD_DAYS_STABLE}일, "
+                f"AGGRESSIVE {settings.MAX_HOLD_DAYS_AGGRESSIVE}일)"
+            )
+
+        return context
 
     async def _get_today_trade_stats(self) -> dict:
         """오늘 매매 승/패 집계 (trade_results 테이블)"""

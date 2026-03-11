@@ -15,6 +15,7 @@
   16:30  일봉 데이터 보관용 수집
 
 ※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
+※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
@@ -98,18 +99,17 @@ class TradingScheduler:
             misfire_grace_time=300,
         )
 
-        # ── 강제 청산 (15:18 평일) — 데이트레이딩: 보유종목 전량 시장가 매도 ──
-        if settings.DAY_TRADING_ONLY:
-            self.scheduler.add_job(
-                self._force_liquidation,
-                "cron",
-                hour=settings.FORCE_LIQUIDATION_HOUR,
-                minute=settings.FORCE_LIQUIDATION_MINUTE,
-                day_of_week="mon-fri",
-                id="force_liquidation",
-                name="장 마감 전 강제 청산",
-                misfire_grace_time=300,
-            )
+        # ── 장 마감 전 청산 (15:10 평일) — DAY_TRADING: 전량 매도 / 스윙: 스마트 청산 ──
+        self.scheduler.add_job(
+            self._force_liquidation,
+            "cron",
+            hour=settings.FORCE_LIQUIDATION_HOUR,
+            minute=settings.FORCE_LIQUIDATION_MINUTE,
+            day_of_week="mon-fri",
+            id="force_liquidation",
+            name="장 마감 전 청산",
+            misfire_grace_time=300,
+        )
 
         # ── 장 마감 리뷰 (15:40 평일) — KRX 종가 기반 성과 리뷰 ──
         self.scheduler.add_job(
@@ -220,7 +220,11 @@ class TradingScheduler:
         except Exception as e:
             logger.debug("어제 리뷰 로드 실패: {}", str(e))
 
-        # 3. 활성 트레이딩 규칙 로드 + 적용 (일일 리뷰 피드백 자동 학습)
+        # 3. 오버나이트 포지션 점검 (스윙 모드)
+        if not settings.DAY_TRADING_ONLY:
+            await self._check_overnight_positions()
+
+        # 4. 활성 트레이딩 규칙 로드 + 적용 (일일 리뷰 피드백 자동 학습)
         try:
             from analysis.feedback.trading_rules import trading_rule_engine
             from agent.trading_agent import trading_agent
@@ -276,6 +280,10 @@ class TradingScheduler:
         )
 
         try:
+            # 0. 오버나이트 포지션 갭 체크 (스윙 모드)
+            if not settings.DAY_TRADING_ONLY:
+                await self._check_overnight_gap()
+
             # 1. AI Agent 매매 사이클 실행 (전체 시장 스캔 → 분석 → 매매)
             result = await trading_agent.run_cycle()
 
@@ -526,10 +534,10 @@ class TradingScheduler:
             logger.warning("장외 리뷰 체크 실패: {}", str(e))
 
     async def _force_liquidation(self) -> None:
-        """장 마감 전 강제 청산 — 보유종목 전량 시장가 매도 (데이트레이딩, 병렬)
+        """장 마감 전 청산
 
-        종가경매(15:20~15:30) 진입 전에 모든 보유종목을 시장가 매도하여
-        오버나이트 포지션을 방지한다. asyncio.gather로 병렬 주문 실행.
+        DAY_TRADING_ONLY=True: 보유종목 전량 시장가 매도 (기존 동작)
+        DAY_TRADING_ONLY=False: 종목별 스마트 판정 (HOLD/SELL)
         """
         import asyncio
         from scheduler.market_calendar import market_calendar
@@ -539,14 +547,8 @@ class TradingScheduler:
             return
 
         if not settings.TRADING_ENABLED:
-            logger.info("매매 비활성 — 강제 청산 스킵")
+            logger.info("매매 비활성 — 청산 스킵")
             return
-
-        logger.warning("=== 장 마감 전 강제 청산 시작 ===")
-        await activity_logger.log(
-            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            "\U0001f6a8 데이트레이딩 강제 청산 — 보유종목 전량 시장가 매도 (병렬)",
-        )
 
         try:
             from trading.account_manager import account_manager
@@ -564,18 +566,36 @@ class TradingScheduler:
             if not sellable:
                 return
 
+            # 스윙 모드: 종목별 HOLD/SELL 판정
+            if not settings.DAY_TRADING_ONLY:
+                to_sell, to_hold = await self._smart_liquidation(sellable)
+            else:
+                to_sell = sellable
+                to_hold = []
+
+            mode_label = "스마트 청산" if not settings.DAY_TRADING_ONLY else "강제 청산"
+            logger.warning("=== 장 마감 전 {} 시작 (매도 {}건, HOLD {}건) ===",
+                           mode_label, len(to_sell), len(to_hold))
+            await activity_logger.log(
+                ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
+                f"\U0001f6a8 {mode_label} — 매도 {len(to_sell)}건, HOLD {len(to_hold)}건",
+            )
+
+            if not to_sell:
+                return
+
             async def _sell_one(h):
                 resp = await _mcp.place_order(
                     symbol=h.symbol,
                     side="SELL",
                     quantity=h.quantity,
-                    price=None,  # 시장가
+                    price=None,
                     market="KRX",
                 )
                 return (resp, h)
 
             results = await asyncio.gather(
-                *[_sell_one(h) for h in sellable],
+                *[_sell_one(h) for h in to_sell],
                 return_exceptions=True,
             )
 
@@ -584,7 +604,7 @@ class TradingScheduler:
 
             for r in results:
                 if isinstance(r, Exception):
-                    logger.error("강제 청산 주문 오류: {}", str(r))
+                    logger.error("청산 주문 오류: {}", str(r))
                     continue
 
                 resp, h = r
@@ -593,28 +613,28 @@ class TradingScheduler:
                     pnl_text = f"{h.pnl_rate:+.1f}%" if hasattr(h, "pnl_rate") else ""
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.COMPLETE,
-                        f"\U0001f6a8 강제 청산: {h.name}({h.symbol}) "
+                        f"\U0001f6a8 청산: {h.name}({h.symbol}) "
                         f"{h.quantity}주 시장가 매도 {pnl_text}",
                         symbol=h.symbol,
                     )
                 else:
                     failed_holdings.append(h)
                     logger.error(
-                        "강제 청산 실패: {}({}) — {}",
+                        "청산 실패: {}({}) — {}",
                         h.name, h.symbol, resp.error or "알 수 없는 오류",
                     )
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.ERROR,
-                        f"\u274c 강제 청산 실패: {h.name}({h.symbol}) — {resp.error or ''}",
+                        f"\u274c 청산 실패: {h.name}({h.symbol}) — {resp.error or ''}",
                         symbol=h.symbol,
                     )
 
             # 실패 종목 2차 재시도 (5초 후)
             if failed_holdings:
-                logger.warning("강제 청산 {}건 실패 → 5초 후 재시도", len(failed_holdings))
+                logger.warning("청산 {}건 실패 → 5초 후 재시도", len(failed_holdings))
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                    f"\u26a0\ufe0f 강제 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
+                    f"\u26a0\ufe0f 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
                 )
                 await asyncio.sleep(5)
                 retry_results = await asyncio.gather(
@@ -623,32 +643,210 @@ class TradingScheduler:
                 )
                 for r in retry_results:
                     if isinstance(r, Exception):
-                        logger.error("강제 청산 재시도 오류: {}", str(r))
+                        logger.error("청산 재시도 오류: {}", str(r))
                         continue
                     resp, h = r
                     if resp.success:
                         sold_count += 1
-                        logger.info("강제 청산 재시도 성공: {}({})", h.name, h.symbol)
+                        logger.info("청산 재시도 성공: {}({})", h.name, h.symbol)
                     else:
-                        logger.error("강제 청산 재시도 실패: {}({}) — {}", h.name, h.symbol, resp.error or "")
+                        logger.error("청산 재시도 실패: {}({}) — {}", h.name, h.symbol, resp.error or "")
 
-            fail_count = len(failed_holdings)
-            summary = f"\U0001f6a8 강제 청산 완료: {sold_count}건 매도"
-            if fail_count:
-                summary += f", {fail_count}건 실패 (재시도 포함)"
+            summary = f"\U0001f6a8 {mode_label} 완료: {sold_count}건 매도"
+            if to_hold:
+                hold_names = ", ".join(f"{h.name}" for h in to_hold)
+                summary += f" | HOLD {len(to_hold)}건: {hold_names}"
+            if failed_holdings:
+                summary += f" | 실패 {len(failed_holdings)}건"
             await activity_logger.log(ActivityType.SCHEDULE, ActivityPhase.PROGRESS, summary)
 
-            # 청산 후 이벤트 감시 임계값 제거
+            # 매도한 종목만 이벤트 감시 임계값 제거 (HOLD 종목은 유지)
             from realtime.event_detector import event_detector
+            sold_symbols = {h.symbol for h in to_sell}
             for h in holdings:
-                event_detector.remove_levels(h.symbol)
+                if h.symbol in sold_symbols:
+                    event_detector.remove_levels(h.symbol)
 
         except Exception as e:
-            logger.error("강제 청산 오류: {}", str(e))
+            logger.error("청산 오류: {}", str(e))
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.ERROR,
-                f"\u274c 강제 청산 오류: {str(e)[:100]}",
+                f"\u274c 청산 오류: {str(e)[:100]}",
             )
+
+    async def _smart_liquidation(self, sellable: list) -> tuple[list, list]:
+        """스윙 모드: 종목별 HOLD/SELL 판정 (코드 룰 기반)
+
+        Returns:
+            (to_sell, to_hold) 두 리스트
+        """
+        from core.database import AsyncSessionLocal
+        from repositories.trade_result_repository import TradeResultRepository
+        from strategy.holding_policy import evaluate_overnight_hold
+        from trading.mcp_client import mcp_client as _mcp
+
+        to_sell = []
+        to_hold = []
+
+        async with AsyncSessionLocal() as session:
+            repo = TradeResultRepository(session)
+
+            for h in sellable:
+                try:
+                    # 현재가 조회
+                    resp = await _mcp.get_current_price(h.symbol)
+                    current_price = 0.0
+                    if resp.success and resp.data:
+                        current_price = float(resp.data.get("price", 0))
+
+                    if current_price <= 0:
+                        to_sell.append(h)
+                        logger.warning("현재가 조회 실패 {} → SELL", h.symbol)
+                        continue
+
+                    # TradeResult (미청산 매수)
+                    trade_result = await repo.get_open_buy(h.symbol)
+
+                    decision = evaluate_overnight_hold(
+                        h, trade_result, current_price, settings,
+                    )
+
+                    if decision.action == "HOLD":
+                        to_hold.append(h)
+                        logger.info("스마트 청산 HOLD: {} — {}", h.symbol, decision.reason)
+                    else:
+                        to_sell.append(h)
+                        logger.info("스마트 청산 SELL: {} — {}", h.symbol, decision.reason)
+                except Exception as e:
+                    to_sell.append(h)
+                    logger.warning("스마트 청산 판정 오류 {} → SELL: {}", h.symbol, str(e))
+
+        return to_sell, to_hold
+
+    async def _check_overnight_positions(self) -> None:
+        """오버나이트 포지션 프리마켓 점검 (08:50)
+
+        서버 재시작 대비 event_detector 임계값 재설정 + 보유일 경고.
+        """
+        from services.activity_logger import activity_logger
+
+        try:
+            from core.database import AsyncSessionLocal
+            from realtime.event_detector import event_detector
+            from repositories.trade_result_repository import TradeResultRepository
+
+            async with AsyncSessionLocal() as session:
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open()
+
+            if not open_positions:
+                return
+
+            restored = 0
+            warnings = []
+            for tr in open_positions:
+                # event_detector 임계값 재설정
+                kwargs = {}
+                if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
+                    kwargs["stop_loss"] = tr.ai_stop_loss_price
+                if tr.ai_target_price and tr.ai_target_price > 0:
+                    kwargs["take_profit"] = tr.ai_target_price
+                if kwargs:
+                    event_detector.set_thresholds(tr.stock_symbol, **kwargs)
+                    restored += 1
+
+                # 최대 보유일 경고
+                from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
+                hold_days = _calc_hold_days(tr)
+                max_days = _get_max_hold_days(tr.strategy_type, settings)
+                if hold_days >= max_days:
+                    warnings.append(
+                        f"{tr.stock_name}({tr.stock_symbol}): 보유 {hold_days}일 ≥ 최대 {max_days}일"
+                    )
+
+            msg = f"\U0001f30d 오버나이트 포지션 {len(open_positions)}건 점검"
+            if restored:
+                msg += f" | 임계값 복원 {restored}건"
+            if warnings:
+                msg += f" | ⚠️ 초과보유: {', '.join(warnings)}"
+
+            logger.info(msg)
+            await activity_logger.log(
+                ActivityType.SCHEDULE, ActivityPhase.PROGRESS, msg,
+            )
+        except Exception as e:
+            logger.warning("오버나이트 포지션 점검 오류: {}", str(e))
+
+    async def _check_overnight_gap(self) -> None:
+        """장 시작 갭 체크 (09:05) — 오버나이트 포지션 손절/익절 즉시 처리"""
+        from services.activity_logger import activity_logger
+
+        try:
+            from core.database import AsyncSessionLocal
+            from repositories.trade_result_repository import TradeResultRepository
+            from trading.account_manager import account_manager
+            from trading.mcp_client import mcp_client as _mcp
+
+            holdings = await account_manager.get_holdings()
+            if not holdings:
+                return
+
+            async with AsyncSessionLocal() as session:
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open()
+
+            # symbol → TradeResult 매핑
+            open_map = {tr.stock_symbol: tr for tr in open_positions}
+
+            alerts = []
+            for h in holdings:
+                if h.quantity <= 0:
+                    continue
+                tr = open_map.get(h.symbol)
+                if not tr:
+                    continue  # 당일 매수 등 — 갭 체크 불필요
+
+                resp = await _mcp.get_current_price(h.symbol)
+                if not resp.success or not resp.data:
+                    continue
+                current = float(resp.data.get("price", 0))
+                if current <= 0:
+                    continue
+
+                should_sell = False
+                reason = ""
+
+                # 갭 하락 → 손절가 이하
+                if tr.ai_stop_loss_price and current <= tr.ai_stop_loss_price:
+                    should_sell = True
+                    reason = f"갭 하락 손절 (현재 {current:,.0f} ≤ 손절 {tr.ai_stop_loss_price:,.0f})"
+
+                # 갭 상승 → 익절가 이상
+                elif tr.ai_target_price and current >= tr.ai_target_price:
+                    should_sell = True
+                    reason = f"갭 상승 익절 (현재 {current:,.0f} ≥ 목표 {tr.ai_target_price:,.0f})"
+
+                if should_sell and settings.TRADING_ENABLED:
+                    sell_resp = await _mcp.place_order(
+                        symbol=h.symbol, side="SELL",
+                        quantity=h.quantity, price=None, market="KRX",
+                    )
+                    status = "성공" if sell_resp.success else f"실패: {sell_resp.error or ''}"
+                    alerts.append(f"\U0001f6a8 {h.name}({h.symbol}): {reason} → 매도 {status}")
+                    if sell_resp.success:
+                        from realtime.event_detector import event_detector
+                        event_detector.remove_levels(h.symbol)
+                elif should_sell:
+                    alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} (TRADING_ENABLED=false)")
+
+            if alerts:
+                msg = "\U0001f30d 오버나이트 갭 체크:\n" + "\n".join(alerts)
+                logger.info(msg)
+                await activity_logger.log(
+                    ActivityType.SCHEDULE, ActivityPhase.PROGRESS, msg,
+                )
+        except Exception as e:
+            logger.warning("오버나이트 갭 체크 오류: {}", str(e))
 
     async def _expire_recommendations(self) -> None:
         """만료된 추천 처리"""

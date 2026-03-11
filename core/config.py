@@ -44,11 +44,13 @@ class Settings(BaseSettings):
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
-    DAY_TRADING_ONLY: bool = True  # 당일 청산 필수 (데이트레이딩 모드)
+    DAY_TRADING_ONLY: bool = False  # True=당일 청산 필수, False=스윙 (유망 종목 오버나이트 보유)
     BUY_CUTOFF_HOUR: int = 14  # 신규 매수 마감 시각 (14시 이후 매수 차단)
     BUY_CUTOFF_MINUTE: int = 30
     FORCE_LIQUIDATION_HOUR: int = 15  # 강제 청산 시각 (종가경매 전)
     FORCE_LIQUIDATION_MINUTE: int = 10
+    MAX_HOLD_DAYS_STABLE: int = 5  # STABLE_SHORT 최대 보유일
+    MAX_HOLD_DAYS_AGGRESSIVE: int = 3  # AGGRESSIVE_SHORT 최대 보유일
     MAX_DAILY_TRADES: int = 0  # 0 = 무제한
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정 (시스템 하드 리밋 없음)
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
