@@ -221,6 +221,10 @@ class DecisionMaker:
                 cycle_id=cycle_id,
             )
 
+            # 체결 확인 후 계좌 캐시 무효화 → 다음 조회 시 최신 반영
+            from trading.account_manager import account_manager
+            account_manager.invalidate_cache()
+
         except Exception as e:
             logger.error("[{}] 체결 확인/기록 실패: {}", symbol, str(e))
 

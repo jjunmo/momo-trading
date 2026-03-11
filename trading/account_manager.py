@@ -19,6 +19,12 @@ class AccountManager:
         self._holdings_cache: list[HoldingInfo] | None = None
         self._pending_orders_cache: list[PendingOrderInfo] | None = None
 
+    def invalidate_cache(self) -> None:
+        """캐시 무효화 (체결 후 즉시 최신 데이터 조회 강제)"""
+        self._balance_cache = None
+        self._holdings_cache = None
+        self._pending_orders_cache = None
+
     def _empty_balance(self) -> AccountBalance:
         return AccountBalance(
             total_asset=0, cash=0, stock_value=0,

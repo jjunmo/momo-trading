@@ -40,7 +40,8 @@ function connectSSE() {
       if (msg.type === 'connected') return;
       if (msg.type === 'activity' && currentView === 'live') {
         appendActivity(msg.data);
-        if (msg.data && msg.data.activity_type === 'DECISION' && msg.data.phase === 'COMPLETE') {
+        if (msg.data && msg.data.phase === 'COMPLETE' &&
+            ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
           setTimeout(loadAccountInfo, 2000);
         }
       }

@@ -20,7 +20,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def get_by_strategy(self, strategy_type: str, limit: int = 100) -> list[TradeResult]:
@@ -30,7 +30,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def get_recent(self, limit: int = 50) -> list[TradeResult]:
@@ -39,7 +39,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def get_open_buy(self, symbol: str) -> TradeResult | None:
@@ -54,7 +54,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             .order_by(TradeResult.created_at.desc())
             .limit(1)
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_completed_by_date(self, target_date: date) -> list[TradeResult]:
@@ -70,7 +70,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             ))
             .order_by(TradeResult.exit_at.asc())
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def get_opened_by_date(self, target_date: date) -> list[TradeResult]:
@@ -86,7 +86,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             ))
             .order_by(TradeResult.entry_at.asc())
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def get_all_open(self) -> list[TradeResult]:
@@ -99,5 +99,5 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
             ))
             .order_by(TradeResult.created_at.desc())
         )
-        result = await self.session.execute(stmt)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
