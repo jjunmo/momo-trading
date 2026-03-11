@@ -8,6 +8,8 @@ from loguru import logger
 from admin.sse_manager import sse_manager
 from core.database import AsyncSessionLocal
 from models.agent_activity import AgentActivityLog
+from trading.enums import ActivityPhase, ActivityType
+from util.time_util import now_kst
 
 
 class ActivityLogger:
@@ -18,8 +20,8 @@ class ActivityLogger:
 
     async def log(
         self,
-        activity_type: str,
-        phase: str,
+        activity_type: ActivityType | str,
+        phase: ActivityPhase | str,
         summary: str,
         *,
         cycle_id: str | None = None,
@@ -34,8 +36,10 @@ class ActivityLogger:
     ) -> AgentActivityLog | None:
         """활동 기록 → DB 저장 + SSE 브로드캐스트"""
         detail_json = json.dumps(detail, ensure_ascii=False, default=str) if detail else None
+        ts = now_kst()
 
         entry = AgentActivityLog(
+            created_at=ts,
             cycle_id=cycle_id,
             activity_type=activity_type,
             phase=phase,
@@ -75,7 +79,7 @@ class ActivityLogger:
                     "execution_time_ms": execution_time_ms,
                     "confidence": confidence,
                     "error_message": error_message,
-                    "created_at": str(entry.created_at),
+                    "created_at": ts.isoformat(),
                 },
             })
         except Exception as e:

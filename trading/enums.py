@@ -97,3 +97,35 @@ class LLMTier(str, Enum):
 class LLMProvider(str, Enum):
     """LLM 제공자"""
     CLAUDE_CODE = "CLAUDE_CODE"  # 로컬 Claude Code CLI (구독 크레딧)
+
+
+class ActivityType(str, Enum):
+    """에이전트 활동 유형"""
+    CYCLE = "CYCLE"
+    SCAN = "SCAN"
+    SCREENING = "SCREENING"
+    TIER1_ANALYSIS = "TIER1_ANALYSIS"
+    TIER2_REVIEW = "TIER2_REVIEW"
+    STRATEGY_EVAL = "STRATEGY_EVAL"
+    RISK_CHECK = "RISK_CHECK"
+    RISK_TUNING = "RISK_TUNING"
+    RISK_GATE = "RISK_GATE"
+    DECISION = "DECISION"
+    TRADE_RESULT = "TRADE_RESULT"
+    ORDER = "ORDER"
+    EVENT = "EVENT"
+    LLM_CALL = "LLM_CALL"
+    DAILY_PLAN = "DAILY_PLAN"
+    REPORT = "REPORT"
+    SCHEDULE = "SCHEDULE"
+    HOLDINGS_CHECK = "HOLDINGS_CHECK"
+    TRADING_RULE = "TRADING_RULE"
+
+
+class ActivityPhase(str, Enum):
+    """활동 단계"""
+    START = "START"
+    PROGRESS = "PROGRESS"
+    COMPLETE = "COMPLETE"
+    ERROR = "ERROR"
+    SKIP = "SKIP"

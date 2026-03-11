@@ -6,7 +6,7 @@ from loguru import logger
 
 from analysis.llm.claude_code_provider import ClaudeCodeProvider
 from core.config import settings
-from trading.enums import LLMTier
+from trading.enums import ActivityPhase, ActivityType, LLMTier
 
 
 class LLMFactory:
@@ -81,7 +81,7 @@ class LLMFactory:
         try:
             from services.activity_logger import activity_logger
             await activity_logger.log(
-                "LLM_CALL", "COMPLETE",
+                ActivityType.LLM_CALL, ActivityPhase.COMPLETE,
                 f"[{tier.value}] {provider} ({model}) — {elapsed_ms/1000:.1f}초",
                 detail={
                     "llm_system_prompt": system_prompt[:2000] if system_prompt else "",
