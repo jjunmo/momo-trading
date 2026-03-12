@@ -87,18 +87,20 @@ class TradingAgent:
 
         async with self._cycle_lock:
             if market_calendar.is_krx_trading_hours():
-                # 매수 마감 시간 이후엔 신규 매수 차단 (DAY_TRADING/스윙 모두 적용)
-                from datetime import time as _time
-                from util.time_util import now_kst
-                cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-                if now_kst().time() >= cutoff:
-                    logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
-                    await activity_logger.log(
-                        ActivityType.CYCLE, ActivityPhase.COMPLETE,
-                        f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — "
-                        "신규 매수 차단, 보유종목 모니터링만 유지",
-                    )
-                    return {"skipped": True, "reason": "buy_cutoff"}
+                # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
+                # 스윙 모드: 오버나이트 보유 가능 → 장 마감(15:20)까지 매수 허용
+                if settings.DAY_TRADING_ONLY:
+                    from datetime import time as _time
+                    from util.time_util import now_kst
+                    cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
+                    if now_kst().time() >= cutoff:
+                        logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
+                        await activity_logger.log(
+                            ActivityType.CYCLE, ActivityPhase.COMPLETE,
+                            f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — "
+                            "신규 매수 차단, 보유종목 모니터링만 유지",
+                        )
+                        return {"skipped": True, "reason": "buy_cutoff"}
                 return await self._run_trading_cycle()
             else:
                 return await self._run_after_hours_cycle()
