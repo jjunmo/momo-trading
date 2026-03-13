@@ -897,7 +897,9 @@ async function loadLLMUsage() {
       document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">데이터 없음</div>';
       return;
     }
-    document.getElementById('usage-summary').innerHTML = `
+    const staleWarning = d.last_computed_date && d.last_computed_date !== new Date().toISOString().slice(0, 10)
+      ? `<div class="text-yellow-500 text-xs mb-1">⚠ 기준일: ${d.last_computed_date} (CLI 캐시 미갱신)</div>` : '';
+    document.getElementById('usage-summary').innerHTML = `${staleWarning}
       <div class="flex justify-between">
         <span class="text-gray-400">총 세션</span>
         <span class="text-white">${d.total_sessions.toLocaleString()}</span>

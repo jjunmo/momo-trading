@@ -271,6 +271,7 @@ async def get_llm_usage():
             "total_sessions": data.get("totalSessions", 0),
             "total_messages": data.get("totalMessages", 0),
             "first_session_date": data.get("firstSessionDate"),
+            "last_computed_date": data.get("lastComputedDate"),
             "model_usage": data.get("modelUsage", {}),
             "daily_activity": data.get("dailyActivity", []),
             "daily_model_tokens": data.get("dailyModelTokens", []),
