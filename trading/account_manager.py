@@ -41,9 +41,9 @@ class AccountManager:
         output2 = data.get("output2", [])
         if output2 and isinstance(output2, list):
             summary = output2[0] if output2 else {}
-            cash = float(summary.get("dnca_tot_amt", 0))
+            kis_total = float(summary.get("tot_evlu_amt", 0))
 
-            # 보유종목 평가합계 사용 (화면 일관성), 없으면 KIS output2 값 사용
+            # 주식 평가: 보유종목 기반 계산 (화면 일관성), fallback으로 KIS값
             if holdings:
                 stock_value = sum(
                     h.current_price * h.quantity for h in holdings
@@ -51,7 +51,11 @@ class AccountManager:
             else:
                 stock_value = float(summary.get("scts_evlu_amt", 0))
 
-            total_asset = cash + stock_value
+            # 총자산: KIS 공식 총평가금액 사용
+            total_asset = kis_total if kis_total > 0 else stock_value
+
+            # 현금: 총자산에서 주식평가 차감 (dnca_tot_amt는 총자산과 동일하여 사용 불가)
+            cash = total_asset - stock_value
 
             # 디버그 로깅: KIS 원본 필드값 기록
             kis_scts = float(summary.get("scts_evlu_amt", 0))
