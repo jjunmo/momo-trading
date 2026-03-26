@@ -1,8 +1,7 @@
-"""오버나이트 보유 판정 — 순수 코드 룰 기반 (LLM 호출 없음)
+"""오버나이트 보유 판정 — 코드 룰 기반 (LLM 폴백용)
 
-강제 청산 시점에 종목별로 HOLD/SELL을 판정한다.
-유망 종목(수익 중 + 고신뢰도 + 목표가 미도달 + 보유일 이내)은 보유 유지,
-나머지는 시장가 매도.
+LLM Tier1 판정 실패 시 폴백으로 사용된다.
+"확실한 위험" 종목만 청산하고 나머지는 보유 유지하는 완화된 기준.
 """
 from __future__ import annotations
 
@@ -48,11 +47,11 @@ def evaluate_overnight_hold(
 
     pnl_rate = (current_price - avg_price) / avg_price * 100
 
-    # 1. 손실 중 → SELL
-    if pnl_rate < 0:
+    # 1. 큰 손실 → SELL (소폭 손실은 스윙에서 정상 변동)
+    if pnl_rate < -3.0:
         return HoldDecision(
             "SELL",
-            f"손실 중 ({pnl_rate:+.1f}%) — 오버나이트 부적합",
+            f"손실 과대 ({pnl_rate:+.1f}% < -3%) — 손절 수준 도달",
         )
 
     # 2. 최대 보유일 초과 → SELL
@@ -64,12 +63,12 @@ def evaluate_overnight_hold(
             f"보유 {hold_days}일 ≥ 최대 {max_days}일 — 최대 보유일 초과",
         )
 
-    # 3. AI 신뢰도 낮음 → SELL
+    # 3. AI 신뢰도 매우 낮음 → SELL
     confidence = trade_result.ai_confidence or 0.0
-    if confidence < 0.65:
+    if confidence < 0.45:
         return HoldDecision(
             "SELL",
-            f"AI 신뢰도 {confidence:.2f} < 0.65 — 확신 부족",
+            f"AI 신뢰도 {confidence:.2f} < 0.45 — 확신 매우 부족",
         )
 
     # 4. 목표가 도달 → SELL (익절)
@@ -82,7 +81,7 @@ def evaluate_overnight_hold(
 
     # 모든 SELL 조건 통과 → HOLD
     target_text = f", 목표 {target_price:,.0f}원" if target_price else ""
-    logger.info(
+    logger.debug(
         "오버나이트 HOLD: {}  수익 {:.1f}%, 신뢰도 {:.2f}, 보유 {}/{}일{}",
         symbol, pnl_rate, confidence, hold_days, max_days, target_text,
     )

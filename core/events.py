@@ -74,7 +74,7 @@ class EventBus:
             return
         self._running = True
         self._task = asyncio.create_task(self._process_events())
-        logger.info("이벤트 버스 시작")
+        logger.debug("이벤트 버스 시작")
 
     async def stop(self) -> None:
         self._running = False
@@ -84,7 +84,7 @@ class EventBus:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("이벤트 버스 중지")
+        logger.debug("이벤트 버스 중지")
 
     async def _process_events(self) -> None:
         while self._running:

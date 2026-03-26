@@ -4,7 +4,7 @@ from loguru import logger
 
 async def daily_report_job() -> None:
     """일일 매매 리포트 생성"""
-    logger.info("일일 리포트 생성 시작")
+    logger.debug("일일 리포트 생성 시작")
     from services.daily_report_service import daily_report_service
     try:
         report = await daily_report_service.generate_daily_report()

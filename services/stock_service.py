@@ -43,7 +43,7 @@ class StockService:
             exchange_code=data.exchange_code,
         )
         created = await self.stock_repo.create(stock)
-        logger.info("종목 등록: {} ({})", data.symbol, data.name)
+        logger.debug("종목 등록: {} ({})", data.symbol, data.name)
         return created
 
     async def update(self, stock_id: str, data: StockUpdate) -> Stock:

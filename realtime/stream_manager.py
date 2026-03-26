@@ -25,7 +25,7 @@ class StreamManager:
         try:
             await kis_websocket.connect()
             self._listen_task = asyncio.create_task(self._run_listener())
-            logger.info("스트림 매니저 시작")
+            logger.debug("스트림 매니저 시작")
         except Exception as e:
             logger.warning("WebSocket 연결 실패 (나중에 재시도): {}", str(e))
 
@@ -39,7 +39,7 @@ class StreamManager:
             except asyncio.CancelledError:
                 pass
         await kis_websocket.disconnect()
-        logger.info("스트림 매니저 중지")
+        logger.debug("스트림 매니저 중지")
 
     async def subscribe_symbols(self, symbols: list[tuple[str, str]]) -> None:
         """종목 리스트 구독 (symbol, market) 쌍"""
@@ -82,7 +82,7 @@ class StreamManager:
             except Exception as e:
                 logger.error("WebSocket 리스너 오류: {}", str(e))
                 if self._running:
-                    logger.info("5초 후 재연결 시도...")
+                    logger.debug("5초 후 재연결 시도...")
                     await asyncio.sleep(5)
                     try:
                         await kis_websocket.connect()

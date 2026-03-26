@@ -38,7 +38,7 @@ class KISWebSocket:
         """WebSocket 연결 시작"""
         self._running = True
         await self._get_approval_key()
-        logger.info("KIS WebSocket 연결 시작")
+        logger.debug("KIS WebSocket 연결 시작")
 
     async def disconnect(self) -> None:
         """WebSocket 연결 종료"""
@@ -49,7 +49,7 @@ class KISWebSocket:
         self._ws_domestic = None
         self._ws_overseas = None
         self._subscriptions.clear()
-        logger.info("KIS WebSocket 연결 종료")
+        logger.debug("KIS WebSocket 연결 종료")
 
     async def _get_approval_key(self) -> None:
         """WebSocket 접속 키 발급"""

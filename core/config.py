@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # === AI Risk Tuning ===
     AI_RISK_TUNING_ENABLED: bool = True
     RISK_APPETITE: str = "AGGRESSIVE"  # CONSERVATIVE / MODERATE / AGGRESSIVE
-    MIN_CASH_RATIO: float = 0.05  # 최소 현금 비중 5% (빠른 대응 위한 여유금)
+    MIN_CASH_RATIO: float = 0.0  # 최소 현금 비중 (0 = 제한 없음, 소액 계좌에서 매수 차단 방지)
 
     # === Scheduler ===
     SCHEDULER_ENABLED: bool = True
@@ -87,7 +87,7 @@ class Settings(BaseSettings):
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
         claude_path = self._find_claude_path()
         if claude_path:
-            logger.info("Claude Code CLI 감지: {} — CLAUDE_CODE 프로바이더 사용", claude_path)
+            logger.debug("Claude Code CLI 감지: {} — CLAUDE_CODE 프로바이더 사용", claude_path)
         else:
             logger.warning(
                 "Claude Code CLI를 찾을 수 없음. "
@@ -101,7 +101,7 @@ class Settings(BaseSettings):
             )
 
         if not self.TRADING_ENABLED:
-            logger.info("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")
+            logger.debug("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")
 
 
     def _find_claude_path(self) -> str | None:

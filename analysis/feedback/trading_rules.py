@@ -13,7 +13,7 @@ from util.time_util import now_kst
 # 안전 범위: 파라미터별 (min, max)
 # ──────────────────────────────────────────────
 SAFETY_BOUNDS: dict[str, tuple[float, float]] = {
-    "min_confidence": (0.50, 0.90),
+    "min_confidence": (0.50, 0.75),
     "stop_loss_pct": (-8.0, -1.0),
     "take_profit_pct": (2.0, 15.0),
     "rr_floor": (0.8, 3.0),
@@ -23,7 +23,7 @@ SAFETY_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 MAX_ACTIVE_RULES = 20
-DEFAULT_EXPIRY_DAYS = 5
+DEFAULT_EXPIRY_DAYS = 2
 
 # 부트스트랩: 항상 활성화해야 할 기본 검증 규칙
 BOOTSTRAP_RULES = [
@@ -56,7 +56,7 @@ class TradingRuleEngine:
         """장 마감 리뷰 LLM 출력에서 action_items 파싱 → TradingRule 생성"""
         action_items = parsed_review.get("action_items") or []
         if not action_items:
-            logger.info("[TradingRule] action_items 없음 — 규칙 생성 스킵")
+            logger.debug("[TradingRule] action_items 없음 — 규칙 생성 스킵")
             return []
 
         now = now_kst()
@@ -72,10 +72,13 @@ class TradingRuleEngine:
             lo, hi = SAFETY_BOUNDS[param_name]
             clamped = max(lo, min(hi, raw_value))
             if clamped != raw_value:
-                logger.info(
+                logger.debug(
                     "[TradingRule] {} 값 클램핑: {} → {} (범위 {}~{})",
                     param_name, raw_value, clamped, lo, hi,
                 )
+
+            raw_expires = item.get("expires_days")
+            expires_days = max(1, min(5, int(raw_expires))) if raw_expires is not None else DEFAULT_EXPIRY_DAYS
 
             rule = TradingRule(
                 rule_type=item.get("rule_type", "PARAM_OVERRIDE"),
@@ -87,7 +90,7 @@ class TradingRuleEngine:
                 source_report_date=report_date,
                 priority=item.get("priority", "MEDIUM"),
                 is_active=True,
-                expires_at=now + timedelta(days=DEFAULT_EXPIRY_DAYS),
+                expires_at=now + timedelta(days=expires_days),
             )
             rules.append(rule)
 
@@ -136,7 +139,7 @@ class TradingRuleEngine:
 
             await session.commit()
 
-        logger.info("[TradingRule] {}건 규칙 생성 완료", len(rules))
+        logger.debug("[TradingRule] {}건 규칙 생성 완료", len(rules))
         return rules
 
     # ──────────────────────────────────────────
@@ -206,7 +209,7 @@ class TradingRuleEngine:
                     old_val = getattr(strategy_instance, param_name)
                     if old_val != param_value:
                         setattr(strategy_instance, param_name, param_value)
-                        logger.info(
+                        logger.debug(
                             "[TradingRule] {} {}: {} → {}",
                             strategy_key, param_name, old_val, param_value,
                         )
@@ -217,7 +220,7 @@ class TradingRuleEngine:
         for regime, floor in rr_overrides.items():
             old = risk_mgr.RR_FLOOR.get(regime)
             risk_mgr.RR_FLOOR[regime] = floor
-            logger.info(
+            logger.debug(
                 "[TradingRule] RR_FLOOR[{}]: {} → {}",
                 regime, old, floor,
             )
@@ -281,7 +284,7 @@ class TradingRuleEngine:
                 expires_at=now + timedelta(days=tmpl["expires_days"]),
             )
             session.add(rule)
-            logger.info("[TradingRule] 부트스트랩 규칙 생성: {}", tmpl["param_name"])
+            logger.debug("[TradingRule] 부트스트랩 규칙 생성: {}", tmpl["param_name"])
 
         await session.flush()
 

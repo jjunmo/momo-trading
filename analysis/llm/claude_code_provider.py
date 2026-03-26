@@ -70,7 +70,7 @@ class ClaudeCodeProvider:
         """새 세션 시작 — 사이클/거래일 시작 시 호출"""
         cls._active_session_id = str(uuid4())
         cls._session_initialized = False
-        logger.info("Claude Code 세션 시작: {}", cls._active_session_id[:8])
+        logger.debug("Claude Code 세션 시작: {}", cls._active_session_id[:8])
         return cls._active_session_id
 
     @classmethod
@@ -78,7 +78,7 @@ class ClaudeCodeProvider:
         """세션 종료 — 세션 ID 반환 (나중에 resume 가능)"""
         sid = cls._active_session_id
         if sid:
-            logger.info("Claude Code 세션 종료: {}", sid[:8])
+            logger.debug("Claude Code 세션 종료: {}", sid[:8])
         cls._active_session_id = None
         cls._session_initialized = False
         return sid
@@ -92,7 +92,7 @@ class ClaudeCodeProvider:
         """
         sid = cls._active_session_id
         if sid:
-            logger.info("Claude Code 세션 일시 중지: {} (병렬 구간)", sid[:8])
+            logger.debug("Claude Code 세션 일시 중지: {} (병렬 구간)", sid[:8])
         cls._active_session_id = None
         # _session_initialized는 보존 (resume 시 그대로 사용)
         return sid
@@ -102,7 +102,7 @@ class ClaudeCodeProvider:
         """이전 세션 재개 — 장 재개, 다음 사이클 등"""
         cls._active_session_id = session_id
         cls._session_initialized = True  # 이미 디스크에 존재
-        logger.info("Claude Code 세션 재개: {}", session_id[:8])
+        logger.debug("Claude Code 세션 재개: {}", session_id[:8])
 
     @classmethod
     def get_session_id(cls) -> str | None:

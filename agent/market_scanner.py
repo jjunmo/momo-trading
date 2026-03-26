@@ -28,7 +28,7 @@ class MarketScanner:
     def add_untradeable(self, symbol: str) -> None:
         """매매불가 종목을 런타임 블록리스트에 등록 (당일 스캔에서 제외)"""
         self._untradeable_symbols.add(symbol)
-        logger.info("매매불가 블록리스트 등록: {} (총 {}건)", symbol, len(self._untradeable_symbols))
+        logger.debug("매매불가 블록리스트 등록: {} (총 {}건)", symbol, len(self._untradeable_symbols))
 
     def _filter_untradeable(self, stocks: list[dict]) -> list[dict]:
         """매매불가 종목 필터링 (런타임 블록리스트 + 이름 키워드)"""
@@ -42,12 +42,29 @@ class MarketScanner:
                 continue
             filtered.append(s)
         if len(filtered) < len(stocks):
-            logger.info("매매불가 종목 필터: {}건 → {}건", len(stocks), len(filtered))
+            logger.debug("매매불가 종목 필터: {}건 → {}건", len(stocks), len(filtered))
         return filtered
+
+    def _build_price_lookup(self, *data_lists: list[dict]) -> dict[str, float]:
+        """스캔 데이터에서 종목코드→현재가 매핑"""
+        lookup: dict[str, float] = {}
+        for data in data_lists:
+            for item in data:
+                sym = item.get("symbol", item.get("code", ""))
+                if not sym:
+                    continue
+                raw = item.get("price", item.get("current_price", 0))
+                try:
+                    price = float(str(raw).replace(",", ""))
+                    if price > 0:
+                        lookup[sym] = price
+                except (ValueError, TypeError):
+                    continue
+        return lookup
 
     async def scan(self, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
-        logger.info("시장 스캔 시작")
+        logger.debug("시장 스캔 시작")
         timer = activity_logger.timer()
 
         await activity_logger.log(
@@ -72,13 +89,19 @@ class MarketScanner:
         )
         balance, holdings = account_snapshot
         available_cash = balance.cash
+        total_asset = balance.total_asset or available_cash
         max_pos_pct = 0.2
         if dynamic_limits:
             max_pos_pct = dynamic_limits.get("max_position_pct", 20.0) / 100
         max_per_stock = available_cash * max_pos_pct
 
+        # 현금 비율 매우 낮으면 보유종목 매도 검토 힌트
+        rotation_hint = ""
+        if total_asset > 0 and available_cash < total_asset * 0.1 and len(holdings) > 0:
+            rotation_hint = "⚠️ 현금 비율 매우 낮음 — 보유종목 중 정체/부진 종목 매도 검토 필요"
+
         data_elapsed = activity_logger.elapsed_ms(timer)
-        logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
+        logger.debug("MCP 데이터 수집 완료: {}ms", data_elapsed)
 
         # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
         from util.time_util import now_kst
@@ -95,8 +118,10 @@ class MarketScanner:
         prompt = MARKET_SCAN_PROMPT.format(
             current_time=now.strftime("%H:%M"),
             minutes_until_cutoff=minutes_until_cutoff,
+            total_asset=total_asset,
             available_cash=available_cash,
             max_per_stock=max_per_stock,
+            rotation_hint=rotation_hint,
             volume_rank_data=self._format_data(volume_rank),
             surge_data=self._format_data(surge_data),
             drop_data=self._format_data(drop_data),
@@ -112,6 +137,19 @@ class MarketScanner:
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
             elapsed = activity_logger.elapsed_ms(timer)
+
+            # 가격 기반 사전 필터: 1주 매수 불가능한 종목 제거
+            if available_cash > 0 and selected:
+                price_lookup = self._build_price_lookup(volume_rank, surge_data, drop_data)
+                before = len(selected)
+                selected = [
+                    s for s in selected
+                    if s.get("direction") != "BUY"
+                    or price_lookup.get(s.get("symbol", ""), 0) <= 0
+                    or price_lookup[s["symbol"]] <= available_cash
+                ]
+                if len(selected) < before:
+                    logger.debug("현금 필터: {}건 → {}건 (가용 {:,.0f}원)", before, len(selected), available_cash)
 
             logger.info(
                 "시장 스캔+선별 완료 ({}): {}개 선정 (데이터 {}ms + AI {}ms)",

@@ -17,7 +17,7 @@ class TradeResult(Base, TimestampMixin):
     __tablename__ = "trade_results"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, unique=True, index=True)
     stock_symbol: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     stock_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
@@ -53,6 +53,9 @@ class TradeResult(Base, TimestampMixin):
 
     # 메모
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 체결 확인 상태: PENDING_CONFIRM → CONFIRMED / CONFIRM_FAILED
+    status: Mapped[str] = mapped_column(String(20), default="CONFIRMED", index=True)
 
     entry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     exit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

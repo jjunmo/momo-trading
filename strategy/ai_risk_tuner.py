@@ -120,8 +120,8 @@ class AIRiskTuner:
                 float(parsed.get("max_position_pct", 25.0)), 5.0
             ),  # 상한선 없음
             "min_cash_ratio": max(
-                float(parsed.get("min_cash_ratio", 0.05)), 0.05
-            ),  # 최소 5%
+                float(parsed.get("min_cash_ratio", 0.0)), 0.0
+            ),  # 0 = 제한 없음
             "reasoning": parsed.get("reasoning", ""),
         }
 
@@ -132,7 +132,7 @@ class AIRiskTuner:
             "max_single_order_krw": settings.MAX_SINGLE_ORDER_KRW,  # 0 = 무제한
             "min_buy_quantity": settings.MIN_BUY_QUANTITY,
             "max_position_pct": 25.0,
-            "min_cash_ratio": 0.05,
+            "min_cash_ratio": 0.0,
             "reasoning": "AI 한도 결정 실패, 기본값 사용",
         }
 

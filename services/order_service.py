@@ -47,7 +47,7 @@ class OrderService:
             reason=data.reason,
         )
         created = await self.order_repo.create(order)
-        logger.info("주문 생성: {} {} {} x{}", data.symbol, data.side.value, data.order_type.value, data.quantity)
+        logger.debug("주문 생성: {} {} {} x{}", data.symbol, data.side.value, data.order_type.value, data.quantity)
         return created
 
     async def cancel(self, order_id: str) -> Order:

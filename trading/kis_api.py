@@ -123,7 +123,7 @@ async def _issue_new_token(client: httpx.AsyncClient) -> str | None:
         "expires_at": expires_at.isoformat(),
     }))
 
-    logger.info("KIS 토큰 신규 발급 완료")
+    logger.debug("KIS 토큰 신규 발급 완료")
     return token
 
 
@@ -248,11 +248,85 @@ async def get_volume_rank(market: str = "J") -> dict:
                 "change_sign": item.get("prdy_vrss_sign", ""),
             })
 
-        logger.info("거래량순위 조회 완료: {}건", len(stocks))
+        logger.debug("거래량순위 조회 완료: {}건", len(stocks))
         return {"success": True, "stocks": stocks}
     except Exception as e:
         logger.error("거래량순위 조회 오류: {}", str(e))
         return {"success": False, "error": str(e), "stocks": []}
+
+
+def _get_trading_domain() -> str:
+    """거래 API용 도메인 반환 (모의투자는 별도 도메인)"""
+    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+        return VIRTUAL_DOMAIN
+    return DOMAIN
+
+
+def _get_account() -> tuple[str, str]:
+    """계좌번호를 (CANO, ACNT_PRDT_CD)로 분리"""
+    cano = settings.KIS_PAPER_STOCK if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL" else settings.KIS_ACCT_STOCK
+    return cano, settings.KIS_PROD_TYPE
+
+
+async def get_buying_power(symbol: str, price: int = 0, order_dvsn: str = "01") -> dict:
+    """매수가능수량 조회 (KIS REST API 직접 호출)
+
+    Args:
+        symbol: 종목코드 (예: 005930)
+        price: 주문단가 (0이면 시장가)
+        order_dvsn: 주문구분 ("01"=시장가, "00"=지정가)
+
+    Returns:
+        {"success": bool, "max_qty": int, "available_cash": int}
+    """
+    cano, acnt_prdt_cd = _get_account()
+    domain = _get_trading_domain()
+    tr_id = "VTTC8434R" if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL" else "TTTC8908R"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token = await _get_access_token(client)
+            response = await client.get(
+                f"{domain}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": tr_id,
+                },
+                params={
+                    "CANO": cano,
+                    "ACNT_PRDT_CD": acnt_prdt_cd,
+                    "PDNO": symbol,
+                    "ORD_UNPR": str(price),
+                    "ORD_DVSN": order_dvsn,
+                    "CMA_EVLU_AMT_ICLD_YN": "N",
+                    "OVRS_ICLD_YN": "N",
+                },
+            )
+
+            if response.status_code != 200:
+                logger.warning("매수가능조회 실패: HTTP {}", response.status_code)
+                return {"success": False, "max_qty": 0, "available_cash": 0}
+
+            result = response.json()
+
+        output = result.get("output", {})
+        rt_cd = result.get("rt_cd", "1")
+        if rt_cd != "0":
+            msg = result.get("msg1", "")
+            logger.warning("매수가능조회 실패 ({}): {}", rt_cd, msg)
+            return {"success": False, "max_qty": 0, "available_cash": 0}
+
+        max_qty = int(output.get("nrcvb_buy_qty", "0"))
+        available_cash = int(output.get("ord_psbl_cash", "0"))
+
+        logger.debug("매수가능조회 [{}]: max_qty={}, cash={:,}", symbol, max_qty, available_cash)
+        return {"success": True, "max_qty": max_qty, "available_cash": available_cash}
+    except Exception as e:
+        logger.error("매수가능조회 오류 ({}): {}", symbol, str(e))
+        return {"success": False, "max_qty": 0, "available_cash": 0}
 
 
 async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
@@ -323,7 +397,7 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
                 "change_sign": item.get("prdy_vrss_sign", ""),
             })
 
-        logger.info("등락률순위({}) 조회 완료: {}건", sort, len(stocks))
+        logger.debug("등락률순위({}) 조회 완료: {}건", sort, len(stocks))
         return {"success": True, "stocks": stocks}
     except Exception as e:
         logger.error("등락률순위 조회 오류: {}", str(e))

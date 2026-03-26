@@ -39,7 +39,7 @@ class PortfolioService:
             cash=data.budget,
         )
         created = await self.portfolio_repo.create(portfolio)
-        logger.info("포트폴리오 생성: {} ({})", data.name, data.type.value)
+        logger.debug("포트폴리오 생성: {} ({})", data.name, data.type.value)
         return created
 
     async def update(self, portfolio_id: str, data: PortfolioUpdate) -> Portfolio:

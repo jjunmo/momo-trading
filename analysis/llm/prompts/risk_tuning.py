@@ -30,7 +30,7 @@ RISK_APPETITE_GUIDELINES = {
 - 소액(~10만원): 포지션 50~70%, 중액(10만~100만원): 15~25%, 대액(100만원~): 10~15%""",
 
     "AGGRESSIVE": """[공격적 성향]
-- 현금 비율 5~10% 유지 (최소 5%)
+- 현금 비율 0% 가능 (소액 계좌에서 현금 유보는 기회비용)
 - 빠른 추세 추종, 기회 적극 포착, 강세장에서 현금 보유가 오히려 리스크
 - 일일 거래 횟수 제한 없음
 - 소액(~10만원): 포지션 70~100%, 1~2종목 집중 (분산 의미 없음)
@@ -62,15 +62,17 @@ RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 위 정보를 분석하여 오늘의 적정 매매 한도를 자율적으로 결정해주세요.
 총자산 대비 적절한 단일 주문 금액, 포지션 비중, 현금 비율을 판단하세요.
 max_daily_trades=0은 무제한, max_single_order_krw=0은 무제한을 의미합니다.
+max_single_order_krw 설정 시 포트폴리오 내 고가 종목(10만~50만원대) 1주 매수가 가능하도록 고려하세요.
+너무 낮으면 좋은 기회를 놓칠 수 있습니다.
 
 JSON 형식으로 답변:
 ```json
 {{
   "max_daily_trades": 0,
   "max_single_order_krw": 0,
-  "min_buy_quantity": 5,
-  "max_position_pct": 25.0,
-  "min_cash_ratio": 0.05,
+  "min_buy_quantity": 1,
+  "max_position_pct": 50.0,
+  "min_cash_ratio": 0.0,
   "reasoning": "판단 근거"
 }}
 ```"""

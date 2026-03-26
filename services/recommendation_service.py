@@ -42,7 +42,7 @@ class RecommendationService:
         rec.status = "APPROVED"
         rec.approved_at = now
         updated = await self.recommendation_repo.update(rec)
-        logger.info("AI 추천 승인: {}", rec_id)
+        logger.debug("AI 추천 승인: {}", rec_id)
         return updated
 
     async def reject(self, rec_id: str) -> Recommendation:
@@ -51,7 +51,7 @@ class RecommendationService:
             raise ServiceException.bad_request(f"거절할 수 없는 상태입니다: {rec.status}")
         rec.status = "REJECTED"
         updated = await self.recommendation_repo.update(rec)
-        logger.info("AI 추천 거절: {}", rec_id)
+        logger.debug("AI 추천 거절: {}", rec_id)
         return updated
 
     async def expire_overdue(self) -> int:
@@ -63,5 +63,5 @@ class RecommendationService:
             await self.recommendation_repo.update(rec)
             count += 1
         if count > 0:
-            logger.info("만료된 추천 {} 건 처리", count)
+            logger.debug("만료된 추천 {} 건 처리", count)
         return count

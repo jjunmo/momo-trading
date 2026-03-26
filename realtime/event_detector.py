@@ -107,6 +107,11 @@ class EventDetector:
 
     async def on_price_update(self, data: dict) -> None:
         """실시간 가격 업데이트 처리 + 이벤트 감지"""
+        # 장외 시간: 이벤트 감지 불필요
+        from scheduler.market_calendar import market_calendar
+        if not market_calendar.is_krx_trading_hours():
+            return
+
         symbol = data.get("symbol", "")
         price = data.get("price", 0)
         volume = data.get("volume", 0)
@@ -160,7 +165,7 @@ class EventDetector:
         if avg_volume > 0 and volume > avg_volume * th.volume_spike_ratio:
             if not self._should_dedup(symbol, "VOLUME_SPIKE"):
                 spike_ratio = volume / avg_volume
-                logger.info("거래량 급증: {} ({:.1f}배, 기준 {:.1f}배)",
+                logger.debug("거래량 급증: {} ({:.1f}배, 기준 {:.1f}배)",
                             symbol, spike_ratio, th.volume_spike_ratio)
                 await event_bus.publish(Event(
                     type=EventType.VOLUME_SPIKE,
@@ -174,7 +179,7 @@ class EventDetector:
     ) -> None:
         if change_rate >= th.surge_pct:
             if not self._should_dedup(symbol, "PRICE_SURGE"):
-                logger.info("급등: {} ({:+.2f}%, 기준 {:.1f}%)",
+                logger.debug("급등: {} ({:+.2f}%, 기준 {:.1f}%)",
                             symbol, change_rate, th.surge_pct)
                 await event_bus.publish(Event(
                     type=EventType.PRICE_SURGE,
@@ -183,7 +188,7 @@ class EventDetector:
                 ))
         elif change_rate <= th.drop_pct:
             if not self._should_dedup(symbol, "PRICE_DROP"):
-                logger.info("급락: {} ({:+.2f}%, 기준 {:.1f}%)",
+                logger.debug("급락: {} ({:+.2f}%, 기준 {:.1f}%)",
                             symbol, change_rate, th.drop_pct)
                 await event_bus.publish(Event(
                     type=EventType.PRICE_DROP,
@@ -206,7 +211,7 @@ class EventDetector:
 
         if th.take_profit > 0 and price >= th.take_profit:
             if not self._should_dedup(symbol, "TAKE_PROFIT"):
-                logger.info("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f})",
+                logger.debug("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f})",
                             symbol, price, th.take_profit)
                 await event_bus.publish(Event(
                     type=EventType.TAKE_PROFIT_HIT,

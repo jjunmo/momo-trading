@@ -46,6 +46,9 @@ class MCPClient:
         self._call_timestamps: list[float] = []
         self._rate_lock = asyncio.Lock()
         self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
+        # P1-3: 주문 메타데이터 추적 (SSE 끊김 시 미확인 주문 복구용)
+        self._pending_order_meta: dict[int, dict] = {}  # msg_id → {tool_name, arguments, timestamp}
+        self._unconfirmed_orders: list[dict] = []  # SSE 끊김 시 보관
 
     @property
     def is_connected(self) -> bool:
@@ -71,7 +74,7 @@ class MCPClient:
         )
         try:
             await self._start_sse()
-            logger.info("MCP 서버 연결 성공: {}", self._base_url)
+            logger.debug("MCP 서버 연결 성공: {}", self._base_url)
         except Exception as e:
             logger.error("MCP 서버 연결 실패: {}", str(e))
             raise
@@ -92,19 +95,26 @@ class MCPClient:
         self._sse_client = None
         self._fail_all_pending("MCP 연결 종료")
         self._session_id = None
-        logger.info("MCP 서버 연결 종료")
+        logger.debug("MCP 서버 연결 종료")
 
     def _fail_all_pending(self, reason: str) -> None:
         """대기 중인 모든 Future를 즉시 실패 처리"""
         if not self._pending:
             return
         count = len(self._pending)
+        # P1-3: 주문 관련 메타를 미확인 목록에 보관
+        for msg_id in list(self._pending.keys()):
+            meta = self._pending_order_meta.pop(msg_id, None)
+            if meta:
+                self._unconfirmed_orders.append(meta)
         for msg_id, fut in list(self._pending.items()):
             if not fut.done():
                 fut.set_result({"error": {"message": reason}})
         self._pending.clear()
         if count:
             logger.warning("SSE 끊김 → 대기 요청 {}건 즉시 실패 처리: {}", count, reason)
+        if self._unconfirmed_orders:
+            logger.warning("미확인 주문 {}건 보관 (재연결 후 복구 예정)", len(self._unconfirmed_orders))
 
     async def _start_sse(self) -> None:
         """SSE 연결 시작 — 세션 ID 획득 → 프로토콜 초기화 → 백그라운드 리스너"""
@@ -152,7 +162,7 @@ class MCPClient:
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
         })
-        logger.info("MCP 프로토콜 초기화 완료")
+        logger.debug("MCP 프로토콜 초기화 완료")
 
     async def _sse_loop(self, initial_ready: asyncio.Event) -> None:
         """SSE 연결 유지 루프 — 끊기면 자동 재연결
@@ -193,8 +203,11 @@ class MCPClient:
                     await self._mcp_initialize()
                     self._reconnect_count = 0
                     delay = _SSE_RECONNECT_DELAY
-                    logger.info("MCP SSE 재연결 성공 (세션: {})",
+                    logger.debug("MCP SSE 재연결 성공 (세션: {})",
                                 self._session_id[:20] if self._session_id else "?")
+                    # P1-3: 재연결 후 미확인 주문 복구
+                    if self._unconfirmed_orders:
+                        asyncio.create_task(self._recover_unconfirmed_orders())
                 except Exception as e:
                     logger.warning("MCP SSE 재연결 실패: {}", str(e))
                     listen_task.cancel()
@@ -232,7 +245,7 @@ class MCPClient:
                 logger.error("MCP SSE 재연결 한도 초과 ({}회)", _SSE_MAX_RECONNECT_ATTEMPTS)
                 break
 
-            logger.info("MCP SSE 재연결 시도 ({}/{}) — {:.1f}초 대기",
+            logger.debug("MCP SSE 재연결 시도 ({}/{}) — {:.1f}초 대기",
                         self._reconnect_count, _SSE_MAX_RECONNECT_ATTEMPTS, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 1.5, _SSE_MAX_RECONNECT_DELAY)
@@ -357,6 +370,14 @@ class MCPClient:
         fut: asyncio.Future = loop.create_future()
         self._pending[msg_id] = fut
 
+        # P1-3: 주문 호출 메타데이터 추적
+        if tool_name == "order-stock":
+            self._pending_order_meta[msg_id] = {
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "timestamp": time.monotonic(),
+            }
+
         try:
             response = await self._post_client.post(self._session_id, json=payload)
             if response.status_code not in (200, 202):
@@ -385,25 +406,35 @@ class MCPClient:
                     try:
                         data = json.loads(text)
                     except (json.JSONDecodeError, KeyError):
-                        data = {"text": text}
+                        logger.warning("MCP 응답 JSON 파싱 실패 ({}): {}", tool_name, text[:200])
+                        self._pending_order_meta.pop(msg_id, None)
+                        return MCPResponse(
+                            success=False,
+                            error=f"응답 JSON 파싱 실패: {tool_name}",
+                            data={"raw_text": text[:500]},
+                        )
                     break
 
             if not data:
                 logger.warning("MCP 도구 응답 content 비어있음: {}", str(result)[:300])
                 return MCPResponse(success=False, error=f"빈 응답: {tool_name}", data={})
 
+            self._pending_order_meta.pop(msg_id, None)  # 성공 시 주문 메타 정리
             return MCPResponse(success=True, data=data)
 
         except asyncio.TimeoutError:
             self._pending.pop(msg_id, None)
+            self._pending_order_meta.pop(msg_id, None)
             logger.error("MCP 도구 호출 타임아웃: {}", tool_name)
             return MCPResponse(success=False, error=f"타임아웃: {tool_name}")
         except httpx.ConnectError:
             self._pending.pop(msg_id, None)
+            self._pending_order_meta.pop(msg_id, None)
             logger.error("MCP 서버 연결 불가: {}", self._base_url)
             return MCPResponse(success=False, error="MCP 서버 연결 불가")
         except Exception as e:
             self._pending.pop(msg_id, None)
+            self._pending_order_meta.pop(msg_id, None)
             logger.error("MCP 도구 호출 오류 ({}): {}", tool_name, str(e))
             return MCPResponse(success=False, error=str(e))
 
@@ -420,6 +451,87 @@ class MCPClient:
             await self._rate_limit()
             return await self._call_tool_inner(tool_name, arguments, _retry + 1)
         return MCPResponse(success=False, error=error_msg[:200])
+
+    async def _recover_unconfirmed_orders(self) -> None:
+        """SSE 재연결 후 미확인 주문 복구 — get_order_list()로 체결 확인"""
+        orders = list(self._unconfirmed_orders)
+        self._unconfirmed_orders.clear()
+        if not orders:
+            return
+
+        logger.debug("미확인 주문 복구 시작: {}건", len(orders))
+        try:
+            await asyncio.sleep(2)  # 재연결 안정화 대기
+            resp = await self.get_order_list()
+            if not resp.success:
+                logger.warning("미확인 주문 복구: 주문내역 조회 실패 — {}", resp.error)
+                return
+
+            kis_orders = []
+            if isinstance(resp.data, dict):
+                kis_orders = (
+                    resp.data.get("output", [])
+                    or resp.data.get("output1", [])
+                    or resp.data.get("orders", [])
+                )
+                if isinstance(kis_orders, dict):
+                    kis_orders = [kis_orders]
+            elif isinstance(resp.data, list):
+                kis_orders = resp.data
+
+            for meta in orders:
+                args = meta.get("arguments", {})
+                symbol = args.get("symbol", "")
+                if not symbol:
+                    continue
+
+                # KIS 주문내역에서 매칭 시도 (종목코드 + 주문유형으로)
+                matched = None
+                for kis_order in kis_orders:
+                    if not isinstance(kis_order, dict):
+                        continue
+                    kis_symbol = kis_order.get("pdno", "") or kis_order.get("symbol", "")
+                    if kis_symbol == symbol:
+                        matched = kis_order
+                        break
+
+                if matched:
+                    order_id = (
+                        matched.get("odno") or matched.get("ODNO")
+                        or matched.get("order_id") or ""
+                    )
+                    filled_qty = self._to_int(
+                        matched.get("tot_ccld_qty") or matched.get("filled_quantity") or 0
+                    )
+                    logger.info(
+                        "미확인 주문 복구 매칭: {} 주문번호={} 체결수량={}",
+                        symbol, order_id, filled_qty,
+                    )
+                    # P0-1의 pending TradeResult가 있으므로 confirm_and_record 호출
+                    if order_id and filled_qty > 0:
+                        try:
+                            from agent.decision_maker import decision_maker
+                            from services.activity_logger import activity_logger
+                            from trading.enums import ActivityPhase, ActivityType
+                            await activity_logger.log(
+                                ActivityType.ORDER, ActivityPhase.PROGRESS,
+                                f"\U0001f504 SSE 재연결 복구: {symbol} 주문번호={order_id} 체결확인",
+                                symbol=symbol,
+                            )
+                            await decision_maker.confirm_and_record(
+                                symbol=symbol,
+                                side="BUY" if args.get("order_type") == "buy" else "SELL",
+                                order_id=order_id,
+                                quantity=self._to_int(args.get("quantity", 0)),
+                                expected_price=self._to_float(args.get("price", 0)),
+                            )
+                        except Exception as e:
+                            logger.error("미확인 주문 복구 기록 실패 ({}): {}", symbol, str(e))
+                else:
+                    logger.warning("미확인 주문 복구: {} 매칭 실패 (KIS 주문내역에서 미발견)", symbol)
+
+        except Exception as e:
+            logger.error("미확인 주문 복구 오류: {}", str(e))
 
     async def list_tools(self) -> list[dict]:
         """사용 가능한 MCP 도구 목록 조회"""

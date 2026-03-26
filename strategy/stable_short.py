@@ -48,8 +48,8 @@ class StableShortStrategy:
         eff_stop = params.get("stop_loss_pct", self.stop_loss_pct)
         eff_target = params.get("take_profit_pct", self.take_profit_pct)
 
-        # 최소 신뢰도 미달 → 스킵
-        if confidence < self.min_confidence:
+        # 최소 신뢰도 미달 → 스킵 (SELL은 면제)
+        if confidence < self.min_confidence and recommendation != "SELL":
             return None
 
         # HOLD → 스킵

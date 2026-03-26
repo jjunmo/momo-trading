@@ -99,6 +99,13 @@ class LLMProvider(str, Enum):
     CLAUDE_CODE = "CLAUDE_CODE"  # 로컬 Claude Code CLI (구독 크레딧)
 
 
+class OrderConfirmStatus(str, Enum):
+    """주문 체결 확인 상태"""
+    PENDING_CONFIRM = "PENDING_CONFIRM"
+    CONFIRMED = "CONFIRMED"
+    CONFIRM_FAILED = "CONFIRM_FAILED"
+
+
 class ActivityType(str, Enum):
     """에이전트 활동 유형"""
     CYCLE = "CYCLE"
@@ -120,6 +127,7 @@ class ActivityType(str, Enum):
     SCHEDULE = "SCHEDULE"
     HOLDINGS_CHECK = "HOLDINGS_CHECK"
     TRADING_RULE = "TRADING_RULE"
+    QA = "QA"
 
 
 class ActivityPhase(str, Enum):

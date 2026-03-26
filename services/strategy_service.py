@@ -42,7 +42,7 @@ class StrategyService:
             description=data.description,
         )
         created = await self.config_repo.create(config)
-        logger.info("전략 생성: {} ({})", data.name, data.type.value)
+        logger.debug("전략 생성: {} ({})", data.name, data.type.value)
         return created
 
     async def update_config(self, config_id: str, data: StrategyConfigUpdate) -> StrategyConfig:
@@ -54,7 +54,7 @@ class StrategyService:
     async def toggle_config(self, config_id: str) -> StrategyConfig:
         config = await self.get_config_by_id(config_id)
         config.is_active = not config.is_active
-        logger.info("전략 토글: {} → {}", config.name, "활성" if config.is_active else "비활성")
+        logger.debug("전략 토글: {} → {}", config.name, "활성" if config.is_active else "비활성")
         return await self.config_repo.update(config)
 
     async def get_recent_signals(self, limit: int = 20) -> list[StrategySignal]:

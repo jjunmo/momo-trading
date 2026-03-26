@@ -25,7 +25,7 @@ class StockScreener:
         """후보 종목 중 실제 분석/매매할 종목 최종 선정"""
         candidates = scan_result.get("candidates", [])
         if not candidates:
-            logger.info("스크리닝: 후보 종목 없음")
+            logger.debug("스크리닝: 후보 종목 없음")
             return []
 
         timer = activity_logger.timer()
