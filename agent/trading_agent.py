@@ -49,6 +49,7 @@ class TradingAgent:
         self._analyzing: set[str] = set()
         self._cooldowns: dict[str, float] = {}  # symbol -> last_trigger_time
         self.EVENT_COOLDOWN_SEC = 120  # 동일 종목 재분석 최소 간격 (초)
+        self.EXIT_COOLDOWN_SEC = 1800  # 손절/익절 후 재진입 차단 (30분)
         # 사이클 내 시장 컨텍스트 캐시 (Tier1/Tier2에 전달)
         self._market_context: str = ""
         # 시장 국면 (전략/리스크에 전달)
@@ -1838,6 +1839,12 @@ class TradingAgent:
                     logger.error("손절 매도 실패 ({}): {}", symbol, str(e))
         finally:
             self._release_sell(symbol)
+            # 손절 후 30분간 재진입 차단 (무한 매수-손절 루프 방지)
+            import time as _time
+            self._cooldowns[symbol] = _time.time() + self.EXIT_COOLDOWN_SEC
+            from agent.market_scanner import market_scanner
+            market_scanner.add_untradeable(symbol)
+            logger.debug("[{}] 손절 후 {}분 재진입 차단 설정", symbol, self.EXIT_COOLDOWN_SEC // 60)
 
     async def _on_take_profit(self, event: Event) -> None:
         """익절선 도달 → 즉시 매도"""
@@ -1911,6 +1918,12 @@ class TradingAgent:
                     logger.error("익절 매도 실패 ({}): {}", symbol, str(e))
         finally:
             self._release_sell(symbol)
+            # 익절 후에도 재진입 차단 (같은 가격대 재매수 방지)
+            import time as _time
+            self._cooldowns[symbol] = _time.time() + self.EXIT_COOLDOWN_SEC
+            from agent.market_scanner import market_scanner
+            market_scanner.add_untradeable(symbol)
+            logger.debug("[{}] 익절 후 {}분 재진입 차단 설정", symbol, self.EXIT_COOLDOWN_SEC // 60)
 
     async def _ensure_realtime_subscription(self, symbol: str) -> None:
         """매수 후 WebSocket 실시간 구독 확인/추가"""
