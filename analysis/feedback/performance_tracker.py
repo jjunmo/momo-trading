@@ -32,12 +32,22 @@ class PerformanceTracker:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    # ── 공통 필터: 청산 완료된 BUY 포지션만 (pnl/is_win이 정확한 레코드) ──
+    _CLOSED_POSITION_FILTER = and_(
+        TradeResult.side == "BUY",
+        TradeResult.exit_at.isnot(None),
+        TradeResult.status == "CONFIRMED",
+    )
+
     async def get_strategy_stats(self, strategy_type: str, limit: int = 100) -> PerformanceStat:
-        """전략별 성과 통계"""
+        """전략별 성과 통계 (청산 완료 포지션만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.strategy_type == strategy_type)
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.strategy_type == strategy_type,
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
@@ -45,11 +55,14 @@ class PerformanceTracker:
         return self._calc_stat(trades)
 
     async def get_symbol_stats(self, symbol: str, limit: int = 50) -> PerformanceStat:
-        """종목별 성과 통계"""
+        """종목별 성과 통계 (청산 완료 포지션만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.stock_symbol == symbol)
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.stock_symbol == symbol,
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
@@ -57,11 +70,14 @@ class PerformanceTracker:
         return self._calc_stat(trades)
 
     async def get_pattern_stats(self, pattern: str, limit: int = 50) -> PerformanceStat:
-        """차트 패턴별 성과 통계 (예: GOLDEN_CROSS, HAMMER 등)"""
+        """차트 패턴별 성과 통계 (청산 완료 포지션만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.entry_pattern == pattern)
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.entry_pattern == pattern,
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
@@ -69,17 +85,15 @@ class PerformanceTracker:
         return self._calc_stat(trades)
 
     async def get_rsi_range_stats(self, rsi_low: float, rsi_high: float) -> PerformanceStat:
-        """특정 RSI 구간 진입 시 성과"""
+        """특정 RSI 구간 진입 시 성과 (청산 완료 포지션만)"""
         stmt = (
             select(TradeResult)
-            .where(
-                and_(
-                    TradeResult.entry_rsi >= rsi_low,
-                    TradeResult.entry_rsi < rsi_high,
-                    TradeResult.entry_rsi.isnot(None),
-                )
-            )
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.entry_rsi >= rsi_low,
+                TradeResult.entry_rsi < rsi_high,
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(100)
         )
         result = await self.session.execute(stmt)
@@ -87,11 +101,14 @@ class PerformanceTracker:
         return self._calc_stat(trades)
 
     async def get_market_regime_stats(self, regime: str) -> PerformanceStat:
-        """시장 국면별 성과 (상승장/하락장/횡보장)"""
+        """시장 국면별 성과 (청산 완료 포지션만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.market_regime == regime)
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.market_regime == regime,
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(100)
         )
         result = await self.session.execute(stmt)
@@ -99,32 +116,39 @@ class PerformanceTracker:
         return self._calc_stat(trades)
 
     async def get_recent_losses(self, limit: int = 10) -> list[TradeResult]:
-        """최근 손실 거래 목록 (AI에게 실패 사례로 제공)"""
+        """최근 손실 거래 목록 (AI에게 실패 사례로 제공, 청산 완료 BUY만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.is_win == False)  # noqa: E712
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.is_win == False,  # noqa: E712
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def get_recent_wins(self, limit: int = 5) -> list[TradeResult]:
-        """최근 성공 거래 목록 (AI에게 성공 패턴으로 제공)"""
+        """최근 성공 거래 목록 (AI에게 성공 패턴으로 제공, 청산 완료 BUY만)"""
         stmt = (
             select(TradeResult)
-            .where(TradeResult.is_win == True)  # noqa: E712
-            .order_by(TradeResult.created_at.desc())
+            .where(and_(
+                self._CLOSED_POSITION_FILTER,
+                TradeResult.is_win == True,  # noqa: E712
+            ))
+            .order_by(TradeResult.exit_at.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def get_consecutive_losses(self) -> int:
-        """최근 연속 손실 횟수"""
+        """최근 연속 손실 횟수 (청산 완료된 BUY 포지션 기준)"""
         stmt = (
             select(TradeResult)
-            .order_by(TradeResult.created_at.desc())
+            .where(self._CLOSED_POSITION_FILTER)
+            .order_by(TradeResult.exit_at.desc())
             .limit(20)
         )
         result = await self.session.execute(stmt)
@@ -138,8 +162,13 @@ class PerformanceTracker:
         return count
 
     async def get_overall_stats(self) -> dict:
-        """전체 요약 통계"""
-        stmt = select(TradeResult).order_by(TradeResult.created_at.desc()).limit(200)
+        """전체 요약 통계 (청산 완료된 BUY, CONFIRMED만)"""
+        stmt = (
+            select(TradeResult)
+            .where(self._CLOSED_POSITION_FILTER)
+            .order_by(TradeResult.exit_at.desc())
+            .limit(200)
+        )
         result = await self.session.execute(stmt)
         trades = list(result.scalars().all())
 

@@ -59,7 +59,7 @@ class DailyReportService:
         if report_date is None:
             report_date = now_kst().date()
 
-        logger.info("일일 리포트 생성 시작: {}", report_date)
+        logger.debug("일일 리포트 생성 시작: {}", report_date)
 
         await activity_logger.log(
             ActivityType.REPORT, ActivityPhase.START,
@@ -91,11 +91,11 @@ class DailyReportService:
                     # 기존 리포트 확인 (중복 방지)
                     existing = await report_repo.get_by_date(report_date)
                     if existing:
-                        logger.info("이미 리포트 존재: {}", report_date)
+                        logger.debug("이미 리포트 존재: {}", report_date)
                         return existing
 
                     # 활동 데이터 집계
-                    activities = await activity_repo.get_by_date(report_date, limit=500)
+                    activities = await activity_repo.get_by_date(report_date, limit=2000)
                     activity_counts = await activity_repo.count_by_date(report_date)
 
                     # 기본 통계
@@ -106,20 +106,22 @@ class DailyReportService:
                     # TradeResult 기반 매수/매도/승패/손익 집계
                     trade_result_repo = TradeResultRepository(session)
                     opened_trades = await trade_result_repo.get_opened_by_date(report_date)
+                    # 청산된 BUY 포지션 (pnl/is_win이 정확히 기록된 레코드)
                     completed_trades = await trade_result_repo.get_completed_by_date(report_date)
+                    # 실제 매도 주문 건수 (SELL 레코드 수)
+                    sell_count = await trade_result_repo.get_sell_count_by_date(report_date)
 
                     buy_count = len(opened_trades)
-                    sell_count = len(completed_trades)
                     total_orders = buy_count + sell_count
                     win_count = sum(1 for t in completed_trades if t.is_win)
                     loss_count = sum(1 for t in completed_trades if not t.is_win)
                     total_pnl = sum(t.pnl for t in completed_trades)
 
-                    # DB에 미청산 포지션이 없으면 계좌 보유 종목 수 사용
-                    if open_position_count == 0:
-                        all_open = await trade_result_repo.get_all_open()
-                        if all_open:
-                            open_position_count = len(all_open)
+                    # 계좌 스냅샷이 빈 경우 DB 미청산 포지션으로 보완
+                    all_open = await trade_result_repo.get_all_open()
+                    if open_position_count == 0 and all_open:
+                        # 종목 수 기준 (같은 종목 여러 BUY는 1종목)
+                        open_position_count = len({t.stock_symbol for t in all_open})
 
                     # LLM으로 리포트 생성
                     recent_summaries = "\n".join(

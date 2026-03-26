@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.agent_activity import AgentActivityLog
 from repositories.async_base_repository import AsyncBaseRepository
+from util.time_util import KST
 
 
 class AgentActivityRepository(AsyncBaseRepository[AgentActivityLog]):
@@ -15,22 +16,36 @@ class AgentActivityRepository(AsyncBaseRepository[AgentActivityLog]):
     async def get_by_date(
         self, target_date: date, limit: int = 500, offset: int = 0
     ) -> list[AgentActivityLog]:
-        start = datetime.combine(target_date, time.min)
-        end = datetime.combine(target_date, time.max)
+        start = datetime.combine(target_date, time.min, tzinfo=KST)
+        end = datetime.combine(target_date, time.max, tzinfo=KST)
+        # DESC로 최신 N건을 가져온 뒤 시간순 정렬하여 반환
         result = await self.db.execute(
             select(AgentActivityLog)
             .where(AgentActivityLog.created_at.between(start, end))
-            .order_by(AgentActivityLog.created_at.asc())
+            .order_by(AgentActivityLog.created_at.desc())
             .offset(offset)
             .limit(limit)
         )
-        return list(result.scalars().all())
+        rows = list(result.scalars().all())
+        rows.reverse()  # ASC 순서로 반환
+        return rows
 
     async def get_by_cycle(self, cycle_id: str) -> list[AgentActivityLog]:
         result = await self.db.execute(
             select(AgentActivityLog)
             .where(AgentActivityLog.cycle_id == cycle_id)
             .order_by(AgentActivityLog.created_at.asc())
+        )
+        return list(result.scalars().all())
+
+    async def get_by_symbol(
+        self, symbol: str, limit: int = 50
+    ) -> list[AgentActivityLog]:
+        result = await self.db.execute(
+            select(AgentActivityLog)
+            .where(AgentActivityLog.symbol == symbol)
+            .order_by(AgentActivityLog.created_at.desc())
+            .limit(limit)
         )
         return list(result.scalars().all())
 
@@ -71,8 +86,8 @@ class AgentActivityRepository(AsyncBaseRepository[AgentActivityLog]):
 
     async def count_by_date(self, target_date: date) -> dict:
         """날짜별 활동 유형 카운트"""
-        start = datetime.combine(target_date, time.min)
-        end = datetime.combine(target_date, time.max)
+        start = datetime.combine(target_date, time.min, tzinfo=KST)
+        end = datetime.combine(target_date, time.max, tzinfo=KST)
         result = await self.db.execute(
             select(
                 AgentActivityLog.activity_type,

@@ -48,9 +48,14 @@ class TradeResultResponse(BaseModel):
     exit_reason: str
     ai_recommendation: str
     ai_confidence: float
+    ai_target_price: Optional[float] = None
+    ai_stop_loss_price: Optional[float] = None
     entry_rsi: Optional[float] = None
     entry_pattern: Optional[str] = None
     market_regime: str = ""
+    status: str = "CONFIRMED"
+    entry_at: Optional[datetime] = None
+    exit_at: Optional[datetime] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
