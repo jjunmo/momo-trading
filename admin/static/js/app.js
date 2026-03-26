@@ -10,6 +10,15 @@ let accountPollTimer = null;
 // Stock card tracking: key = "cycleId:symbol" → { element, headerEl, bodyEl, stepsEl, activities[], outcome }
 let stockCards = {};
 
+// Sidebar section state
+const sidebarState = {
+  account: true,
+  holdings: true,
+  pending: false,
+  settings: false,
+  system: true,
+};
+
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
   loadSettings();
@@ -17,13 +26,34 @@ document.addEventListener('DOMContentLoaded', () => {
   loadReportList();
   loadAccountInfo();
   loadLLMStatus();
-  loadLLMUsage();
   connectSSE();
   loadTodayActivities();
+  initSidebarSections();
   setInterval(loadSystemStatus, 15000);
   accountPollTimer = setInterval(loadAccountInfo, 30000);
-  setInterval(loadLLMUsage, 60000);
 });
+
+// ── Sidebar Accordion ──
+function initSidebarSections() {
+  for (const [id, isOpen] of Object.entries(sidebarState)) {
+    const body = document.getElementById(`body-${id}`);
+    const arrow = document.getElementById(`arrow-${id}`);
+    if (body) {
+      body.classList.toggle('open', isOpen);
+    }
+    if (arrow) {
+      arrow.classList.toggle('collapsed', !isOpen);
+    }
+  }
+}
+
+function toggleSidebarSection(id) {
+  sidebarState[id] = !sidebarState[id];
+  const body = document.getElementById(`body-${id}`);
+  const arrow = document.getElementById(`arrow-${id}`);
+  if (body) body.classList.toggle('open', sidebarState[id]);
+  if (arrow) arrow.classList.toggle('collapsed', !sidebarState[id]);
+}
 
 // ── SSE Connection ──
 function connectSSE() {
@@ -115,21 +145,26 @@ function renderAccountBalance(data) {
 function renderAccountHoldings(data) {
   const el = document.getElementById('holdings-info');
   const countEl = document.getElementById('holdings-count');
-  const sectionEl = document.getElementById('holdings-section');
   if (!el) return;
   if (!data || !data.length) {
-    if (sectionEl) sectionEl.style.display = 'none';
+    if (countEl) countEl.textContent = '0';
+    el.innerHTML = '<div class="text-gray-600 text-xs">보유종목 없음</div>';
     return;
   }
-  if (sectionEl) sectionEl.style.display = '';
-  if (countEl) countEl.textContent = `${data.length}종목`;
+  if (countEl) countEl.textContent = `${data.length}`;
   el.innerHTML = data.map(h => {
     const pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
+    const bgTint = h.pnl_rate >= 0 ? 'bg-green-900/5' : 'bg-red-900/5';
     const evalAmt = h.current_price * h.quantity;
-    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5">
+    const barColor = h.pnl_rate >= 0 ? 'bg-green-500' : 'bg-red-500';
+    const barWidth = Math.min(Math.abs(h.pnl_rate) * 10, 100);
+    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5 ${bgTint}">
       <div class="flex justify-between items-center">
         <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}</span>
-        <span class="${pnlColor} font-medium">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
+        <span class="${pnlColor} font-bold text-sm">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
+      </div>
+      <div class="pnl-bar">
+        <div class="pnl-bar-fill ${barColor}" style="width:${barWidth}%"></div>
       </div>
       <div class="flex justify-between text-gray-500">
         <span>${h.quantity}주 | 평단 ${Number(h.avg_buy_price).toLocaleString()}원</span>
@@ -137,7 +172,7 @@ function renderAccountHoldings(data) {
       </div>
       <div class="flex justify-between text-gray-500">
         <span>평가 ${formatKRW(evalAmt)}</span>
-        <span class="${pnlColor}">${h.pnl >= 0 ? '+' : ''}${formatKRW(h.pnl)}</span>
+        <span class="${pnlColor} font-medium">${h.pnl >= 0 ? '+' : ''}${formatKRW(h.pnl)}</span>
       </div>
     </div>`;
   }).join('');
@@ -146,16 +181,14 @@ function renderAccountHoldings(data) {
 function renderPendingOrders(data) {
   const el = document.getElementById('pending-orders-info');
   const countEl = document.getElementById('pending-count');
-  const sectionEl = document.getElementById('pending-section');
   if (!el) return;
   if (!data || !data.length) {
-    if (sectionEl) sectionEl.style.display = 'none';
+    if (countEl) countEl.textContent = '0';
+    el.innerHTML = '';
     return;
   }
-  if (sectionEl) sectionEl.style.display = '';
   if (countEl) {
-    const totalAmt = data.reduce((s, o) => s + o.order_price * o.remaining_qty, 0);
-    countEl.textContent = `${data.length}건 (${formatKRW(totalAmt)})`;
+    countEl.textContent = `${data.length}`;
   }
   el.innerHTML = data.map(o => {
     const sideColor = o.side === '매수' ? 'text-red-400' : 'text-blue-400';
@@ -177,15 +210,6 @@ function renderPendingOrders(data) {
       </div>
     </div>`;
   }).join('');
-}
-
-function toggleSettings() {
-  const body = document.getElementById('settings-body');
-  const arrow = document.getElementById('settings-arrow');
-  if (!body) return;
-  const isHidden = body.classList.contains('hidden');
-  body.classList.toggle('hidden');
-  if (arrow) arrow.style.transform = isHidden ? '' : 'rotate(-90deg)';
 }
 
 function formatKRW(amount) {
@@ -243,7 +267,7 @@ function appendActivity(data) {
     // 정확한 키 매칭 실패 시 → 같은 종목의 진행 중인 카드에 합류
     if (!card) {
       for (const [key, existing] of Object.entries(stockCards)) {
-        if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress')) {
+        if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress' || existing.outcome === 'buy')) {
           card = existing;
           stockCards[cardKey] = card;  // alias 등록
           break;
@@ -304,6 +328,7 @@ function createStockCard(symbol, firstActivity) {
     <span class="text-sm font-medium text-white flex-1 truncate">
       ${escapeHtml(stockName)} <span class="text-gray-500 text-xs">${escapeHtml(symbol)}</span>
     </span>
+    <span class="stock-confidence"></span>
     <span class="stock-outcome text-xs px-2 py-0.5 rounded bg-purple-900/40 text-purple-300">
       <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:4px"></span>분석 중
     </span>
@@ -391,8 +416,12 @@ function addStepToCard(card, data) {
   const typeColor = getTypeColor(data.activity_type);
   const elapsed = data.execution_time_ms ? `${(data.execution_time_ms / 1000).toFixed(1)}초` : '';
 
+  // Activity type color dot
+  const dotColor = getTypeDotColor(data.activity_type);
+
   let html = `
     <span class="text-xs text-gray-600 shrink-0 w-14">${time}</span>
+    <span class="shrink-0 w-2 h-2 rounded-full bg-${dotColor}-400 mt-1.5"></span>
     <div class="flex-1 min-w-0">
       <div class="text-xs">${escapeHtml(data.summary)}</div>`;
 
@@ -468,11 +497,11 @@ function updateCardHeader(card) {
       } else if (summ.includes('BUY')) {
         outcome = 'buy';
         outcomeText = '📈 매수';
-        outcomeBg = 'bg-red-900/40 text-red-300';
+        outcomeBg = 'bg-red-900/50 text-red-200 font-bold border border-red-700/50';
       } else if (summ.includes('SELL')) {
         outcome = 'sell';
         outcomeText = '📉 매도';
-        outcomeBg = 'bg-blue-900/40 text-blue-300';
+        outcomeBg = 'bg-blue-900/50 text-blue-200 font-bold border border-blue-700/50';
       }
     }
 
@@ -503,13 +532,13 @@ function updateCardHeader(card) {
       if (a.phase === 'COMPLETE' && (summ.includes('주문 접수') || summ.includes('체결'))) {
         outcome = isSell ? 'sell' : 'buy';
         outcomeText = isSell ? '📉 매도 완료' : '📈 매수 완료';
-        outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
+        outcomeBg = isSell ? 'bg-blue-900/50 text-blue-200 font-bold border border-blue-700/50' : 'bg-red-900/50 text-red-200 font-bold border border-red-700/50';
       } else if (summ.includes('주문 실행')) {
         // 주문 접수 전 — 방향만 표시
         if (outcome !== 'buy' && outcome !== 'sell') {
           outcome = isSell ? 'sell' : 'buy';
           outcomeText = isSell ? '📉 매도' : '📈 매수';
-          outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
+          outcomeBg = isSell ? 'bg-blue-900/50 text-blue-200 font-bold border border-blue-700/50' : 'bg-red-900/50 text-red-200 font-bold border border-red-700/50';
         }
       }
     }
@@ -528,6 +557,20 @@ function updateCardHeader(card) {
   if (outcomeEl) {
     outcomeEl.className = `stock-outcome text-xs px-2 py-0.5 rounded ${outcomeBg}`;
     outcomeEl.innerHTML = outcomeText;
+  }
+
+  // Update confidence mini-bar
+  const confEl = card.headerEl.querySelector('.stock-confidence');
+  if (confEl && card.confidence != null) {
+    const pct = Math.round(card.confidence * 100);
+    let barColor = '#ef4444'; // red
+    if (pct >= 70) barColor = '#22c55e'; // green
+    else if (pct >= 50) barColor = '#eab308'; // yellow
+    confEl.innerHTML = `
+      <span class="text-xs text-gray-500">${pct}%</span>
+      <span class="stock-confidence-bar">
+        <span class="stock-confidence-fill" style="width:${pct}%;background:${barColor}"></span>
+      </span>`;
   }
 
   // Update elapsed — when done, stop live timer and show final time
@@ -640,7 +683,7 @@ async function loadTodayActivities() {
   cleanupStockCards();
 
   try {
-    const resp = await fetch(`${API}/activities?limit=500`);
+    const resp = await fetch(`${API}/activities?limit=2000`);
     const json = await resp.json();
     container.innerHTML = '';
     activityCount = 0;
@@ -714,6 +757,49 @@ function cleanupStockCards() {
   stockCards = {};
 }
 
+// ── Q&A ──
+async function askQuestion() {
+  const input = document.getElementById('qa-input');
+  const btn = document.getElementById('qa-btn');
+  const respEl = document.getElementById('qa-response');
+  const question = input.value.trim();
+  if (!question) return;
+
+  btn.disabled = true;
+  btn.textContent = '...';
+  respEl.classList.remove('hidden');
+  respEl.innerHTML = '<span class="text-gray-500">답변 생성 중...</span>';
+
+  try {
+    const res = await fetch(`${API}/qa/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    const json = await res.json();
+    if (json.data) {
+      const d = json.data;
+      respEl.innerHTML =
+        `<div class="text-xs text-gray-500 mb-1">${d.context_summary} | ${d.llm_provider} | ${(d.execution_time_ms/1000).toFixed(1)}s</div>` +
+        `<div class="whitespace-pre-wrap">${escapeHtml(d.answer)}</div>`;
+    } else {
+      respEl.innerHTML = `<span class="text-red-400">${json.message || '답변 생성 실패'}</span>`;
+    }
+  } catch (e) {
+    respEl.innerHTML = `<span class="text-red-400">요청 실패: ${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '질문';
+    input.value = '';
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
 // ── Reports ──
 async function loadReport(dateStr) {
   const container = document.getElementById('chat-container');
@@ -734,7 +820,10 @@ async function loadReport(dateStr) {
     }
     container.innerHTML = '';
     container.appendChild(createReportCard(report));
-    if (report.report_date) await loadDateActivities(report.report_date, container);
+    if (report.report_date) {
+      await loadTradeHistory(report.report_date, container);
+      await loadDateActivities(report.report_date, container);
+    }
   } catch (err) {
     container.innerHTML = `<div class="text-center text-red-400 text-sm py-8">리포트 로드 실패: ${err.message}</div>`;
   }
@@ -841,6 +930,108 @@ function createReportCard(report) {
   return div;
 }
 
+// ── Trade History ──
+async function loadTradeHistory(dateStr, container) {
+  try {
+    const resp = await fetch(`${API}/trades?target_date=${dateStr}`);
+    const json = await resp.json();
+    const data = json.data;
+    if (!data) return;
+
+    const opened = data.opened || [];
+    const completed = data.completed || [];
+    const openPositions = data.open_positions || [];
+    if (!opened.length && !completed.length && !openPositions.length) return;
+
+    const section = document.createElement('div');
+    section.className = 'bg-dark-700 rounded-xl p-5 border border-gray-600 mx-2 mt-3 chat-bubble';
+
+    let html = '<div class="text-sm font-bold text-white mb-3">💰 매매 내역</div>';
+
+    // 청산 완료 (실현 손익)
+    if (completed.length) {
+      html += '<div class="text-xs font-medium text-gray-400 mb-2">청산 완료</div>';
+      html += completed.map(t => renderTradeCard(t, 'completed')).join('');
+    }
+
+    // 오늘 매수
+    if (opened.length) {
+      html += `<div class="text-xs font-medium text-gray-400 mb-2 ${completed.length ? 'mt-3' : ''}">오늘 매수</div>`;
+      html += opened.map(t => renderTradeCard(t, 'opened')).join('');
+    }
+
+    // 미청산 보유
+    if (openPositions.length) {
+      html += `<div class="text-xs font-medium text-gray-400 mb-2 mt-3">보유 중 (미청산)</div>`;
+      // 종목별 그룹핑
+      const grouped = {};
+      openPositions.forEach(t => {
+        if (!grouped[t.stock_symbol]) grouped[t.stock_symbol] = { name: t.stock_name, symbol: t.stock_symbol, trades: [] };
+        grouped[t.stock_symbol].trades.push(t);
+      });
+      html += Object.values(grouped).map(g => {
+        const totalQty = g.trades.reduce((s, t) => s + t.quantity, 0);
+        const avgPrice = g.trades.reduce((s, t) => s + t.entry_price * t.quantity, 0) / totalQty;
+        const entries = g.trades.map(t => {
+          const time = t.entry_at ? new Date(t.entry_at).toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit'}) : '';
+          return `${time} ${t.quantity}주 @${t.entry_price.toLocaleString()}원`;
+        }).join(' → ');
+        const conf = g.trades[0].ai_confidence;
+        return `<div class="bg-dark-900 rounded-lg p-3 mb-2 border-l-2 border-blue-500">
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-white font-medium">${g.name}<span class="text-gray-500 text-xs ml-1">${g.symbol}</span></span>
+            <span class="text-xs text-blue-400">${totalQty}주 · 평단 ${Math.round(avgPrice).toLocaleString()}원</span>
+          </div>
+          <div class="text-xs text-gray-500 mt-1">${entries}</div>
+          ${conf ? `<div class="text-xs text-gray-600 mt-1">신뢰도 ${(conf*100).toFixed(0)}%</div>` : ''}
+        </div>`;
+      }).join('');
+    }
+
+    section.innerHTML = html;
+    container.appendChild(section);
+  } catch (err) {
+    console.error('Trade history load error:', err);
+  }
+}
+
+function renderTradeCard(t, type) {
+  const time = (type === 'completed' && t.exit_at)
+    ? new Date(t.exit_at).toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit'})
+    : (t.entry_at ? new Date(t.entry_at).toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit'}) : '');
+
+  if (type === 'completed') {
+    const pnlColor = t.pnl >= 0 ? 'text-green-400' : 'text-red-400';
+    const borderColor = t.pnl >= 0 ? 'border-green-500' : 'border-red-500';
+    const pnlSign = t.pnl >= 0 ? '+' : '';
+    const returnSign = t.return_pct >= 0 ? '+' : '';
+    return `<div class="bg-dark-900 rounded-lg p-3 mb-2 border-l-2 ${borderColor}">
+      <div class="flex justify-between items-center">
+        <span class="text-sm text-white font-medium">${t.stock_name}<span class="text-gray-500 text-xs ml-1">${t.stock_symbol}</span></span>
+        <span class="text-xs ${pnlColor} font-medium">${pnlSign}${t.pnl.toLocaleString()}원 (${returnSign}${t.return_pct}%)</span>
+      </div>
+      <div class="flex justify-between text-xs text-gray-500 mt-1">
+        <span>${t.quantity}주 · ${t.entry_price.toLocaleString()} → ${t.exit_price.toLocaleString()}원</span>
+        <span>${time} · ${t.exit_reason || 'SIGNAL'}${t.hold_days > 0 ? ` · ${t.hold_days}일 보유` : ''}</span>
+      </div>
+      ${t.ai_confidence ? `<div class="text-xs text-gray-600 mt-1">신뢰도 ${(t.ai_confidence*100).toFixed(0)}% · ${t.strategy_type || ''}</div>` : ''}
+    </div>`;
+  }
+
+  // opened (매수)
+  const conf = t.ai_confidence ? `신뢰도 ${(t.ai_confidence*100).toFixed(0)}%` : '';
+  return `<div class="bg-dark-900 rounded-lg p-3 mb-2 border-l-2 border-red-500">
+    <div class="flex justify-between items-center">
+      <span class="text-sm text-white font-medium">${t.stock_name}<span class="text-gray-500 text-xs ml-1">${t.stock_symbol}</span></span>
+      <span class="text-xs text-red-400">매수 ${t.quantity}주 @${t.entry_price.toLocaleString()}원</span>
+    </div>
+    <div class="flex justify-between text-xs text-gray-500 mt-1">
+      <span>${time} · ${t.strategy_type || ''}</span>
+      <span>${conf}</span>
+    </div>
+  </div>`;
+}
+
 // ── Settings ──
 async function loadSettings() {
   try {
@@ -885,102 +1076,6 @@ async function loadLLMStatus() {
   } catch (err) {
     console.error('LLM status error:', err);
   }
-}
-
-// ── LLM Usage ──
-async function loadLLMUsage() {
-  try {
-    const resp = await fetch(`${API}/llm/usage`);
-    const json = await resp.json();
-    const d = json.data;
-    if (!d) {
-      document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">데이터 없음</div>';
-      return;
-    }
-    const staleWarning = d.last_computed_date && d.last_computed_date !== new Date().toISOString().slice(0, 10)
-      ? `<div class="text-yellow-500 text-xs mb-1">⚠ 기준일: ${d.last_computed_date} (CLI 캐시 미갱신)</div>` : '';
-    document.getElementById('usage-summary').innerHTML = `${staleWarning}
-      <div class="flex justify-between">
-        <span class="text-gray-400">총 세션</span>
-        <span class="text-white">${d.total_sessions.toLocaleString()}</span>
-      </div>
-      <div class="flex justify-between">
-        <span class="text-gray-400">총 메시지</span>
-        <span class="text-white">${d.total_messages.toLocaleString()}</span>
-      </div>`;
-    const appEl = document.getElementById('usage-app');
-    const app = d.app_usage;
-    if (app && app.total_calls > 0) {
-      let html = `
-        <div class="flex justify-between"><span class="text-gray-400">호출 수</span><span class="text-cyan-400">${app.total_calls}</span></div>
-        <div class="flex justify-between"><span class="text-gray-400">출력 토큰</span><span class="text-green-400">${formatTokens(app.total_output_tokens)}</span></div>`;
-      if (app.by_model && Object.keys(app.by_model).length) {
-        for (const [model, mu] of Object.entries(app.by_model)) {
-          const short = model.replace('claude-', '').replace(/-\d{8,}$/, '');
-          html += `<div class="bg-dark-900 rounded p-1.5 mt-1">
-            <div class="text-gray-300 text-xs">${short} <span class="text-gray-600">(${mu.calls}회)</span></div>
-            <div class="text-gray-500">${formatTokens(mu.input_tokens)} in / ${formatTokens(mu.output_tokens)} out</div>
-          </div>`;
-        }
-      }
-      appEl.innerHTML = html;
-    } else {
-      appEl.innerHTML = '<div class="text-gray-600">아직 호출 없음</div>';
-    }
-    const modelsEl = document.getElementById('usage-models');
-    if (d.model_usage && Object.keys(d.model_usage).length) {
-      let html = '';
-      for (const [model, usage] of Object.entries(d.model_usage)) {
-        const shortModel = model.replace('claude-', '').replace(/-\d{8}$/, '');
-        html += `<div class="bg-dark-900 rounded p-2 mb-1">
-          <div class="text-gray-300 font-medium mb-1" title="${model}">${shortModel}</div>
-          <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
-            <span>입력</span><span class="text-right text-gray-400">${formatTokens(usage.inputTokens)}</span>
-            <span>출력</span><span class="text-right text-green-400">${formatTokens(usage.outputTokens)}</span>
-            <span>캐시읽기</span><span class="text-right text-blue-400">${formatTokens(usage.cacheReadInputTokens)}</span>
-            <span>캐시생성</span><span class="text-right text-purple-400">${formatTokens(usage.cacheCreationInputTokens)}</span>
-          </div>
-        </div>`;
-      }
-      modelsEl.innerHTML = html;
-    } else {
-      modelsEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
-    }
-    const chartEl = document.getElementById('usage-chart');
-    const dailyTokens = (d.daily_model_tokens || []).slice(-7);
-    if (dailyTokens.length) {
-      const totals = dailyTokens.map(day => {
-        let sum = 0;
-        for (const t of Object.values(day.tokensByModel || {})) sum += t;
-        return { date: day.date, tokens: sum };
-      });
-      const maxTokens = Math.max(...totals.map(t => t.tokens), 1);
-      chartEl.innerHTML = totals.map(t => {
-        const pct = Math.max((t.tokens / maxTokens) * 100, 2);
-        const dateLabel = t.date.slice(5);
-        return `<div class="flex items-center gap-2">
-          <span class="text-gray-500 w-12 shrink-0">${dateLabel}</span>
-          <div class="flex-1 bg-dark-900 rounded-full h-3 overflow-hidden">
-            <div class="h-full bg-cyan-500/60 rounded-full" style="width:${pct}%"></div>
-          </div>
-          <span class="text-gray-400 w-14 text-right shrink-0">${formatTokens(t.tokens)}</span>
-        </div>`;
-      }).join('');
-    } else {
-      chartEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
-    }
-  } catch (err) {
-    console.error('LLM usage error:', err);
-    document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">조회 실패</div>';
-  }
-}
-
-function formatTokens(n) {
-  if (n == null || n === 0) return '0';
-  if (n >= 1000000000) return (n / 1000000000).toFixed(1) + 'B';
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
-  return n.toLocaleString();
 }
 
 // ── System Status ──
@@ -1108,6 +1203,19 @@ function getTypeColor(type) {
   return map[type] || 'gray';
 }
 
+function getTypeDotColor(type) {
+  const map = {
+    CYCLE: 'blue', SCAN: 'cyan', SCREENING: 'purple',
+    TIER1_ANALYSIS: 'yellow', TIER2_REVIEW: 'green',
+    STRATEGY_EVAL: 'blue', RISK_CHECK: 'yellow',
+    RISK_TUNING: 'purple',
+    DECISION: 'green', EVENT: 'gray', REPORT: 'purple',
+    LLM_CALL: 'cyan', ORDER: 'red', DAILY_PLAN: 'purple',
+    TRADE_RESULT: 'green', RISK_GATE: 'red',
+  };
+  return map[type] || 'gray';
+}
+
 function formatLLMConversation(detail) {
   let obj = detail;
   try {
@@ -1119,9 +1227,39 @@ function formatLLMConversation(detail) {
   const model = obj.llm_model || '';
   let html = '';
   if (model) html += `<div class="llm-model-tag">${escapeHtml(model)}</div>`;
-  if (sys) html += `<div class="llm-msg llm-system"><div class="llm-role">SYSTEM</div><div class="llm-body">${escapeHtml(sys)}</div></div>`;
+
+  // System prompt: collapsed by default, show first 2 lines
+  if (sys) {
+    const sysId = 'sys-' + Math.random().toString(36).substr(2, 6);
+    const lines = sys.split('\n');
+    const preview = lines.slice(0, 2).join('\n');
+    const hasMore = lines.length > 2;
+    html += `<div class="llm-msg llm-system">
+      <div class="llm-role">SYSTEM</div>
+      <div class="llm-body" style="max-height:none">
+        <span>${escapeHtml(preview)}${hasMore ? '...' : ''}</span>
+        ${hasMore ? `
+          <div id="${sysId}" style="display:none"><br>${escapeHtml(lines.slice(2).join('\n'))}</div>
+          <button onclick="event.stopPropagation();var el=document.getElementById('${sysId}');var show=el.style.display==='none';el.style.display=show?'':'none';this.textContent=show?'접기':'시스템 프롬프트 전체 보기'" class="text-purple-400 hover:text-purple-300 text-xs mt-1 block">시스템 프롬프트 전체 보기</button>
+        ` : ''}
+      </div>
+    </div>`;
+  }
+
   if (prompt) html += `<div class="llm-msg llm-user"><div class="llm-role">PROMPT</div><div class="llm-body">${escapeHtml(prompt)}</div></div>`;
-  if (response) html += `<div class="llm-msg llm-assistant"><div class="llm-role">RESPONSE</div><div class="llm-body">${escapeHtml(response)}</div></div>`;
+
+  // Response: try JSON formatting
+  if (response) {
+    let formattedResponse = escapeHtml(response);
+    try {
+      const parsed = JSON.parse(response);
+      formattedResponse = '<pre class="whitespace-pre-wrap break-all">' + escapeHtml(JSON.stringify(parsed, null, 2)) + '</pre>';
+    } catch {
+      // not JSON, use plain text
+    }
+    html += `<div class="llm-msg llm-assistant"><div class="llm-role">RESPONSE</div><div class="llm-body">${formattedResponse}</div></div>`;
+  }
+
   return `<div class="llm-conversation">${html}</div>`;
 }
 

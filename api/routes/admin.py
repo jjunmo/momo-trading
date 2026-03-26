@@ -1,5 +1,7 @@
-"""관리자 대시보드 API — SSE 스트림 + 활동 조회 + 설정 + 리포트 + 계좌"""
+"""관리자 대시보드 API — SSE 스트림 + 활동 조회 + 설정 + 리포트 + 계좌 + Q&A"""
 import asyncio
+import json as _json
+import time as _time
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, Query
@@ -15,6 +17,7 @@ from repositories.daily_report_repository import DailyReportRepository
 from schemas.activity_schema import ActivityResponse, CycleResponse
 from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
+from schemas.qa_schema import QARequest, QAResponse
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
@@ -60,7 +63,7 @@ async def get_activities(
     target_date: str | None = Query(None, description="YYYY-MM-DD"),
     cycle_id: str | None = Query(None),
     activity_type: str | None = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_async_db),
 ):
@@ -136,6 +139,35 @@ async def get_report_by_date(
     d = date.fromisoformat(report_date)
     report = await repo.get_by_date(d)
     return SuccessResponse(data=report)
+
+
+# ── 매매 내역 ──
+@router.get("/trades")
+async def get_trades(
+    target_date: str | None = Query(None, description="조회 날짜 (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """특정 날짜의 매매 내역 (매수 진입 + 청산 완료)"""
+    from repositories.trade_result_repository import TradeResultRepository
+    from schemas.feedback_schema import TradeResultResponse
+    from util.time_util import now_kst
+
+    d = date.fromisoformat(target_date) if target_date else now_kst().date()
+    repo = TradeResultRepository(db)
+
+    # 오늘 진입한 매수
+    opened = await repo.get_opened_by_date(d)
+    # 오늘 청산된 포지션 (BUY 레코드, pnl 계산됨)
+    completed = await repo.get_completed_by_date(d)
+    # 미청산 포지션
+    open_positions = await repo.get_all_open()
+
+    return SuccessResponse(data={
+        "date": str(d),
+        "opened": [TradeResultResponse.model_validate(t) for t in opened],
+        "completed": [TradeResultResponse.model_validate(t) for t in completed],
+        "open_positions": [TradeResultResponse.model_validate(t) for t in open_positions],
+    })
 
 
 # ── 계좌 정보 ──
@@ -343,3 +375,118 @@ async def generate_report(target_date: str | None = Query(None)):
             message="리포트 생성 완료",
         )
     return SuccessResponse(message="리포트 생성 실패 또는 이미 존재")
+
+
+# ── Q&A: 분석 결과에 대한 질문 ──
+@router.post("/qa/ask", response_model=SuccessResponse[QAResponse])
+async def ask_question(
+    req: QARequest,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """활동 기록 기반 Q&A — LLM(Tier1)으로 답변"""
+    start = _time.time()
+    repo = AgentActivityRepository(db)
+
+    # 1. 컨텍스트 결정: cycle_id → symbol → 오늘 전체
+    if req.cycle_id:
+        activities = await repo.get_by_cycle(req.cycle_id)
+        context_label = f"사이클 {req.cycle_id[:8]}"
+    elif req.symbol:
+        activities = await repo.get_by_symbol(req.symbol, limit=50)
+        context_label = f"종목 {req.symbol}"
+    else:
+        from util.time_util import now_kst
+        activities = await repo.get_by_date(now_kst().date(), limit=100)
+        context_label = "오늘 전체"
+
+    # 2. 핵심 필드 추출 (프롬프트에 전달할 컨텍스트)
+    context_lines = []
+    for a in activities[-80:]:  # 최근 80건 (역순 → 시간순)
+        line = f"[{a.activity_type}/{a.phase}] {a.summary}"
+        if a.symbol:
+            line = f"[{a.symbol}] " + line
+        if a.confidence is not None:
+            line += f" (확신도: {a.confidence:.0%})"
+        # detail에서 recommendation, reason 추출
+        if a.detail:
+            try:
+                detail = _json.loads(a.detail) if isinstance(a.detail, str) else a.detail
+                for key in ("recommendation", "reason", "signal", "action", "exit_reason"):
+                    if key in detail:
+                        line += f" | {key}: {detail[key]}"
+            except (ValueError, TypeError):
+                pass
+        context_lines.append(line)
+
+    context_text = "\n".join(context_lines) if context_lines else "(활동 기록 없음)"
+
+    # 2.5 포트폴리오 실시간 컨텍스트
+    portfolio_text = ""
+    try:
+        balance, holdings = await account_manager.get_account_snapshot()
+        parts = []
+        if balance.is_valid:
+            parts.append(
+                f"총자산: {balance.total_asset:,.0f}원 | 현금: {balance.cash:,.0f}원 | "
+                f"주식평가: {balance.stock_value:,.0f}원 | 총손익: {balance.total_pnl:+,.0f}원 ({balance.total_pnl_rate:+.2f}%)"
+            )
+        if holdings:
+            parts.append(f"보유 {len(holdings)}종목:")
+            for h in holdings:
+                parts.append(f"- {h.name}({h.symbol}) {h.quantity}주 평균단가:{h.avg_buy_price:,.0f} 현재가:{h.current_price:,.0f} 수익률:{h.pnl_rate:+.2f}%")
+        else:
+            parts.append("보유 종목 없음")
+        portfolio_text = "\n".join(parts)
+    except Exception as e:
+        logger.warning("Q&A 포트폴리오 조회 실패: {}", str(e))
+        portfolio_text = "(포트폴리오 조회 실패)"
+
+    has_portfolio = bool(portfolio_text and "조회 실패" not in portfolio_text)
+    context_summary = f"{context_label} — {len(activities)}건의 활동 기록"
+    if has_portfolio:
+        context_summary += " + 포트폴리오"
+
+    # 3. LLM 호출 (Tier1, 속도 우선)
+    from analysis.llm.llm_factory import llm_factory
+
+    system_prompt = (
+        "너는 AI 트레이딩 시스템의 운영 어시스턴트다. "
+        "아래 포트폴리오 현황과 활동 기록을 바탕으로 사용자의 질문에 간결하고 정확하게 답변해라. "
+        "추측하지 말고, 제공된 데이터에 근거한 답변만 해라. "
+        "한국어로 답변하되, 핵심만 2-3문단 이내로."
+    )
+    prompt = (
+        f"## 포트폴리오 현황 (실시간)\n{portfolio_text}\n\n"
+        f"## 활동 기록 ({context_summary})\n{context_text}\n\n"
+        f"## 질문\n{req.question}"
+    )
+
+    try:
+        answer, provider = await llm_factory.generate_tier1(prompt, system_prompt)
+    except Exception as e:
+        logger.error("Q&A LLM 호출 실패: {}", str(e))
+        answer = f"LLM 호출에 실패했습니다: {str(e)[:100]}"
+        provider = "error"
+
+    elapsed_ms = int((_time.time() - start) * 1000)
+
+    # 4. 활동 로그 기록
+    await activity_logger.log(
+        ActivityType.QA, ActivityPhase.COMPLETE,
+        f"Q&A: {req.question[:80]}",
+        detail={
+            "question": req.question,
+            "answer": answer[:1000],
+            "context_summary": context_summary,
+            "llm_provider": provider,
+        },
+        execution_time_ms=elapsed_ms,
+    )
+
+    return SuccessResponse(data=QAResponse(
+        question=req.question,
+        answer=answer,
+        context_summary=context_summary,
+        llm_provider=provider,
+        execution_time_ms=elapsed_ms,
+    ))

@@ -50,8 +50,14 @@
 
     /* Stock group card */
     .stock-card { border: 1px solid #374151; border-radius: 10px; margin: 4px 0; overflow: hidden; animation: fadeIn 0.3s ease-out; }
-    .stock-card.outcome-buy { border-left: 3px solid #f87171; }
-    .stock-card.outcome-sell { border-left: 3px solid #60a5fa; }
+    .stock-card.outcome-buy {
+      border-left: 4px solid #f87171;
+      background: linear-gradient(90deg, rgba(248,113,113,0.06) 0%, transparent 30%);
+    }
+    .stock-card.outcome-sell {
+      border-left: 4px solid #60a5fa;
+      background: linear-gradient(90deg, rgba(96,165,250,0.06) 0%, transparent 30%);
+    }
     .stock-card.outcome-hold { border-left: 3px solid #6b7280; }
     .stock-card.outcome-error { border-left: 3px solid #fbbf24; }
     .stock-card.outcome-progress { border-left: 3px solid #a78bfa; }
@@ -66,6 +72,30 @@
     /* Cycle divider */
     .cycle-divider { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 8px 0 4px 0; color: #6b7280; font-size: 12px; }
     .cycle-divider::before, .cycle-divider::after { content: ''; flex: 1; height: 1px; background: #374151; }
+
+    /* Sidebar accordion */
+    .sidebar-section { border-bottom: 1px solid #374151; }
+    .sidebar-section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%; padding: 8px 12px; font-size: 12px; font-weight: 600;
+      color: #9ca3af; cursor: pointer; transition: color 0.15s;
+    }
+    .sidebar-section-header:hover { color: #d1d5db; }
+    .sidebar-section-body {
+      max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out;
+    }
+    .sidebar-section-body.open { max-height: 600px; overflow-y: auto; }
+    .sidebar-section-arrow { transition: transform 0.2s; }
+    .sidebar-section-arrow.collapsed { transform: rotate(-90deg); }
+
+    /* Stock confidence mini-bar */
+    .stock-confidence { display: inline-flex; align-items: center; gap: 4px; }
+    .stock-confidence-bar { width: 40px; height: 4px; background: #374151; border-radius: 2px; overflow: hidden; }
+    .stock-confidence-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+
+    /* PnL bar in holdings */
+    .pnl-bar { height: 4px; border-radius: 2px; background: #374151; overflow: hidden; }
+    .pnl-bar-fill { height: 100%; border-radius: 2px; transition: width 0.4s ease-out; }
   </style>
 </head>
 <body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
@@ -87,7 +117,7 @@
   <div class="flex flex-1 overflow-hidden">
     <!-- Left Sidebar -->
     <aside class="w-64 bg-dark-800 border-r border-gray-700 flex flex-col shrink-0">
-      <!-- Navigation -->
+      <!-- Navigation (always visible) -->
       <nav class="p-3 space-y-1">
         <button onclick="switchView('live')" id="nav-live" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300">
           &#x1f4e1; &#xc2e4;&#xc2dc;&#xac04; &#xbaa8;&#xb2c8;&#xd130;&#xb9c1;
@@ -101,83 +131,108 @@
         </div>
       </nav>
 
-      <div class="border-t border-gray-700 my-2"></div>
-
-      <!-- Account Info -->
-      <div class="p-3 space-y-2 flex-1 overflow-y-auto">
-        <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
-        <div id="account-info" class="text-xs space-y-1">
-          <div class="text-gray-600">로딩 중...</div>
+      <!-- Accordion sections -->
+      <div class="flex-1 overflow-y-auto">
+        <!-- Account Balance -->
+        <div class="sidebar-section" id="section-account">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('account')">
+            <span>&#x1f4b0; &#xacc4;&#xc88c; &#xc794;&#xace0;</span>
+            <span class="sidebar-section-arrow" id="arrow-account">&#x25BC;</span>
+          </div>
+          <div class="sidebar-section-body open" id="body-account">
+            <div class="px-3 pb-2">
+              <div id="account-info" class="text-xs space-y-1">
+                <div class="text-gray-600">&#xb85c;&#xb529; &#xc911;...</div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <!-- 보유종목 -->
-        <div id="holdings-section">
-          <div id="holdings-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-green-400 font-medium">보유종목</span>
-            <span id="holdings-count" class="text-xs text-gray-600">0종목</span>
+        <!-- Holdings -->
+        <div class="sidebar-section" id="section-holdings">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('holdings')">
+            <span>&#x1f4ca; &#xbcf4;&#xc720;&#xc885;&#xbaa9; <span id="holdings-count" class="ml-1 px-1.5 py-0.5 rounded-full bg-green-900/40 text-green-400 text-xs">0</span></span>
+            <span class="sidebar-section-arrow" id="arrow-holdings">&#x25BC;</span>
           </div>
-          <div id="holdings-info" class="text-xs space-y-1 max-h-60 overflow-y-auto"></div>
+          <div class="sidebar-section-body open" id="body-holdings">
+            <div class="px-3 pb-2">
+              <div id="holdings-info" class="text-xs space-y-1.5"></div>
+            </div>
+          </div>
         </div>
 
-        <!-- 미체결 주문 -->
-        <div id="pending-section">
-          <div id="pending-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
-            <span id="pending-count" class="text-xs text-gray-600">0건</span>
+        <!-- Pending Orders -->
+        <div class="sidebar-section" id="section-pending">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('pending')">
+            <span>&#x23f3; &#xbbf8;&#xccb4;&#xacb0; &#xc8fc;&#xbb38; <span id="pending-count" class="ml-1 px-1.5 py-0.5 rounded-full bg-yellow-900/40 text-yellow-400 text-xs">0</span></span>
+            <span class="sidebar-section-arrow collapsed" id="arrow-pending">&#x25BC;</span>
           </div>
-          <div id="pending-orders-info" class="text-xs space-y-1 max-h-40 overflow-y-auto"></div>
+          <div class="sidebar-section-body" id="body-pending">
+            <div class="px-3 pb-2">
+              <div id="pending-orders-info" class="text-xs space-y-1"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Settings -->
+        <div class="sidebar-section" id="section-settings">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('settings')">
+            <span>&#x2699;&#xfe0f; &#xc124;&#xc815;</span>
+            <span class="sidebar-section-arrow collapsed" id="arrow-settings">&#x25BC;</span>
+          </div>
+          <div class="sidebar-section-body" id="body-settings">
+            <div class="px-3 pb-2 space-y-3">
+              <label class="flex items-center justify-between">
+                <span class="text-sm">&#xb9e4;&#xb9e4; &#xd65c;&#xc131;&#xd654;</span>
+                <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
+                  class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
+                  after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
+              </label>
+
+              <div>
+                <label class="text-sm block mb-1">&#xbaa8;&#xb4dc;</label>
+                <select id="set-mode" onchange="updateSetting('AUTONOMY_MODE', this.value)"
+                  class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
+                  <option value="SEMI_AUTO">SEMI_AUTO</option>
+                  <option value="AUTONOMOUS">AUTONOMOUS</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="text-sm block mb-1">&#xb9ac;&#xc2a4;&#xd06c; &#xc131;&#xd5a5;</label>
+                <select id="set-risk-appetite" onchange="updateSetting('RISK_APPETITE', this.value)"
+                  class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
+                  <option value="CONSERVATIVE">&#xbcf4;&#xc218;&#xc801; (CONSERVATIVE)</option>
+                  <option value="MODERATE">&#xc911;&#xb9bd; (MODERATE)</option>
+                  <option value="AGGRESSIVE">&#xacf5;&#xaca9;&#xc801; (AGGRESSIVE)</option>
+                </select>
+              </div>
+
+              <div class="border-t border-gray-700 pt-2">
+                <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
+                <div class="text-xs text-gray-400">Claude Code (&#xb85c;&#xceec; CLI)</div>
+                <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- System -->
+        <div class="sidebar-section" id="section-system">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('system')">
+            <span>&#x1f5a5; &#xc2dc;&#xc2a4;&#xd15c;</span>
+            <span class="sidebar-section-arrow" id="arrow-system">&#x25BC;</span>
+          </div>
+          <div class="sidebar-section-body open" id="body-system">
+            <div class="px-3 pb-2">
+              <div id="sys-status" class="text-xs space-y-1"></div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div class="border-t border-gray-700 my-2"></div>
-
-      <!-- Settings (접이식) -->
-      <div class="p-3 shrink-0">
-        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition">
-          <span>설정</span>
-          <span id="settings-arrow" class="transition-transform" style="transform:rotate(-90deg)">&#x25BC;</span>
-        </button>
-        <div id="settings-body" class="space-y-3 mt-2 hidden">
-          <label class="flex items-center justify-between">
-            <span class="text-sm">매매 활성화</span>
-            <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
-              class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
-              after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
-          </label>
-
-          <div>
-            <label class="text-sm block mb-1">모드</label>
-            <select id="set-mode" onchange="updateSetting('AUTONOMY_MODE', this.value)"
-              class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-              <option value="SEMI_AUTO">SEMI_AUTO</option>
-              <option value="AUTONOMOUS">AUTONOMOUS</option>
-            </select>
-          </div>
-
-          <div>
-            <label class="text-sm block mb-1">리스크 성향</label>
-            <select id="set-risk-appetite" onchange="updateSetting('RISK_APPETITE', this.value)"
-              class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-              <option value="CONSERVATIVE">보수적 (CONSERVATIVE)</option>
-              <option value="MODERATE">중립 (MODERATE)</option>
-              <option value="AGGRESSIVE">공격적 (AGGRESSIVE)</option>
-            </select>
-          </div>
-
-          <div class="border-t border-gray-700 pt-2">
-            <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
-            <div class="text-xs text-gray-400">Claude Code (로컬 CLI)</div>
-            <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="border-t border-gray-700 my-2"></div>
-
-      <!-- System Status & Actions -->
-      <div class="p-3 space-y-2 shrink-0">
-        <div class="text-xs text-gray-500 font-medium">&#xc2dc;&#xc2a4;&#xd15c;</div>
-        <div id="sys-status" class="text-xs space-y-1"></div>
+      <!-- Action buttons (always at bottom) -->
+      <div class="p-3 space-y-2 shrink-0 border-t border-gray-700">
         <button onclick="triggerCycle()"
           class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg py-2 transition">
           &#x25b6;&#xfe0f; &#xc218;&#xb3d9; &#xc0ac;&#xc774;&#xd074; &#xc2e4;&#xd589;
@@ -209,37 +264,22 @@
             class="text-gray-500 hover:text-gray-300 transition">&#x1f504; &#xc0c8;&#xb85c;&#xace0;&#xce68;</button>
         </div>
       </div>
-    </main>
 
-    <!-- Right Sidebar: LLM Usage -->
-    <aside class="w-64 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 overflow-y-auto">
-      <div class="p-3 space-y-3">
-        <div class="text-xs text-gray-500 font-medium">Claude Code Usage</div>
-
-        <!-- Summary -->
-        <div id="usage-summary" class="space-y-2">
-          <div class="text-gray-600 text-xs">로딩 중...</div>
+      <!-- Q&A Chat Input -->
+      <div class="bg-dark-800 border-t border-gray-700 px-4 py-2 shrink-0">
+        <div class="flex items-center gap-2">
+          <input type="text" id="qa-input" placeholder="&#xbd84;&#xc11d; &#xacb0;&#xacfc;&#xc5d0; &#xb300;&#xd574; &#xc9c8;&#xbb38;&#xd558;&#xc138;&#xc694;... (&#xc608;: &#xc65c; &#xb9e4;&#xc218;&#xb97c; &#xc548; &#xd574;?)"
+            class="flex-1 bg-dark-700 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            onkeydown="if(event.key==='Enter')askQuestion()">
+          <button onclick="askQuestion()" id="qa-btn"
+            class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg px-4 py-2 transition whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
+            &#xc9c8;&#xbb38;
+          </button>
         </div>
-
-        <!-- App (trading) usage -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">Trading App 사용량</div>
-          <div id="usage-app" class="text-xs space-y-1"></div>
-        </div>
-
-        <!-- Subscription model usage -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">구독 누적 사용량</div>
-          <div id="usage-models" class="text-xs space-y-1"></div>
-        </div>
-
-        <!-- Daily chart (last 7 days) -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">일별 토큰 추이</div>
-          <div id="usage-chart" class="space-y-1"></div>
+        <div id="qa-response" class="hidden mt-2 p-3 bg-dark-700 rounded-lg text-sm text-gray-300 max-h-48 overflow-y-auto">
         </div>
       </div>
-    </aside>
+    </main>
   </div>
 
   <script src="/admin/static/js/app.js"></script>
