@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정 (시스템 하드 리밋 없음)
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
 
+    # === Circuit Breaker ===
+    DAILY_LOSS_LIMIT_SOFT: float = -2.0   # 일일 손실 소프트 리밋 (%) → BUY만 차단
+    DAILY_LOSS_LIMIT_HARD: float = -3.0   # 일일 손실 하드 리밋 (%) → 전체 매매 중단
+    MAX_CONSECUTIVE_LOSSES: int = 3        # 연속 N패 → BUY 30분 일시정지
+
     # === AI Risk Tuning ===
     AI_RISK_TUNING_ENABLED: bool = True
     RISK_APPETITE: str = "AGGRESSIVE"  # CONSERVATIVE / MODERATE / AGGRESSIVE

@@ -17,6 +17,7 @@ class AggressiveShortStrategy:
     """
 
     strategy_type = "AGGRESSIVE_SHORT"
+    DEFAULT_TRAILING_STOP_PCT = 4.0
 
     REGIME_PARAMS = {
         "BULL":  {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},

@@ -20,6 +20,13 @@ class StockThresholds:
     # 트레일링 스탑용 고점 추적
     highest_price: float = 0.0
 
+    # 동적 출구 전략 (구간별 트레일링 + 소프트 익절)
+    entry_price: float = 0.0           # 매수 진입가 (본전 보호 기준)
+    initial_take_profit: float = 0.0   # 최초 익절가 (구간 계산 기준)
+    initial_stop_loss: float = 0.0     # 최초 손절가 (트레일링 구분 기준)
+    breakeven_trigger_pct: float = 0.0 # 본전 보호 활성 수익률 % (AI가 국면별 결정, 0이면 미사용)
+    strategy_type: str = ""            # 전략 유형 (기본 trailing % 결정)
+
 
 # 기본 임계값 (AI 미설정 시 폴백)
 DEFAULT_THRESHOLDS = StockThresholds()
@@ -58,10 +65,12 @@ class EventDetector:
         """
         import math
 
-        # 값 검증: NaN, None, 숫자가 아닌 값 필터링
+        # 값 검증: NaN, None 필터링 (문자열 필드는 그대로 통과)
         validated = {}
         for k, v in kwargs.items():
-            if isinstance(v, (int, float)) and not math.isnan(v):
+            if isinstance(v, str):
+                validated[k] = v
+            elif isinstance(v, (int, float)) and not math.isnan(v):
                 validated[k] = v
             else:
                 logger.warning("유효하지 않은 임계값 무시: {} {} = {}", symbol, k, v)
@@ -129,15 +138,39 @@ class EventDetector:
             source="event_detector",
         ))
 
-        # 트레일링 스탑 고점 갱신
-        if th.trailing_stop_pct > 0 and price > th.highest_price:
-            th.highest_price = price
-            # 트레일링 스탑 가격 = 고점 × (1 - trailing_pct/100)
-            new_stop = price * (1 - th.trailing_stop_pct / 100)
-            if new_stop > th.stop_loss:
-                th.stop_loss = new_stop
-                logger.debug("트레일링 스탑 상향: {} → 손절 {:,.0f}원 (고점 {:,.0f})",
-                             symbol, new_stop, price)
+        # 구간별 동적 트레일링 스탑
+        if th.trailing_stop_pct > 0:
+            effective_pct = th.trailing_stop_pct  # 기본값
+
+            if th.entry_price > 0:
+                profit_pct = (price - th.entry_price) / th.entry_price * 100
+
+                # 본전 보호: AI가 설정한 breakeven_trigger_pct 도달 시 활성
+                if (th.breakeven_trigger_pct > 0
+                        and profit_pct >= th.breakeven_trigger_pct
+                        and th.stop_loss < th.entry_price):
+                    th.stop_loss = th.entry_price
+                    logger.info("본전 보호 활성: {} 손절 → {:,.0f}원 (수익률 {:.1f}%, 기준 {:.1f}%)",
+                                symbol, th.entry_price, profit_pct, th.breakeven_trigger_pct)
+                    effective_pct = min(effective_pct, 2.0)
+
+                # 본전 보호 이후 구간: trailing 강화
+                if th.breakeven_trigger_pct > 0 and profit_pct >= th.breakeven_trigger_pct:
+                    effective_pct = min(effective_pct, 2.0)
+
+                # 목표가 초과: 최대 강화
+                if (th.initial_take_profit > th.entry_price
+                        and price >= th.initial_take_profit):
+                    effective_pct = min(effective_pct, 1.5)
+
+            # 고점 갱신 + 트레일링 스탑 상향
+            if price > th.highest_price:
+                th.highest_price = price
+                new_stop = price * (1 - effective_pct / 100)
+                if new_stop > th.stop_loss:
+                    th.stop_loss = new_stop
+                    logger.debug("트레일링 스탑 상향: {} → 손절 {:,.0f}원 (고점 {:,.0f}, trailing {:.1f}%)",
+                                 symbol, new_stop, price, effective_pct)
 
         # 거래량 급증 감지
         await self._check_volume_spike(symbol, volume, th, data)
@@ -201,23 +234,40 @@ class EventDetector:
     ) -> None:
         if th.stop_loss > 0 and price <= th.stop_loss:
             if not self._should_dedup(symbol, "STOP_LOSS"):
-                logger.warning("손절선 도달: {} (현재 {:,.0f}, 손절 {:,.0f})",
-                               symbol, price, th.stop_loss)
+                # 실제로 손절선이 상향 조정된 경우만 트레일링 스탑으로 구분
+                is_trailing = (th.trailing_stop_pct > 0
+                               and th.initial_stop_loss > 0
+                               and th.stop_loss > th.initial_stop_loss)
+                logger.warning("{}도달: {} (현재 {:,.0f}, 손절 {:,.0f}{})",
+                               "트레일링 스탑 " if is_trailing else "손절선 ",
+                               symbol, price, th.stop_loss,
+                               f", 고점 {th.highest_price:,.0f}" if is_trailing else "")
                 await event_bus.publish(Event(
                     type=EventType.STOP_LOSS_HIT,
-                    data={**data, "stop_loss_price": th.stop_loss},
+                    data={**data, "stop_loss_price": th.stop_loss,
+                          "is_trailing_stop": is_trailing,
+                          "highest_price": th.highest_price},
                     source="event_detector",
                 ))
 
         if th.take_profit > 0 and price >= th.take_profit:
-            if not self._should_dedup(symbol, "TAKE_PROFIT"):
-                logger.debug("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f})",
-                            symbol, price, th.take_profit)
-                await event_bus.publish(Event(
-                    type=EventType.TAKE_PROFIT_HIT,
-                    data={**data, "take_profit_price": th.take_profit},
-                    source="event_detector",
-                ))
+            if th.trailing_stop_pct > 0:
+                # 소프트 익절: 트레일링 스탑이 활성이면 익절선 상향, 매도하지 않음
+                new_tp = price * 1.03
+                old_tp = th.take_profit
+                th.take_profit = new_tp
+                logger.info("소프트 익절: {} 익절선 {:,.0f} → {:,.0f} (현재가 {:,.0f}, 트레일링 보호 중)",
+                            symbol, old_tp, new_tp, price)
+            else:
+                # 트레일링 미사용: 기존 동작 (즉시 매도 이벤트)
+                if not self._should_dedup(symbol, "TAKE_PROFIT"):
+                    logger.debug("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f})",
+                                symbol, price, th.take_profit)
+                    await event_bus.publish(Event(
+                        type=EventType.TAKE_PROFIT_HIT,
+                        data={**data, "take_profit_price": th.take_profit},
+                        source="event_detector",
+                    ))
 
     def _should_dedup(self, symbol: str, event_type: str) -> bool:
         """같은 종목+이벤트 중복 발행 방지"""

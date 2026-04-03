@@ -33,10 +33,12 @@ class PerformanceTracker:
         self.session = session
 
     # ── 공통 필터: 청산 완료된 BUY 포지션만 (pnl/is_win이 정확한 레코드) ──
+    # ORPHAN_CLEANUP은 실제 매매 판단이 아니므로 성과 지표에서 제외
     _CLOSED_POSITION_FILTER = and_(
         TradeResult.side == "BUY",
         TradeResult.exit_at.isnot(None),
         TradeResult.status == "CONFIRMED",
+        TradeResult.exit_reason != "ORPHAN_CLEANUP",
     )
 
     async def get_strategy_stats(self, strategy_type: str, limit: int = 100) -> PerformanceStat:

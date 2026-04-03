@@ -65,6 +65,8 @@ class TradingAgent:
         # 이중 매도 방지: 매도 진행 중인 종목 잠금
         self._selling: set[str] = set()
         self._sell_lock = asyncio.Lock()
+        # 연속 손실 일시정지
+        self._loss_pause_until: float = 0.0
 
     async def start(self) -> None:
         """에이전트 시작 - 실시간 이벤트 구독"""
@@ -193,6 +195,75 @@ class TradingAgent:
 
             if self._daily_start_balance == 0 and snapshot["total_asset"] > 0:
                 self._daily_start_balance = snapshot["total_asset"]
+
+            buy_blocked = False
+
+            # ── 서킷브레이커: 일일 손실 한도 ──
+            daily_pnl_pct = 0.0
+            if self._daily_start_balance > 0 and snapshot["total_asset"] > 0:
+                daily_pnl_pct = (
+                    (snapshot["total_asset"] - self._daily_start_balance)
+                    / self._daily_start_balance * 100
+                )
+
+            if daily_pnl_pct <= settings.DAILY_LOSS_LIMIT_HARD:
+                logger.warning(
+                    "서킷브레이커 발동 (하드): 일일 손실 {:.2f}% ≤ {:.1f}% → 전체 매매 중단",
+                    daily_pnl_pct, settings.DAILY_LOSS_LIMIT_HARD,
+                )
+                await activity_logger.log(
+                    ActivityType.CYCLE, ActivityPhase.COMPLETE,
+                    f"\U0001f6d1 서킷브레이커 (하드): 일일 손실 {daily_pnl_pct:+.2f}% "
+                    f"→ 전체 매매 중단 (한도 {settings.DAILY_LOSS_LIMIT_HARD}%)",
+                    cycle_id=cycle_id,
+                )
+                return results
+
+            if daily_pnl_pct <= settings.DAILY_LOSS_LIMIT_SOFT:
+                buy_blocked = True
+                logger.warning(
+                    "서킷브레이커 (소프트): 일일 손실 {:.2f}% → 매수 차단, 매도만 허용",
+                    daily_pnl_pct,
+                )
+                await activity_logger.log(
+                    ActivityType.CYCLE, ActivityPhase.IN_PROGRESS,
+                    f"\u26a0\ufe0f 서킷브레이커 (소프트): 일일 손실 {daily_pnl_pct:+.2f}% "
+                    f"→ 매수 차단 (한도 {settings.DAILY_LOSS_LIMIT_SOFT}%)",
+                    cycle_id=cycle_id,
+                )
+
+            # ── 서킷브레이커: 연속 손실 일시정지 ──
+            import time as _time
+            if self._loss_pause_until > 0 and _time.time() < self._loss_pause_until:
+                remaining = int((self._loss_pause_until - _time.time()) / 60)
+                buy_blocked = True
+                logger.info("연속 손실 일시정지 중: {}분 남음", remaining)
+            elif self._loss_pause_until > 0:
+                self._loss_pause_until = 0.0  # 정지 해제
+                logger.info("연속 손실 일시정지 해제")
+
+            if not buy_blocked and settings.MAX_CONSECUTIVE_LOSSES > 0:
+                try:
+                    from analysis.feedback.performance_tracker import PerformanceTracker
+                    from dependencies.database import get_async_db
+                    async for session in get_async_db():
+                        tracker = PerformanceTracker(session)
+                        consec = await tracker.get_consecutive_losses()
+                        if consec >= settings.MAX_CONSECUTIVE_LOSSES:
+                            buy_blocked = True
+                            self._loss_pause_until = _time.time() + 1800  # 30분
+                            logger.warning(
+                                "연속 {}패 → 매수 30분 일시정지 (한도 {}패)",
+                                consec, settings.MAX_CONSECUTIVE_LOSSES,
+                            )
+                            await activity_logger.log(
+                                ActivityType.CYCLE, ActivityPhase.IN_PROGRESS,
+                                f"\u26a0\ufe0f 연속 {consec}패 → 매수 30분 일시정지",
+                                cycle_id=cycle_id,
+                            )
+                        break
+                except Exception as e:
+                    logger.debug("연속 손실 체크 실패: {}", str(e))
 
             # 현금 부족 판정 → 매수만 차단, 스캔+매도 분석은 계속 진행
             eff_min_order_amount = (
@@ -462,7 +533,17 @@ class TradingAgent:
             logger.warning("[{}] 현재가·일봉 모두 없음 → 분석 스킵", symbol)
             await activity_logger.log(
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.SKIP,
-                f"⚠️ [{name}] 데이터 부족으로 분석 스킵 (현재가·일봉 조회 실패)",
+                f"\u26a0\ufe0f [{name}] 데이터 부족으로 분석 스킵 (현재가·일봉 조회 실패)",
+                cycle_id=cycle_id, symbol=symbol,
+            )
+            return result
+
+        # 일봉 데이터 최소 검증 — 5개 미만이면 기술적 분석 불가
+        if len(daily_df) < 5:
+            logger.warning("[{}] 일봉 데이터 부족 ({}개 < 5) → 분석 스킵", symbol, len(daily_df))
+            await activity_logger.log(
+                ActivityType.TIER1_ANALYSIS, ActivityPhase.SKIP,
+                f"\u26a0\ufe0f [{name}] 일봉 데이터 부족 ({len(daily_df)}개) → 분석 스킵",
                 cycle_id=cycle_id, symbol=symbol,
             )
             return result
@@ -590,7 +671,7 @@ class TradingAgent:
         )
         # 시장 국면별 신뢰도 임계값 동적 조정
         if rule_min_conf and not is_sell_or_holding:
-            _regime_adj = {"BULL": -0.05, "THEME": -0.03, "SIDEWAYS": 0.0, "BEAR": 0.03}
+            _regime_adj = {"BULL": -0.05, "THEME": -0.03, "SIDEWAYS": 0.0, "BEAR": 0.10}
             adj = _regime_adj.get(self._market_regime, 0.0)
             effective_min_conf = max(0.50, min(0.85, rule_min_conf + adj))
 
@@ -912,7 +993,8 @@ class TradingAgent:
             # 1. 오늘 시장 마감 데이터 수집 (MCP)
             market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data()
 
-            # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
+            # 2. 포트폴리오 현황 (장 마감 리뷰는 최신 데이터 필요 → 캐시 무효화)
+            account_manager.invalidate_cache()
             balance = await account_manager.get_balance()
 
             cash_ratio = 0.0
@@ -947,7 +1029,72 @@ class TradingAgent:
             except Exception as e:
                 logger.warning("활동 집계 실패: {}", str(e))
 
-            # 4. 과거 매매 성과
+            # 3-1. 체결 확인 백그라운드 태스크 완료 대기 (실현 손익 정확성 보장)
+            awaited = await decision_maker.await_pending_tasks()
+            if awaited:
+                logger.info("체결 확인 {}건 완료 → 매매 내역 조회 진행", awaited)
+
+            # 4. 오늘 실제 매매 내역 조회 (TradeResult 기반)
+            today_trades_text = "매매 내역 없음"
+            today_buy_count = 0
+            today_sell_count = 0
+            today_win_count = 0
+            today_loss_count = 0
+            today_realized_pnl = 0.0
+            today_open_position_count = 0
+
+            try:
+                async with AsyncSessionLocal() as session:
+                    from repositories.trade_result_repository import TradeResultRepository
+                    trade_repo = TradeResultRepository(session)
+
+                    opened_trades = await trade_repo.get_opened_by_date(today_date)
+                    completed_trades = await trade_repo.get_completed_by_date(today_date)
+                    all_open = await trade_repo.get_all_open()
+
+                    today_buy_count = len(opened_trades)
+                    today_sell_count = len(completed_trades)
+                    today_win_count = sum(1 for t in completed_trades if t.is_win)
+                    today_loss_count = sum(1 for t in completed_trades if not t.is_win)
+                    today_realized_pnl = sum(t.pnl for t in completed_trades)
+                    today_open_position_count = len({t.stock_symbol for t in all_open})
+
+                    lines = []
+
+                    if opened_trades:
+                        lines.append("#### 오늘 매수")
+                        for t in opened_trades:
+                            status = "보유 중" if t.exit_at is None else "청산 완료"
+                            conf = t.ai_confidence or 0.0
+                            lines.append(
+                                f"- {t.stock_name}({t.stock_symbol}): "
+                                f"매수가 {t.entry_price:,.0f}원 × {t.quantity}주, "
+                                f"전략 {t.strategy_type}, 신뢰도 {conf:.2f}, "
+                                f"상태: {status}"
+                            )
+
+                    if completed_trades:
+                        lines.append("#### 오늘 청산 (실현 손익)")
+                        for t in completed_trades:
+                            win_mark = "✅" if t.is_win else "❌"
+                            lines.append(
+                                f"- {win_mark} {t.stock_name}({t.stock_symbol}): "
+                                f"매수 {t.entry_price:,.0f}원 → 매도 {t.exit_price:,.0f}원, "
+                                f"{t.quantity}주, 손익 {t.pnl:+,.0f}원 ({t.return_pct:+.2f}%), "
+                                f"보유 {t.hold_days}일, 사유: {t.exit_reason}"
+                            )
+                        lines.append(
+                            f"\n**오늘 실현 손익 합계: {today_realized_pnl:+,.0f}원** "
+                            f"(승 {today_win_count}건 / 패 {today_loss_count}건)"
+                        )
+
+                    if lines:
+                        today_trades_text = "\n".join(lines)
+
+            except Exception as e:
+                logger.warning("오늘 매매 내역 조회 실패: {}", str(e))
+
+            # 5-1. 과거 매매 성과
             performance_summary = "매매 이력 없음"
             try:
                 from analysis.feedback.performance_tracker import PerformanceTracker
@@ -964,7 +1111,7 @@ class TradingAgent:
             except Exception as e:
                 logger.warning("성과 요약 실패: {}", str(e))
 
-            # 5. 오버나이트 보유종목 현황 (스윙 모드)
+            # 5-2. 오버나이트 보유종목 현황 (스윙 모드)
             overnight_holdings_text = "없음 (당일 청산 모드)" if settings.DAY_TRADING_ONLY else "없음"
             if not settings.DAY_TRADING_ONLY:
                 try:
@@ -1071,6 +1218,10 @@ class TradingAgent:
                 today_analyses=today_analyses,
                 today_recommendations=today_recommendations,
                 today_orders=today_orders,
+                today_trades_text=today_trades_text,
+                today_buy_count=today_buy_count,
+                today_sell_count=today_sell_count,
+                today_realized_pnl=today_realized_pnl,
                 activity_summary=activity_summary,
                 performance_summary=performance_summary,
                 overnight_holdings_text=overnight_holdings_text,
@@ -1128,6 +1279,13 @@ class TradingAgent:
                         today_analyses=today_analyses,
                         today_recommendations=today_recommendations,
                         today_orders=today_orders,
+                        buy_count=today_buy_count,
+                        sell_count=today_sell_count,
+                        win_count=today_win_count,
+                        loss_count=today_loss_count,
+                        total_pnl=today_realized_pnl,
+                        unrealized_pnl=balance.total_pnl,
+                        open_position_count=today_open_position_count,
                     )
                 except Exception as e:
                     logger.warning("일일 리포트 저장 실패: {}", str(e))
@@ -1194,6 +1352,10 @@ class TradingAgent:
         self, report_date, parsed: dict,
         today_cycles: int = 0, today_analyses: int = 0,
         today_recommendations: int = 0, today_orders: int = 0,
+        buy_count: int = 0, sell_count: int = 0,
+        win_count: int = 0, loss_count: int = 0,
+        total_pnl: float = 0.0, unrealized_pnl: float = 0.0,
+        open_position_count: int = 0,
     ) -> None:
         """장 마감 리뷰 AI 결과를 DailyReport에 저장 (데이트레이딩 성과 리뷰)"""
         from models.daily_report import DailyReport
@@ -1221,6 +1383,13 @@ class TradingAgent:
                     "total_analyses": today_analyses,
                     "total_recommendations": today_recommendations,
                     "total_orders": today_orders,
+                    "buy_count": buy_count,
+                    "sell_count": sell_count,
+                    "win_count": win_count,
+                    "loss_count": loss_count,
+                    "total_pnl": total_pnl,
+                    "unrealized_pnl": unrealized_pnl,
+                    "open_position_count": open_position_count,
                     "market_summary": parsed.get("today_review", ""),
                     "performance_review": json.dumps(trade_eval, ensure_ascii=False),
                     "lessons_learned": feedback.get("system_improvement", ""),
@@ -1493,6 +1662,7 @@ class TradingAgent:
         """Tier1/Tier2 분석 결과에서 손절/익절/트레일링 스탑을 event_detector에 적용
 
         Tier2 값을 우선 사용하고, 없으면 Tier1 값 사용.
+        trailing_stop_pct 미설정 시 전략별 기본값 자동 적용.
         """
         kwargs = {}
 
@@ -1506,10 +1676,34 @@ class TradingAgent:
         if take_profit and float(take_profit) > 0:
             kwargs["take_profit"] = float(take_profit)
 
-        # trailing_stop_pct: Tier2 > Tier1
+        # trailing_stop_pct: Tier2 > Tier1 > 전략 기본값
         trailing = tier2.get("trailing_stop_pct") or tier1.get("trailing_stop_pct")
-        if trailing and float(trailing) > 0:
-            kwargs["trailing_stop_pct"] = float(trailing)
+        if not trailing or float(trailing) <= 0:
+            # 전략별 기본 trailing_stop_pct 적용
+            strategy_type = (tier2.get("strategy_type")
+                             or tier1.get("strategy_type", ""))
+            strategy = self.strategies.get(strategy_type)
+            trailing = getattr(strategy, "DEFAULT_TRAILING_STOP_PCT", 3.0)
+        kwargs["trailing_stop_pct"] = float(trailing)
+
+        # breakeven_trigger_pct: AI가 결정한 본전 보호 활성 수익률
+        be_trigger = tier2.get("breakeven_trigger_pct") or tier1.get("breakeven_trigger_pct")
+        if be_trigger and float(be_trigger) > 0:
+            kwargs["breakeven_trigger_pct"] = float(be_trigger)
+        else:
+            # AI 미설정 시 기본값: 1.5%
+            kwargs["breakeven_trigger_pct"] = 1.5
+
+        # entry_price: 매수 진입가 (본전 보호 기준)
+        entry = tier2.get("entry_price") or tier1.get("current_price", 0)
+        if entry and float(entry) > 0:
+            kwargs["entry_price"] = float(entry)
+
+        # initial_take_profit / initial_stop_loss: 최초 값 (구간 계산 + 트레일링 구분)
+        if "take_profit" in kwargs:
+            kwargs["initial_take_profit"] = kwargs["take_profit"]
+        if "stop_loss" in kwargs:
+            kwargs["initial_stop_loss"] = kwargs["stop_loss"]
 
         if kwargs:
             event_detector.set_thresholds(symbol, **kwargs)
@@ -1784,11 +1978,17 @@ class TradingAgent:
 
         try:
             name = self._resolve_name(symbol)
-            logger.warning("손절선 도달: {} {} (현재가: {:,.0f}, 손절: {:,.0f})", name, symbol, price, stop_loss)
+            is_trailing = event.data.get("is_trailing_stop", False)
+            highest = event.data.get("highest_price", 0)
+            label = "트레일링 스탑" if is_trailing else "손절선"
+            logger.warning("{} 도달: {} {} (현재가: {:,.0f}, 손절: {:,.0f}{})",
+                           label, name, symbol, price, stop_loss,
+                           f", 고점: {highest:,.0f}" if is_trailing else "")
             await activity_logger.log(
                 ActivityType.EVENT, ActivityPhase.PROGRESS,
-                f"\U0001f6a8 손절선 도달: {name}({symbol}) — 즉시 매도 실행 "
-                f"(현재가: {price:,.0f}원, 손절: {stop_loss:,.0f}원)",
+                f"\U0001f6a8 {label} 도달: {name}({symbol}) — 즉시 매도 실행 "
+                f"(현재가: {price:,.0f}원, 손절: {stop_loss:,.0f}원"
+                f"{f', 고점: {highest:,.0f}원' if is_trailing else ''})",
                 symbol=symbol,
                 detail=event.data,
             )
@@ -1824,7 +2024,7 @@ class TradingAgent:
                                 order_id=order_id,
                                 quantity=holding.quantity,
                                 expected_price=price,
-                                exit_reason="STOP_LOSS",
+                                exit_reason="TRAILING_STOP" if is_trailing else "STOP_LOSS",
                             )
                         else:
                             # 매도 실패 → 임계값 복원

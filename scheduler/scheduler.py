@@ -456,8 +456,23 @@ class TradingScheduler:
                     should_sell = True
                     reason = f"손절 도달 ({pnl_rate:+.1f}%, 기준 {stop_loss_pct:+.1f}%)"
                 elif pnl_rate >= take_profit_pct:
-                    should_sell = True
-                    reason = f"익절 도달 ({pnl_rate:+.1f}%, 기준 {take_profit_pct:+.1f}%)"
+                    # 트레일링 스탑이 활성이면 고정 익절 대신 트레일링에 위임
+                    if th.trailing_stop_pct > 0:
+                        # 고점 갱신 + 트레일링 스탑 상향 (WebSocket 보완)
+                        if current > th.highest_price:
+                            th.highest_price = current
+                            new_stop = current * (1 - th.trailing_stop_pct / 100)
+                            if new_stop > th.stop_loss:
+                                th.stop_loss = new_stop
+                        # 소프트 익절: 익절선 상향
+                        th.take_profit = current * 1.03
+                        alerts.append(
+                            f"📈 {h.name}({h.symbol}): 익절선 도달 ({pnl_rate:+.1f}%) "
+                            f"→ 트레일링 보호 중 (손절↑{th.stop_loss:,.0f}원, 고점 {th.highest_price:,.0f}원)"
+                        )
+                    else:
+                        should_sell = True
+                        reason = f"익절 도달 ({pnl_rate:+.1f}%, 기준 {take_profit_pct:+.1f}%)"
                 # 시간 기반 조건 (데이트레이딩 전용)
                 elif settings.DAY_TRADING_ONLY:
                     if minutes_left <= 60 and pnl_rate > 1.0:
@@ -1245,12 +1260,25 @@ class TradingScheduler:
             restored = 0
             warnings = []
             for tr in open_positions:
-                # event_detector 임계값 재설정
+                # event_detector 임계값 재설정 (트레일링 스탑 포함)
                 kwargs = {}
                 if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
                     kwargs["stop_loss"] = tr.ai_stop_loss_price
+                    kwargs["initial_stop_loss"] = tr.ai_stop_loss_price
                 if tr.ai_target_price and tr.ai_target_price > 0:
                     kwargs["take_profit"] = tr.ai_target_price
+                    kwargs["initial_take_profit"] = tr.ai_target_price
+                # 트레일링 스탑 복원 (전략별 기본값)
+                if tr.entry_price and tr.entry_price > 0:
+                    kwargs["entry_price"] = tr.entry_price
+                if tr.strategy_type:
+                    kwargs["strategy_type"] = tr.strategy_type
+                    # 전략별 기본 trailing_stop_pct
+                    from agent.trading_agent import trading_agent
+                    strategy = trading_agent.strategies.get(tr.strategy_type)
+                    default_trailing = getattr(strategy, "DEFAULT_TRAILING_STOP_PCT", 3.0)
+                    kwargs["trailing_stop_pct"] = default_trailing
+                    kwargs["breakeven_trigger_pct"] = 1.5
                 if kwargs:
                     event_detector.set_thresholds(tr.stock_symbol, **kwargs)
                     restored += 1

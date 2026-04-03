@@ -17,6 +17,7 @@ class StableShortStrategy:
     """
 
     strategy_type = "STABLE_SHORT"
+    DEFAULT_TRAILING_STOP_PCT = 3.0
 
     REGIME_PARAMS = {
         "BULL":  {"stop_loss_pct": -2.5, "take_profit_pct": 5.0},
