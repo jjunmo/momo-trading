@@ -31,6 +31,20 @@ class DecisionMaker:
     def __init__(self):
         self._pending_tasks: set[asyncio.Task] = set()
 
+    async def await_pending_tasks(self, timeout: float = 30.0) -> int:
+        """대기 중인 체결 확인 태스크를 모두 완료할 때까지 대기.
+
+        Returns: 완료된 태스크 수
+        """
+        if not self._pending_tasks:
+            return 0
+        pending = list(self._pending_tasks)
+        logger.info("체결 확인 태스크 {}건 완료 대기 (timeout={}s)", len(pending), timeout)
+        done, not_done = await asyncio.wait(pending, timeout=timeout)
+        if not_done:
+            logger.warning("체결 확인 태스크 {}건 타임아웃 미완료", len(not_done))
+        return len(done)
+
     async def execute(
         self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
         analysis_context: dict | None = None,

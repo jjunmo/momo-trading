@@ -67,6 +67,15 @@ class DailyReportService:
         )
 
         try:
+            # 체결 확인 백그라운드 태스크 완료 대기 (실현 손익 정확성 보장)
+            from agent.decision_maker import decision_maker
+            awaited = await decision_maker.await_pending_tasks()
+            if awaited:
+                logger.info("일일 리포트: 체결 확인 {}건 완료 대기 후 진행", awaited)
+
+            # 계좌 캐시 무효화 (최신 잔고 반영)
+            account_manager.invalidate_cache()
+
             # 계좌 스냅샷 조회 (세션 밖에서 — MCP 호출)
             unrealized_pnl = 0.0
             open_position_count = 0
@@ -88,11 +97,34 @@ class DailyReportService:
                     activity_repo = AgentActivityRepository(session)
                     report_repo = DailyReportRepository(session)
 
-                    # 기존 리포트 확인 (중복 방지)
+                    # 기존 리포트 확인 (중복 방지 + 잘못된 리포트 자동 재생성)
                     existing = await report_repo.get_by_date(report_date)
                     if existing:
-                        logger.debug("이미 리포트 존재: {}", report_date)
-                        return existing
+                        trade_result_repo_check = TradeResultRepository(session)
+                        opened_check = await trade_result_repo_check.get_opened_by_date(report_date)
+                        completed_check = await trade_result_repo_check.get_completed_by_date(report_date)
+
+                        should_regenerate = False
+                        # 케이스 1: 통계 0인데 실제 매수 데이터 있음
+                        if existing.buy_count == 0 and existing.sell_count == 0 and len(opened_check) > 0:
+                            should_regenerate = True
+                        # 케이스 2: 청산 포지션 있는데 실현손익 0 → 비동기 confirm 전에 캐시됨
+                        if len(completed_check) > 0 and existing.total_pnl == 0.0:
+                            should_regenerate = True
+                        # 케이스 3: 매도 건수가 실제 청산 포지션 수와 불일치
+                        if existing.sell_count != len(completed_check):
+                            should_regenerate = True
+
+                        if should_regenerate:
+                            await session.delete(existing)
+                            await session.flush()
+                            logger.info(
+                                "잘못된 리포트 감지 → 재생성: {} (매수 {}건, 청산 {}건)",
+                                report_date, len(opened_check), len(completed_check),
+                            )
+                        else:
+                            logger.debug("이미 리포트 존재: {}", report_date)
+                            return existing
 
                     # 활동 데이터 집계
                     activities = await activity_repo.get_by_date(report_date, limit=2000)
@@ -108,10 +140,9 @@ class DailyReportService:
                     opened_trades = await trade_result_repo.get_opened_by_date(report_date)
                     # 청산된 BUY 포지션 (pnl/is_win이 정확히 기록된 레코드)
                     completed_trades = await trade_result_repo.get_completed_by_date(report_date)
-                    # 실제 매도 주문 건수 (SELL 레코드 수)
-                    sell_count = await trade_result_repo.get_sell_count_by_date(report_date)
 
                     buy_count = len(opened_trades)
+                    sell_count = len(completed_trades)  # 청산된 포지션 수 (대시보드와 일치)
                     total_orders = buy_count + sell_count
                     win_count = sum(1 for t in completed_trades if t.is_win)
                     loss_count = sum(1 for t in completed_trades if not t.is_win)

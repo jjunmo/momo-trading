@@ -41,13 +41,20 @@ DAILY_PLAN_PROMPT = """## 장 마감 매매 성과 리뷰
 - 총 자산: {total_asset:,.0f}원
 - 현금: {cash:,.0f}원 (현금비율: {cash_ratio:.1f}%)
 - 주식 평가액: {stock_value:,.0f}원
-- 평가 손익: {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
+- 미실현 평가 손익 (현재 보유종목): {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
 
 ### 오늘 매매 활동
 - 분석 사이클: {today_cycles}회
 - Tier1 분석: {today_analyses}건
 - 매매 추천: {today_recommendations}건
 - 주문 체결: {today_orders}건
+
+### 오늘 실제 매매 내역 (개별 종목)
+{today_trades_text}
+
+### 오늘 매매 집계
+- 매수: {today_buy_count}건 / 청산(매도): {today_sell_count}건
+- 오늘 실현 손익: {today_realized_pnl:+,.0f}원
 
 ### 오늘 활동 로그 (주요)
 {activity_summary}
