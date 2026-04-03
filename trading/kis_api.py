@@ -255,6 +255,59 @@ async def get_volume_rank(market: str = "J") -> dict:
         return {"success": False, "error": str(e), "stocks": []}
 
 
+async def get_market_index(index_code: str = "0001") -> dict:
+    """업종 현재지수 조회 (KIS REST API 직접 호출)
+
+    Args:
+        index_code: 업종 코드 - "0001"(KOSPI), "2001"(KOSDAQ)
+
+    Returns:
+        {"success": True, "name": "코스피", "price": 2650.32,
+         "change": -50.12, "change_rate": -1.85, "volume": 420000000}
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token = await _get_access_token(client)
+            response = await client.get(
+                f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-index-price",
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": "FHPUP02100000",
+                },
+                params={
+                    "FID_COND_MRKT_DIV_CODE": "U",
+                    "FID_INPUT_ISCD": index_code,
+                },
+            )
+
+            if response.status_code != 200:
+                logger.warning("업종지수 조회 실패 ({}): HTTP {}", index_code, response.status_code)
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+
+            result = response.json()
+
+        output = result.get("output", {})
+        if not output:
+            return {"success": False, "error": "업종지수 데이터 없음"}
+
+        name_map = {"0001": "KOSPI", "2001": "KOSDAQ"}
+        return {
+            "success": True,
+            "name": name_map.get(index_code, index_code),
+            "price": float(output.get("bstp_nmix_prpr", "0")),
+            "change": float(output.get("bstp_nmix_prdy_vrss", "0")),
+            "change_rate": float(output.get("bstp_nmix_prdy_ctrt", "0")),
+            "volume": int(output.get("acml_vol", "0")),
+            "trade_amount": output.get("acml_tr_pbmn", "0"),
+        }
+    except Exception as e:
+        logger.error("업종지수 조회 오류 ({}): {}", index_code, str(e))
+        return {"success": False, "error": str(e)}
+
+
 def _get_trading_domain() -> str:
     """거래 API용 도메인 반환 (모의투자는 별도 도메인)"""
     if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":

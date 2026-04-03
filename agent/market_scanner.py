@@ -73,19 +73,24 @@ class MarketScanner:
             cycle_id=cycle_id,
         )
 
-        # 1. 데이터 수집 병렬화 (MCP 3건 + DB 1건 + 계좌 1건)
+        # 1. 데이터 수집 병렬화 (MCP 3건 + DB 1건 + 계좌 1건 + 지수 2건)
+        from trading.kis_api import get_market_index
         (
             account_snapshot,
             volume_rank,
             surge_data,
             drop_data,
             performance_summary,
+            kospi_index,
+            kosdaq_index,
         ) = await asyncio.gather(
             account_manager.get_account_snapshot(),
             self._get_volume_rank(),
             self._get_fluctuation_rank("top"),
             self._get_fluctuation_rank("bottom"),
             self._get_performance_summary(),
+            get_market_index("0001"),
+            get_market_index("2001"),
         )
         balance, holdings = account_snapshot
         available_cash = balance.cash
@@ -115,6 +120,16 @@ class MarketScanner:
         )
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
 
+        # 시장 지수 포맷
+        index_lines = []
+        for idx in [kospi_index, kosdaq_index]:
+            if idx.get("success"):
+                vol_str = f"{idx['volume'] / 1_0000:,.0f}만주" if idx.get("volume") else ""
+                index_lines.append(
+                    f"{idx['name']}: {idx['price']:,.2f} ({idx['change_rate']:+.2f}%) {vol_str}"
+                )
+        market_index_data = "\n".join(index_lines) if index_lines else "지수 데이터 없음"
+
         prompt = MARKET_SCAN_PROMPT.format(
             current_time=now.strftime("%H:%M"),
             minutes_until_cutoff=minutes_until_cutoff,
@@ -122,6 +137,7 @@ class MarketScanner:
             available_cash=available_cash,
             max_per_stock=max_per_stock,
             rotation_hint=rotation_hint,
+            market_index_data=market_index_data,
             volume_rank_data=self._format_data(volume_rank),
             surge_data=self._format_data(surge_data),
             drop_data=self._format_data(drop_data),
