@@ -124,15 +124,17 @@ class ClaudeCodeProvider:
         """claude CLI 경로 탐색"""
         if self._claude_path:
             return self._claude_path
+        import os
         configured = getattr(settings, "CLAUDE_CODE_PATH", "")
-        if configured:
+        if configured and os.path.isfile(configured) and os.access(configured, os.X_OK):
             self._claude_path = configured
             return configured
+        elif configured:
+            logger.warning("CLAUDE_CODE_PATH 설정 경로가 존재하지 않음: {}", configured)
         path = shutil.which("claude")
         if path:
             self._claude_path = path
             return path
-        import os
         for candidate in [
             "/opt/homebrew/bin/claude",
             "/usr/local/bin/claude",
@@ -169,6 +171,7 @@ class ClaudeCodeProvider:
             "--max-turns", "1",
             "--effort", effort,
             "--dangerously-skip-permissions",
+            "--allowedTools", "",
         ]
 
         actual_prompt = prompt
