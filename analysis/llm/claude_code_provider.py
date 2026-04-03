@@ -171,7 +171,7 @@ class ClaudeCodeProvider:
             "--max-turns", "1",
             "--effort", effort,
             "--dangerously-skip-permissions",
-            "--allowedTools", "",
+            "--disallowedTools", "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,Agent,NotebookEdit",
         ]
 
         actual_prompt = prompt
@@ -197,11 +197,25 @@ class ClaudeCodeProvider:
         # 세션 사용 시 직렬화 (같은 세션에 동시 resume 방지)
         if self._active_session_id:
             async with self._get_lock():
-                result = await self._execute(cmd, actual_prompt)
-                # 첫 호출 성공 후 세션 초기화 완료 표시
-                if not self.__class__._session_initialized:
-                    self.__class__._session_initialized = True
-                return result
+                try:
+                    result = await self._execute(cmd, actual_prompt)
+                    # 첫 호출 성공 후 세션 초기화 완료 표시
+                    if not self.__class__._session_initialized:
+                        self.__class__._session_initialized = True
+                    return result
+                except RuntimeError as e:
+                    if "already in use" in str(e):
+                        # 세션 충돌 → 일회성 호출로 폴백
+                        logger.warning("세션 충돌 → 일회성 호출로 폴백: {}", str(e)[:80])
+                        fallback_cmd = [
+                            c for c in cmd
+                            if c not in ("--resume", "--session-id", self._active_session_id)
+                        ]
+                        fallback_cmd.extend(["--no-session-persistence"])
+                        if system_prompt and "--system-prompt" not in fallback_cmd:
+                            fallback_cmd.extend(["--system-prompt", system_prompt])
+                        return await self._execute(fallback_cmd, prompt)
+                    raise
         else:
             return await self._execute(cmd, actual_prompt)
 
