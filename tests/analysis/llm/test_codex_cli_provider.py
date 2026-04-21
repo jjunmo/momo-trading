@@ -16,6 +16,7 @@ def test_codex_command_uses_ephemeral_when_session_disabled(monkeypatch, tmp_pat
 
     assert cmd[:2] == ["/usr/local/bin/codex", "exec"]
     assert "--ephemeral" in cmd
+    assert "--sandbox" in cmd
     assert "--model" in cmd
     assert "gpt-5.4-mini" in cmd
     assert "model_reasoning_effort=medium" in cmd
@@ -36,6 +37,7 @@ def test_codex_command_resumes_existing_session(monkeypatch, tmp_path):
 
     assert cmd[:3] == ["/usr/local/bin/codex", "exec", "resume"]
     assert "--ephemeral" not in cmd
+    assert "--sandbox" not in cmd
     assert "thread-123" in cmd
     assert "model_reasoning_effort=xhigh" in cmd
     assert "mcp_servers={}" in cmd

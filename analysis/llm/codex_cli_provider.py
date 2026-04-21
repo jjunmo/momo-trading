@@ -155,22 +155,22 @@ class CodexCLIProvider:
         if not codex:
             raise RuntimeError("codex CLI를 찾을 수 없습니다 (PATH 또는 CODEX_CLI_PATH 확인)")
 
-        base_flags = [
+        common_flags = [
             "--json",
             "--skip-git-repo-check",
-            "--sandbox", "read-only",
             "--model", self._model,
             "-o", output_path,
         ]
         if self._reasoning_effort:
-            base_flags.extend(["-c", f"model_reasoning_effort={self._reasoning_effort}"])
+            common_flags.extend(["-c", f"model_reasoning_effort={self._reasoning_effort}"])
         if settings.CODEX_DISABLE_MCP:
-            base_flags.extend(["-c", "mcp_servers={}"])
+            common_flags.extend(["-c", "mcp_servers={}"])
 
         if self._session_enabled and self._active_session_id and self._session_initialized:
-            return [codex, "exec", "resume", *base_flags, self._active_session_id, "-"]
+            # `codex exec resume` does not accept the top-level --sandbox flag.
+            return [codex, "exec", "resume", *common_flags, self._active_session_id, "-"]
 
-        cmd = [codex, "exec", *base_flags]
+        cmd = [codex, "exec", *common_flags, "--sandbox", "read-only"]
         if not self._session_enabled:
             cmd.append("--ephemeral")
         cmd.append("-")
