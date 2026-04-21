@@ -170,7 +170,7 @@ class StockAnalysisAgent(BaseAgent):
         if result.confidence > 1.0:
             result.confidence = result.confidence / 100.0 if result.confidence <= 100.0 else 1.0
 
-        # 보유종목 분석 완료 → PriceGuard 임계값 설정 (분석 Agent가 직접)
+        # 보유종목 분석 완료 → PriceGuard 임계값 설정 (분석 Agent가 직접) + DB 동기화
         if request.is_holding and result.success:
             from realtime.event_detector import event_detector
             kwargs = {}
@@ -187,6 +187,24 @@ class StockAnalysisAgent(BaseAgent):
             if kwargs:
                 event_detector.set_thresholds(request.symbol, **kwargs)
                 logger.info("[분석] {} 임계값 설정: {}", request.symbol, kwargs)
+
+            # DB 동기화: trade_results의 open BUY 레코드 업데이트 → 서버 재시작 시 복원값이 최신
+            if result.target_price > 0 or result.stop_loss_price > 0:
+                try:
+                    from core.database import AsyncSessionLocal
+                    from repositories.trade_result_repository import TradeResultRepository
+                    async with AsyncSessionLocal() as session:
+                        async with session.begin():
+                            repo = TradeResultRepository(session)
+                            open_positions = await repo.get_all_open()
+                            for tr in open_positions:
+                                if tr.stock_symbol == request.symbol and tr.side == "BUY":
+                                    if result.target_price > 0:
+                                        tr.ai_target_price = result.target_price
+                                    if result.stop_loss_price > 0:
+                                        tr.ai_stop_loss_price = result.stop_loss_price
+                except Exception as e:
+                    logger.warning("[분석] {} 임계값 DB 동기화 실패: {}", request.symbol, str(e))
 
         # 결과 저장
         self._results[request.symbol] = result

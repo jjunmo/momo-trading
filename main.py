@@ -37,6 +37,41 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("MCP 서버 연결 실패 (나중에 재시도): {}", str(e))
 
+    # event_detector 임계값 복원 (DB의 open BUY 포지션 → 메모리)
+    try:
+        from realtime.event_detector import event_detector
+        from repositories.trade_result_repository import TradeResultRepository
+        from core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            repo = TradeResultRepository(session)
+            open_positions = await repo.get_all_open()
+        restored = 0
+        for tr in open_positions:
+            if tr.side != "BUY":
+                continue
+            kwargs = {}
+            if tr.ai_target_price and tr.ai_target_price > 0:
+                kwargs["take_profit"] = tr.ai_target_price
+                kwargs["initial_take_profit"] = tr.ai_target_price
+            if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
+                kwargs["stop_loss"] = tr.ai_stop_loss_price
+                kwargs["initial_stop_loss"] = tr.ai_stop_loss_price
+            if tr.entry_price and tr.entry_price > 0:
+                kwargs["entry_price"] = tr.entry_price
+            if kwargs:
+                event_detector.set_thresholds(tr.stock_symbol, **kwargs)
+                restored += 1
+        logger.info("event_detector 임계값 복원: {}건 (open BUY {}건)", restored, len(open_positions))
+    except Exception as e:
+        logger.warning("event_detector 임계값 복원 실패: {}", str(e))
+
+    # 매매불가 블록리스트 복원 (DB → 메모리)
+    try:
+        from agent.market_scanner import market_scanner
+        await market_scanner.load_untradeable_from_db()
+    except Exception as e:
+        logger.warning("매매불가 블록리스트 복원 실패: {}", str(e))
+
     # 실시간 모니터 시작 (WebSocket, 실패해도 서버 기동)
     from realtime.monitor import realtime_monitor
     try:

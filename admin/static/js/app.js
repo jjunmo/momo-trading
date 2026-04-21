@@ -174,7 +174,7 @@ function renderAccountHoldings(data) {
     const barWidth = Math.min(Math.abs(h.pnl_rate) * 10, 100);
     return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5 ${bgTint}">
       <div class="flex justify-between items-center">
-        <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}</span>
+        <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}${h.tradeable_market === 'NXT' ? ' <span class="text-green-400 text-xs">[NXT]</span>' : h.tradeable_market === 'KRX_ONLY' ? ' <span class="text-yellow-500 text-xs">[KRX종가]</span>' : ''}</span>
         <span class="${pnlColor} font-bold text-sm">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
       </div>
       <div class="pnl-bar">

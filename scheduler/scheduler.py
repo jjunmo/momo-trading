@@ -364,10 +364,8 @@ class TradingScheduler:
         )
 
         try:
-            # 0. 오버나이트 포지션 갭 체크
-            await self._check_overnight_gap()
-
-            # 1. AI Agent 매매 사이클 실행 (전체 시장 스캔 → 분석 → 매매)
+            # AI Agent 매매 사이클 실행 (전체 시장 스캔 → 분석 → 매매)
+            # 오버나이트 갭은 NXT 프리마켓(08:00~08:50) 실시간 모니터링이 처리함
             result = await trading_agent.run_cycle()
 
             # 2. 선정 종목 + 보유종목을 WebSocket 실시간 구독
@@ -1029,96 +1027,6 @@ class TradingScheduler:
             )
         except Exception as e:
             logger.warning("오버나이트 포지션 점검 오류: {}", str(e))
-
-    async def _check_overnight_gap(self) -> None:
-        """장 시작 갭 체크 (09:05) — 오버나이트 포지션 손절/익절 즉시 처리"""
-        from services.activity_logger import activity_logger
-
-        try:
-            from core.database import AsyncSessionLocal
-            from repositories.trade_result_repository import TradeResultRepository
-            from trading.account_manager import account_manager
-            from trading.mcp_client import mcp_client as _mcp
-
-            holdings = await account_manager.get_holdings()
-            if not holdings:
-                return
-
-            async with AsyncSessionLocal() as session:
-                repo = TradeResultRepository(session)
-                open_positions = await repo.get_all_open()
-
-            # symbol → TradeResult 매핑
-            open_map = {tr.stock_symbol: tr for tr in open_positions}
-
-            alerts = []
-            for h in holdings:
-                if h.quantity <= 0:
-                    continue
-                tr = open_map.get(h.symbol)
-                if not tr:
-                    continue  # 당일 매수 등 — 갭 체크 불필요
-
-                resp = await _mcp.get_current_price(h.symbol)
-                if not resp.success or not resp.data:
-                    continue
-                current = float(resp.data.get("price", 0))
-                if current <= 0:
-                    continue
-
-                should_sell = False
-                reason = ""
-
-                # 갭 하락 → 손절가 이하
-                if tr.ai_stop_loss_price and current <= tr.ai_stop_loss_price:
-                    should_sell = True
-                    reason = f"갭 하락 손절 (현재 {current:,.0f} ≤ 손절 {tr.ai_stop_loss_price:,.0f})"
-
-                # 갭 상승 → 익절가 이상
-                elif tr.ai_target_price and current >= tr.ai_target_price:
-                    should_sell = True
-                    reason = f"갭 상승 익절 (현재 {current:,.0f} ≥ 목표 {tr.ai_target_price:,.0f})"
-
-                if should_sell and settings.TRADING_ENABLED:
-                    # P0-2: 이중 매도 방지
-                    from agent.trading_agent import trading_agent
-                    if not await trading_agent._acquire_sell(h.symbol):
-                        alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} → 이미 매도 진행 중")
-                        continue
-                    try:
-                        sell_resp = await _mcp.place_order(
-                            symbol=h.symbol, side="SELL",
-                            quantity=h.quantity, price=None,
-                            market=market_calendar.get_excg_dvsn_cd(),
-                        )
-                        status = "성공" if sell_resp.success else f"실패: {sell_resp.error or ''}"
-                        alerts.append(f"\U0001f6a8 {h.name}({h.symbol}): {reason} → 매도 {status}")
-                        if sell_resp.success:
-                            from realtime.event_detector import event_detector
-                            event_detector.remove_levels(h.symbol)
-                            # 체결 확인 + TradeResult 기록
-                            from agent.decision_maker import decision_maker
-                            order_data = sell_resp.data or {}
-                            order_id = order_data.get("order_id", "")
-                            await decision_maker.confirm_and_record(
-                                symbol=h.symbol, side="SELL",
-                                order_id=order_id, quantity=h.quantity,
-                                expected_price=current,
-                                exit_reason="GAP_CHECK",
-                            )
-                    finally:
-                        trading_agent._release_sell(h.symbol)
-                elif should_sell:
-                    alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} (TRADING_ENABLED=false)")
-
-            if alerts:
-                msg = "\U0001f30d 오버나이트 갭 체크:\n" + "\n".join(alerts)
-                logger.info(msg)
-                await activity_logger.log(
-                    ActivityType.SCHEDULE, ActivityPhase.PROGRESS, msg,
-                )
-        except Exception as e:
-            logger.warning("오버나이트 갭 체크 오류: {}", str(e))
 
     async def _trigger_rescan_after_sell(self) -> None:
         """매도 완료 후 재스캔 (현금 충분 + 장중 + 매수 마감 전)"""

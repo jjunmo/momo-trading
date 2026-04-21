@@ -198,9 +198,22 @@ async def get_account_balance():
 
 @router.get("/account/holdings")
 async def get_account_holdings():
-    """보유 종목 조회"""
+    """보유 종목 조회 (KRX/NXT 시세 구분 포함)"""
     try:
+        from scheduler.market_calendar import market_calendar
+        from agent.market_scanner import market_scanner
+
         holdings = await account_manager.get_holdings()
+        session = market_calendar.get_market_session()
+        untradeable = market_scanner._untradeable_symbols
+
+        def _market_label(symbol: str) -> str:
+            if session in ("NXT_PRE", "NXT_AFTER"):
+                if symbol in untradeable:
+                    return "KRX_ONLY"
+                return "NXT"
+            return "KRX"
+
         return SuccessResponse(data=[
             {
                 "symbol": h.symbol,
@@ -210,6 +223,7 @@ async def get_account_holdings():
                 "current_price": h.current_price,
                 "pnl": h.pnl,
                 "pnl_rate": h.pnl_rate,
+                "tradeable_market": _market_label(h.symbol),
             }
             for h in holdings
         ])
