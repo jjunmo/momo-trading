@@ -1031,8 +1031,20 @@ class TradingScheduler:
             logger.warning("오버나이트 포지션 점검 오류: {}", str(e))
 
     async def _check_overnight_gap(self) -> None:
-        """장 시작 갭 체크 (09:05) — 오버나이트 포지션 손절/익절 즉시 처리"""
+        """장 시작 갭 체크 (09:05) — 오버나이트 포지션 손절/익절 즉시 처리
+
+        KRX 개장 시간대(08:50~09:30)에만 실행.
+        NXT 세션에는 KRX 전용 종목 매도 불가이므로 스킵.
+        """
+        from datetime import time as _time
+        from util.time_util import now_kst
         from services.activity_logger import activity_logger
+
+        # KRX 개장 시간대가 아니면 스킵 (NXT 세션 중 서버 재시작 대응)
+        current = now_kst().time()
+        if not (_time(8, 50) <= current <= _time(9, 30)):
+            logger.debug("갭 체크 스킵: KRX 개장 시간대 아님 (현재 {})", current.strftime("%H:%M"))
+            return
 
         try:
             from core.database import AsyncSessionLocal
@@ -1087,10 +1099,13 @@ class TradingScheduler:
                         alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} → 이미 매도 진행 중")
                         continue
                     try:
+                        # KRX 세션은 시장가(즉시 체결 보장), NXT 세션은 지정가(현재가)
+                        excg_cd = market_calendar.get_excg_dvsn_cd()
+                        sell_price = int(current) if excg_cd in ("NXT", "SOR") else None
                         sell_resp = await _mcp.place_order(
                             symbol=h.symbol, side="SELL",
-                            quantity=h.quantity, price=None,
-                            market=market_calendar.get_excg_dvsn_cd(),
+                            quantity=h.quantity, price=sell_price,
+                            market=excg_cd,
                         )
                         status = "성공" if sell_resp.success else f"실패: {sell_resp.error or ''}"
                         alerts.append(f"\U0001f6a8 {h.name}({h.symbol}): {reason} → 매도 {status}")
@@ -1107,6 +1122,15 @@ class TradingScheduler:
                                 expected_price=current,
                                 exit_reason="GAP_CHECK",
                             )
+                        else:
+                            # 매도 실패 → 재분석 트리거 (분석 캐시 무효화 + 블록리스트 체크)
+                            from agent.stock_analysis_agent import stock_analysis_agent
+                            stock_analysis_agent.invalidate(h.symbol)
+                            err = (sell_resp.error or "").lower()
+                            if "nxt" in err or "종목정보가 없" in (sell_resp.error or ""):
+                                from agent.market_scanner import market_scanner
+                                market_scanner.add_untradeable(h.symbol, reason=sell_resp.error or "")
+                            logger.warning("[갭체크] {} 매도 실패 → 재분석 예약", h.symbol)
                     finally:
                         trading_agent._release_sell(h.symbol)
                 elif should_sell:
