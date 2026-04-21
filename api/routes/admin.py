@@ -385,23 +385,22 @@ async def update_settings(updates: dict):
     return SuccessResponse(data=changed, message=f"{len(changed)}개 설정 변경됨")
 
 
-# ── Claude Code 사용량 ──
+# ── LLM 사용량 ──
 @router.get("/llm/usage")
 async def get_llm_usage():
-    """Claude Code 구독 사용량 (stats-cache.json)"""
+    """LLM provider 사용량."""
     import json
     from pathlib import Path
 
+    from analysis.llm.llm_factory import llm_factory
+
+    app_usage = llm_factory.get_llm_usage()
     stats_path = Path.home() / ".claude" / "stats-cache.json"
     if not stats_path.exists():
-        return SuccessResponse(data=None, message="stats-cache.json 없음")
+        return SuccessResponse(data={"app_usage": app_usage}, message="Claude stats-cache.json 없음")
 
     try:
         data = json.loads(stats_path.read_text())
-
-        # 앱의 실시간 사용량도 함께 반환
-        from analysis.llm.claude_code_provider import ClaudeCodeProvider
-        app_usage = ClaudeCodeProvider.get_usage_snapshot()
 
         return SuccessResponse(data={
             "total_sessions": data.get("totalSessions", 0),
@@ -414,8 +413,8 @@ async def get_llm_usage():
             "app_usage": app_usage,
         })
     except Exception as e:
-        logger.error("Claude 사용량 조회 실패: {}", str(e))
-        return SuccessResponse(data=None, message=f"조회 실패: {str(e)[:100]}")
+        logger.error("LLM 사용량 조회 실패: {}", str(e))
+        return SuccessResponse(data={"app_usage": app_usage}, message=f"조회 실패: {str(e)[:100]}")
 
 
 # ── LLM 상태 ──

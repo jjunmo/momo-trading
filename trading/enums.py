@@ -97,6 +97,7 @@ class LLMTier(str, Enum):
 class LLMProvider(str, Enum):
     """LLM 제공자"""
     CLAUDE_CODE = "CLAUDE_CODE"  # 로컬 Claude Code CLI (구독 크레딧)
+    CODEX_CLI = "CODEX_CLI"      # 로컬 Codex CLI
 
 
 class OrderConfirmStatus(str, Enum):

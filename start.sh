@@ -13,10 +13,11 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$APP_DIR/venv"
-PID_FILE="$APP_DIR/.momo.pid"
-LOG_FILE="$APP_DIR/logs/momo-trading.log"
+PID_FILE="${MOMO_PID_FILE:-$APP_DIR/.momo.pid}"
+LOG_FILE="${MOMO_LOG_FILE:-$APP_DIR/logs/momo-trading.log}"
 HOST="${MOMO_HOST:-0.0.0.0}"
 PORT="${MOMO_PORT:-9000}"
+ENV_FILE="${MOMO_ENV_FILE:-.env}"
 
 # venv 활성화
 if [ -f "$VENV_DIR/bin/activate" ]; then
@@ -29,9 +30,10 @@ fi
 
 cd "$APP_DIR"
 
-# .env 체크
-if [ ! -f ".env" ]; then
-    echo "⚠️  .env 파일이 없습니다. .env.example을 참고하세요."
+# env 체크
+if [ ! -f "$ENV_FILE" ]; then
+    echo "⚠️  env 파일이 없습니다: $ENV_FILE"
+    echo "   .env.example 또는 .env.multi-agent.example을 참고하세요."
 fi
 
 # 로그 디렉토리 확인
@@ -86,6 +88,7 @@ case "${1:-}" in
         echo "🚀 momo-trading 백그라운드 시작"
         echo "   Host: $HOST:$PORT"
         echo "   Admin: http://localhost:$PORT/admin"
+        echo "   Env: $ENV_FILE"
         echo "   Log: $LOG_FILE"
 
         nohup python -m uvicorn main:app \
@@ -103,13 +106,15 @@ case "${1:-}" in
         echo "🚀 momo-trading 시작 (포그라운드)"
         echo "   Host: $HOST:$PORT"
         echo "   Admin: http://localhost:$PORT/admin"
+        echo "   Env: $ENV_FILE"
+        echo "   Log: $LOG_FILE"
         echo "   종료: Ctrl+C"
         echo ""
 
         python -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
             --log-level info \
-            --reload
+            --reload 2>&1 | tee -a "$LOG_FILE"
         ;;
 
     *)

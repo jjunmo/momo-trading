@@ -50,9 +50,11 @@ venv.bak/
 .env.local
 .env.production
 !.env.example
+!.env.multi-agent.example
+
 
 # KIS API 토큰 (런타임 생성, 절대 커밋 금지)
-data/kis_token.json
+data/*
 
 # Python 버전 관리
 .python-version

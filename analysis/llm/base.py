@@ -14,6 +14,9 @@ class LLMProviderProtocol(Protocol):
     @property
     def tier(self) -> LLMTier: ...
 
+    @property
+    def model_id(self) -> str: ...
+
     async def generate(self, prompt: str, system_prompt: str = "") -> str:
         """텍스트 생성"""
         ...
