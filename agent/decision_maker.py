@@ -145,11 +145,12 @@ class DecisionMaker:
             task.add_done_callback(self._pending_tasks.discard)
         else:
             error_msg = response.error or "주문번호 없음"
-            # 매매불가 종목 → 런타임 블록리스트 등록 (이후 스캔에서 제외)
-            if "매매불가" in error_msg:
+            # 매매불가/NXT미상장 종목 → 블록리스트 등록 (메모리 + DB 영속화)
+            _block_keywords = ("매매불가", "종목정보가 없", "NXT 상장종목")
+            if any(kw in error_msg for kw in _block_keywords):
                 from agent.market_scanner import market_scanner
-                market_scanner.add_untradeable(signal.symbol)
-                logger.warning("매매불가 종목 블록리스트 등록: {} → 이후 스캔에서 제외", signal.symbol)
+                market_scanner.add_untradeable(signal.symbol, reason=error_msg[:200])
+                logger.warning("매매불가 종목 블록리스트 등록: {} → 이후 스캔에서 제외 ({})", signal.symbol, error_msg[:50])
             await activity_logger.log(
                 ActivityType.DECISION, ActivityPhase.ERROR,
                 f"\u274c [{signal.symbol}] 주문 실패: {error_msg}",

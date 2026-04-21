@@ -25,10 +25,50 @@ class MarketScanner:
     def __init__(self):
         self._untradeable_symbols: set[str] = set()
 
-    def add_untradeable(self, symbol: str) -> None:
-        """매매불가 종목을 런타임 블록리스트에 등록 (당일 스캔에서 제외)"""
+    def add_untradeable(self, symbol: str, reason: str = "") -> None:
+        """매매불가 종목을 블록리스트에 등록 (메모리 + DB 영속화)"""
+        if symbol in self._untradeable_symbols:
+            return
         self._untradeable_symbols.add(symbol)
         logger.debug("매매불가 블록리스트 등록: {} (총 {}건)", symbol, len(self._untradeable_symbols))
+        # DB 영속화 (비동기, 실패 허용)
+        try:
+            task = asyncio.create_task(self._persist_untradeable(symbol, reason))
+            task.add_done_callback(lambda t: t.exception())  # 예외 무시
+        except RuntimeError:
+            # 이벤트 루프 없는 경우 (테스트 등)
+            pass
+
+    async def _persist_untradeable(self, symbol: str, reason: str) -> None:
+        """매매불가 종목을 DB에 저장 (중복 INSERT 방지)"""
+        try:
+            from sqlalchemy import select
+            from core.database import AsyncSessionLocal
+            from models.untradeable_symbol import UntradeableSymbol
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    existing = await session.execute(
+                        select(UntradeableSymbol).where(UntradeableSymbol.symbol == symbol)
+                    )
+                    if existing.scalar_one_or_none():
+                        return
+                    session.add(UntradeableSymbol(symbol=symbol, reason=(reason or "")[:200]))
+        except Exception as e:
+            logger.warning("매매불가 DB 저장 실패 ({}): {}", symbol, str(e))
+
+    async def load_untradeable_from_db(self) -> None:
+        """서버 시작 시 호출 — DB에서 블록리스트 메모리에 복원"""
+        try:
+            from sqlalchemy import select
+            from core.database import AsyncSessionLocal
+            from models.untradeable_symbol import UntradeableSymbol
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(UntradeableSymbol.symbol))
+                symbols = set(result.scalars().all())
+            self._untradeable_symbols = symbols
+            logger.info("매매불가 블록리스트 복원: {}건", len(symbols))
+        except Exception as e:
+            logger.warning("매매불가 블록리스트 복원 실패: {}", str(e))
 
     def _filter_untradeable(self, stocks: list[dict]) -> list[dict]:
         """매매불가 종목 필터링 (런타임 블록리스트 + 이름 키워드)"""
