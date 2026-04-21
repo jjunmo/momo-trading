@@ -1039,6 +1039,7 @@ class TradingScheduler:
             from repositories.trade_result_repository import TradeResultRepository
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
+            from scheduler.market_calendar import market_calendar
 
             holdings = await account_manager.get_holdings()
             if not holdings:

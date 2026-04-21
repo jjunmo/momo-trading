@@ -138,9 +138,10 @@ class AccountManager:
                 logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
                 return self._balance_cache, self._holdings_cache
 
-        # KIS REST API 직접 호출 (AFHR_FLPR_YN=X: KRX+NXT 통합 가격 반영)
-        # MCP inquery-balance는 AFHR_FLPR_YN 미지원 → 항상 직접 호출
-        data = await self._fetch_balance_direct("X")
+        # 세션별 AFHR_FLPR_YN 분기: NXT 세션은 "X"(NXT 실시간), 장외는 "N"(KRX 종가)
+        session = market_calendar.get_market_session()
+        afhr_param = "X" if session in ("NXT_PRE", "KRX_NXT", "NXT_AFTER") else "N"
+        data = await self._fetch_balance_direct(afhr_param)
 
         if data is None:
             balance = self._balance_cache if self._balance_cache else self._empty_balance()

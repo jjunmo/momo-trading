@@ -82,14 +82,20 @@ class RealtimeMonitor:
                         logger.debug("장외 시간 → 폴링 폴백 비활성화")
                     continue
 
+                # NXT 단독 세션(프리/애프터): WebSocket 미지원 → 단절은 정상, 조용히 폴링
+                session = market_calendar.get_market_session()
+                nxt_only = session in ("NXT_PRE", "NXT_AFTER")
+
                 ws_disconnected = not stream_manager.is_connected
                 data_stale = (time.monotonic() - self._last_ws_data_time) > self.WS_STALE_THRESHOLD_SEC
 
                 if (ws_disconnected or data_stale) and not self._polling_active:
-                    reason = "연결 끊김" if ws_disconnected else f"데이터 {self.WS_STALE_THRESHOLD_SEC}초 미수신"
-                    logger.warning("WebSocket 단절 감지 ({}) → 폴링 폴백 활성화", reason)
+                    if not nxt_only:
+                        reason = "연결 끊김" if ws_disconnected else f"데이터 {self.WS_STALE_THRESHOLD_SEC}초 미수신"
+                        logger.warning("WebSocket 단절 감지 ({}) → 폴링 폴백 활성화", reason)
+                    else:
+                        logger.debug("NXT 단독 세션 → WebSocket 미지원, 폴링 폴백 활성화")
                     self._polling_active = True
-                    # 폴링 태스크 시작
                     if self._poll_task is None or self._poll_task.done():
                         self._poll_task = asyncio.create_task(self._poll_loop())
 
