@@ -40,18 +40,12 @@ class OrderExecutor:
         )
 
     async def cancel(self, order_id: str, market: str = "KRX") -> OrderResult:
-        """주문 취소"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
-            response = await mcp_client.call_tool("cancel_domestic_order", {
-                "order_id": order_id,
-            })
-        else:
-            response = await mcp_client.call_tool("cancel_overseas_order", {
-                "order_id": order_id,
-            })
+        """주문 취소 (KIS REST API 직접 호출)"""
+        from trading.kis_api import cancel_order_direct
 
-        if not response.success:
-            return OrderResult(success=False, message=response.error or "취소 실패")
+        result = await cancel_order_direct(order_id=order_id)
+        if not result.get("success"):
+            return OrderResult(success=False, message=result.get("error", "취소 실패"))
 
         logger.info("주문 취소: {}", order_id)
         return OrderResult(success=True, message="주문 취소 완료")

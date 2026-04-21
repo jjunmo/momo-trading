@@ -57,6 +57,14 @@ async def sse_stream():
     )
 
 
+# ── 종목명 매핑 ──
+@router.get("/symbol-names")
+async def get_symbol_names():
+    """종목 심볼 → 이름 매핑 (프론트엔드 표시용)"""
+    from agent.trading_agent import trading_agent
+    return SuccessResponse(data=trading_agent._symbol_names)
+
+
 # ── 활동 목록 ──
 @router.get("/activities", response_model=SuccessResponse[list[ActivityResponse]])
 async def get_activities(
@@ -234,6 +242,102 @@ async def get_pending_orders():
         return SuccessResponse(data=[], message=f"미체결 주문 조회 실패: {str(e)[:100]}")
 
 
+@router.post("/sync-holdings")
+async def sync_holdings():
+    """KIS 계좌 보유 종목 → trade_results BUY 레코드 복원"""
+    from uuid import uuid4
+    from models.trade_result import TradeResult
+    from repositories.trade_result_repository import TradeResultRepository
+    from core.database import AsyncSessionLocal
+    from util.time_util import now_kst
+
+    try:
+        holdings = await account_manager.get_holdings()
+        if not holdings:
+            return SuccessResponse(data={"synced": 0, "message": "보유 종목 없음"})
+
+        now = now_kst()
+        synced = []
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open()
+                db_symbols = {tr.stock_symbol for tr in open_positions}
+
+                for h in holdings:
+                    if h.quantity <= 0 or h.symbol in db_symbols:
+                        continue
+                    record = TradeResult(
+                        id=str(uuid4()),
+                        stock_symbol=h.symbol,
+                        stock_name=h.name,
+                        side="BUY",
+                        strategy_type="STABLE_SHORT",
+                        entry_price=h.avg_buy_price,
+                        exit_price=0,
+                        quantity=h.quantity,
+                        pnl=0,
+                        return_pct=0,
+                        is_win=False,
+                        hold_days=0,
+                        exit_reason="",
+                        ai_recommendation="BUY",
+                        ai_confidence=0.5,
+                        market="KRX",
+                        market_regime="",
+                        status="CONFIRMED",
+                        entry_at=now,
+                        notes="KIS 계좌 동기화 복원",
+                    )
+                    session.add(record)
+                    synced.append({"symbol": h.symbol, "name": h.name,
+                                   "qty": h.quantity, "avg_price": h.avg_buy_price})
+                    logger.info("보유 종목 복원: {}({}) {}주 @{:,.0f}원",
+                                h.name, h.symbol, h.quantity, h.avg_buy_price)
+
+        return SuccessResponse(data={"synced": len(synced), "details": synced})
+    except Exception as e:
+        logger.error("보유 종목 동기화 실패: {}", str(e))
+        return SuccessResponse(data={"synced": 0, "error": str(e)})
+
+
+@router.post("/cancel-all-pending")
+async def cancel_all_pending():
+    """미체결 주문 전체 취소 — 묶인 현금 해방"""
+    from trading.kis_api import cancel_order_direct
+
+    try:
+        orders = await account_manager.get_pending_orders()
+        if not orders:
+            return SuccessResponse(data={"cancelled": 0, "message": "미체결 주문 없음"})
+
+        results = []
+        for o in orders:
+            if not o.order_id:
+                continue
+            cancel_result = await cancel_order_direct(order_id=o.order_id)
+            results.append({
+                "order_id": o.order_id,
+                "symbol": o.symbol,
+                "name": o.name,
+                "success": cancel_result.get("success", False),
+                "message": cancel_result.get("error", "취소 완료"),
+            })
+            logger.info("미체결 취소: {} {} — {}", o.symbol, o.order_id,
+                        "성공" if cancel_result.get("success") else cancel_result.get("error"))
+
+        cancelled = sum(1 for r in results if r["success"])
+        return SuccessResponse(data={
+            "cancelled": cancelled,
+            "total": len(results),
+            "details": results,
+        })
+    except Exception as e:
+        logger.error("미체결 전체 취소 실패: {}", str(e))
+        return SuccessResponse(data={"cancelled": 0, "error": str(e)})
+
+
 # ── 설정 조회/변경 ──
 MUTABLE_SETTINGS = [
     "TRADING_ENABLED", "AUTONOMY_MODE",
@@ -340,9 +444,10 @@ async def get_system_status():
         "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
-        "market_open": market_calendar.is_krx_trading_hours(),
+        "market_open": market_calendar.is_domestic_trading_hours(),
+        "market_session": market_calendar.get_market_session(),
         "market_holiday": market_calendar.get_holiday_name(),
-        "next_market_open": market_calendar.next_krx_open().strftime("%m/%d %H:%M"),
+        "next_market_open": market_calendar.next_market_open().strftime("%m/%d %H:%M"),
     })
 
 

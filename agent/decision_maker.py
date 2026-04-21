@@ -17,7 +17,7 @@ from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderConfirmStatus, OrderSource, RecommendationStatus
 from trading.mcp_client import mcp_client
-from util.time_util import now_kst
+from util.time_util import ensure_kst, now_kst
 
 
 class DecisionMaker:
@@ -30,6 +30,8 @@ class DecisionMaker:
 
     def __init__(self):
         self._pending_tasks: set[asyncio.Task] = set()
+        # 매도 체결 대기 목록: {symbol: {order_id, expected_price, quantity, exit_reason, timestamp}}
+        self._pending_sells: dict[str, dict] = {}
 
     async def await_pending_tasks(self, timeout: float = 30.0) -> int:
         """대기 중인 체결 확인 태스크를 모두 완료할 때까지 대기.
@@ -84,11 +86,13 @@ class DecisionMaker:
             symbol=signal.symbol,
         )
 
+        from scheduler.market_calendar import market_calendar
         response = await mcp_client.place_order(
             symbol=signal.symbol,
             side=signal.action.value,
             quantity=signal.suggested_quantity or 0,
             price=signal.suggested_price,
+            market=market_calendar.get_excg_dvsn_cd(),
         )
 
         # 주문 응답 검증: MCP success + 주문번호 존재 확인
@@ -230,70 +234,107 @@ class DecisionMaker:
         on_settled: 체결 확인 완료 시 호출되는 콜백 (order_id, success)
         """
         try:
-            await asyncio.sleep(3)  # KIS 체결 처리 대기
+            # 10초 간격 × 3회 재시도 (총 30초) — 지정가 체결 대기
+            MAX_ATTEMPTS = 3
+            POLL_INTERVAL = 10
 
-            resp = await mcp_client.get_order_list()
-            if not resp.success:
-                logger.warning("[{}] 주문내역 조회 실패: {}", symbol, resp.error)
-                await self._mark_pending_failed(pending_record_id, f"주문내역 조회 실패: {resp.error}")
-                if on_settled:
-                    await on_settled(order_id, False)
-                return
-
-            # 응답 구조 로깅 (첫 호출 디버깅용)
-            logger.debug("[체결확인] get_order_list 응답: {}", str(resp.data)[:500])
-
-            # KIS 주문내역 응답 파싱: output 또는 output1 배열
-            orders = []
-            if isinstance(resp.data, dict):
-                orders = (
-                    resp.data.get("output", [])
-                    or resp.data.get("output1", [])
-                    or resp.data.get("orders", [])
-                )
-                if isinstance(orders, dict):
-                    orders = [orders]
-            elif isinstance(resp.data, list):
-                orders = resp.data
-
-            # order_id 매칭으로 체결 확인
             filled_order = None
-            for order in orders:
-                if not isinstance(order, dict):
+            filled_qty = 0
+            filled_price = 0.0
+
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                await asyncio.sleep(POLL_INTERVAL)
+
+                resp = await mcp_client.get_order_list()
+                if not resp.success:
+                    logger.warning("[{}] 주문내역 조회 실패 ({}회차): {}", symbol, attempt, resp.error)
                     continue
-                # KIS 주문번호 키: odno (대소문자 혼용)
-                kis_odno = (
-                    order.get("odno") or order.get("ODNO")
-                    or order.get("order_id") or ""
+
+                if attempt == 1:
+                    logger.debug("[체결확인] get_order_list 응답: {}", str(resp.data)[:500])
+
+                # KIS 주문내역 응답 파싱
+                orders = []
+                if isinstance(resp.data, dict):
+                    orders = (
+                        resp.data.get("output", [])
+                        or resp.data.get("output1", [])
+                        or resp.data.get("orders", [])
+                    )
+                    if isinstance(orders, dict):
+                        orders = [orders]
+                elif isinstance(resp.data, list):
+                    orders = resp.data
+
+                # order_id 매칭으로 체결 확인
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    kis_odno = (
+                        order.get("odno") or order.get("ODNO")
+                        or order.get("order_id") or ""
+                    )
+                    if str(kis_odno) == str(order_id):
+                        filled_order = order
+                        break
+
+                # 폴백: order_id 매칭 실패 시 종목+방향으로 탐색
+                if not filled_order and orders:
+                    side_code = "02" if side == "SELL" else "01"
+                    for order in orders:
+                        if not isinstance(order, dict):
+                            continue
+                        o_symbol = order.get("pdno") or order.get("symbol") or ""
+                        o_side = order.get("sll_buy_dvsn_cd") or order.get("side") or ""
+                        o_qty = mcp_client._to_int(
+                            order.get("tot_ccld_qty") or order.get("filled_quantity") or 0
+                        )
+                        if o_symbol == symbol and o_side == side_code and o_qty > 0:
+                            filled_order = order
+                            logger.warning(
+                                "[{}] order_id {} 매칭 실패 → 종목+방향 폴백 매칭 (odno={})",
+                                symbol, order_id,
+                                order.get("odno") or order.get("ODNO") or "?",
+                            )
+                            break
+
+                if not filled_order:
+                    logger.debug("[{}] 체결 미확인 ({}회차/{}) — 재시도", symbol, attempt, MAX_ATTEMPTS)
+                    continue
+
+                # 체결 수량/가격 추출
+                filled_qty = mcp_client._to_int(
+                    filled_order.get("tot_ccld_qty")
+                    or filled_order.get("filled_quantity")
+                    or filled_order.get("ccld_qty")
+                    or quantity
                 )
-                if str(kis_odno) == str(order_id):
-                    filled_order = order
-                    break
+                raw_price = (
+                    filled_order.get("avg_prvs")
+                    or filled_order.get("ccld_pric")
+                    or filled_order.get("filled_price")
+                )
+                if raw_price:
+                    filled_price = mcp_client._to_float(raw_price)
+                else:
+                    filled_price = float(expected_price)
+                    logger.warning(
+                        "[{}] 체결가격 필드 없음 → expected_price {:,.0f}원 사용. 원본: {}",
+                        symbol, expected_price, str(filled_order)[:300],
+                    )
 
-            if not filled_order:
-                logger.debug("[{}] 주문 {} 미체결 (체결내역에서 미발견) → 취소 시도", symbol, order_id)
+                if filled_qty > 0:
+                    break  # 체결 확인 완료
+                else:
+                    logger.debug("[{}] 체결수량 0 ({}회차) — 재시도", symbol, attempt)
+                    filled_order = None  # 리셋하고 재시도
+
+            # 재시도 모두 실패 → 미체결 취소
+            if not filled_order or filled_qty <= 0:
+                logger.warning("[{}] 주문 {} — {}초간 체결 미확인 → 취소 시도",
+                               symbol, order_id, MAX_ATTEMPTS * POLL_INTERVAL)
                 await self._cancel_unfilled_order(order_id, symbol)
-                if on_settled:
-                    await on_settled(order_id, False)
-                return
-
-            # 체결 수량/가격 추출
-            filled_qty = mcp_client._to_int(
-                filled_order.get("tot_ccld_qty")
-                or filled_order.get("filled_quantity")
-                or filled_order.get("ccld_qty")
-                or quantity
-            )
-            filled_price = mcp_client._to_float(
-                filled_order.get("avg_prvs")
-                or filled_order.get("ccld_pric")
-                or filled_order.get("filled_price")
-                or expected_price
-            )
-
-            if filled_qty <= 0:
-                logger.debug("[{}] 주문 {} 체결수량 0 → 미체결 → 취소 시도", symbol, order_id)
-                await self._cancel_unfilled_order(order_id, symbol)
+                await self._mark_pending_failed(pending_record_id, "체결 미확인 (타임아웃)")
                 if on_settled:
                     await on_settled(order_id, False)
                 return
@@ -343,18 +384,34 @@ class DecisionMaker:
                 await on_settled(order_id, False)
 
     async def _cancel_unfilled_order(self, order_id: str, symbol: str) -> None:
-        """미체결 주문 취소 시도"""
-        if not order_id:
-            return
-        try:
-            from trading.order_executor import order_executor
-            result = await order_executor.cancel(str(order_id))
-            if result.success:
-                logger.debug("[{}] 미체결 주문 취소 완료: {}", symbol, order_id)
-            else:
-                logger.warning("[{}] 미체결 주문 취소 실패: {} — {}", symbol, order_id, result.message)
-        except Exception as e:
-            logger.warning("[{}] 미체결 주문 취소 오류: {} — {}", symbol, order_id, str(e))
+        """미체결 주문 취소 시도 — order_id 없으면 종목 기준 폴백"""
+        from trading.kis_api import cancel_order_direct
+
+        if order_id:
+            # 정상 경로: order_id로 직접 취소
+            try:
+                result = await cancel_order_direct(order_id=order_id)
+                if result.get("success"):
+                    logger.info("[{}] 미체결 취소 완료: {}", symbol, order_id)
+                else:
+                    logger.warning("[{}] 미체결 취소 실패: {} — {}", symbol, order_id, result.get("error"))
+            except Exception as e:
+                logger.warning("[{}] 미체결 취소 오류: {} — {}", symbol, order_id, str(e))
+        else:
+            # 폴백: order_id 없음 → 미체결 목록에서 종목으로 찾아 취소
+            logger.warning("[{}] order_id 없음 — 미체결 목록에서 종목 기준 취소 시도", symbol)
+            try:
+                from trading.account_manager import account_manager
+                pending = await account_manager.get_pending_orders()
+                for o in pending:
+                    if o.symbol == symbol and o.remaining_qty > 0:
+                        result = await cancel_order_direct(order_id=o.order_id)
+                        if result.get("success"):
+                            logger.info("[{}] 폴백 취소 완료: {}", symbol, o.order_id)
+                        else:
+                            logger.warning("[{}] 폴백 취소 실패: {} — {}", symbol, o.order_id, result.get("error"))
+            except Exception as e:
+                logger.warning("[{}] 폴백 취소 오류: {}", symbol, str(e))
 
     async def _confirm_pending_record(
         self,
@@ -404,7 +461,7 @@ class DecisionMaker:
                             open_buy.pnl = pnl
                             open_buy.return_pct = round(return_pct, 2)
                             open_buy.is_win = pnl > 0
-                            open_buy.hold_days = (now - open_buy.entry_at).days if open_buy.entry_at else 0
+                            open_buy.hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
                             open_buy.exit_reason = exit_reason or "SIGNAL"
                             open_buy.exit_at = now
                         if open_buys:
@@ -507,10 +564,10 @@ class DecisionMaker:
                         open_buys = await repo.get_all_open_buys(symbol)
                         if not open_buys:
                             logger.warning(
-                                "[TradeResult] {} 미청산 매수 기록 없음 → 매도 기록만 생성",
-                                symbol,
+                                "[TradeResult] {} 미청산 매수 기록 없음 → 매도 체결가({:,.0f})로 독립 기록",
+                                symbol, filled_price,
                             )
-                            # 매수 기록 없이 매도만 온 경우 → 독립 기록
+                            # 매수 기록 없이 매도만 온 경우 → 독립 SELL (체결가 기록)
                             tr = TradeResult(
                                 order_id=order_id,
                                 stock_symbol=symbol,
@@ -525,6 +582,7 @@ class DecisionMaker:
                                 entry_at=now,
                             )
                             session.add(tr)
+                            # portfolio_sync_job이 나중에 SELL 체결가로 BUY를 자동 청산
                             return
 
                         # 모든 미청산 BUY 일괄 청산
@@ -534,7 +592,7 @@ class DecisionMaker:
                             pnl = (filled_price - entry_price) * open_buy.quantity
                             return_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
                             is_win = pnl > 0
-                            hold_days = (now - open_buy.entry_at).days if open_buy.entry_at else 0
+                            hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
 
                             open_buy.exit_price = filled_price
                             open_buy.pnl = pnl
@@ -628,6 +686,170 @@ class DecisionMaker:
             "action": signal.action.value,
             "recommendation": rec_data,
         }
+
+
+    # ── 매도 체결 확인: 보유종목 변동 감지 ──
+
+    def register_pending_sell(
+        self, symbol: str, order_id: str, quantity: int,
+        expected_price: float, exit_reason: str = "",
+    ) -> None:
+        """매도 주문 후 체결 대기 등록"""
+        import time
+        self._pending_sells[symbol] = {
+            "order_id": order_id,
+            "expected_price": expected_price,
+            "quantity": quantity,
+            "exit_reason": exit_reason,
+            "timestamp": time.time(),
+        }
+        logger.info("[매도대기] {} 등록: order_id={}, qty={}, price={:,.0f}",
+                     symbol, order_id, quantity, expected_price)
+
+    async def wait_for_sell_confirmation(
+        self, symbol: str, order_id: str, quantity: int,
+        expected_price: float, exit_reason: str = "",
+    ) -> bool:
+        """매도 직후 보유종목 변동 감지 (빠른 확인, 최대 30초)"""
+        from trading.account_manager import account_manager
+
+        for attempt in range(3):
+            await asyncio.sleep(10)
+            try:
+                holdings = await account_manager.get_holdings()
+                holding_symbols = {h.symbol for h in holdings if h.symbol}
+                if symbol not in holding_symbols:
+                    # 보유목록에서 사라짐 → 매도 체결 확인
+                    fill_price = await self._get_fill_price(order_id, symbol)
+                    actual_price = fill_price or expected_price
+                    await self._record_trade_result(
+                        symbol=symbol, side="SELL", order_id=order_id,
+                        filled_qty=quantity, filled_price=actual_price,
+                        exit_reason=exit_reason,
+                    )
+                    self._pending_sells.pop(symbol, None)
+                    logger.info("[매도확인] {} 체결 확인 (보유종목 변동): {:,.0f}원", symbol, actual_price)
+                    # 계좌 캐시 무효화
+                    account_manager.invalidate_cache()
+                    return True
+            except Exception as e:
+                logger.warning("[매도확인] {} 보유종목 조회 실패 ({}/3): {}", symbol, attempt + 1, str(e))
+
+        # 30초 내 미확인 → pending_sells에 유지 (정기 체크에서 재시도)
+        self.register_pending_sell(symbol, order_id, quantity, expected_price, exit_reason)
+        logger.info("[매도대기] {} 30초 내 미확인 → 정기 체크에서 재시도", symbol)
+        return False
+
+    async def check_pending_sells(self) -> int:
+        """매도 체결 대기 점검 — 메모리 + DB 양쪽 확인
+
+        1. 메모리 _pending_sells: 현재 세션에서 매도한 종목
+        2. DB PENDING_CONFIRM SELL: 서버 재시작 후 복구용
+
+        Returns: 체결 확인된 건수
+        """
+        from trading.account_manager import account_manager
+        try:
+            holdings = await account_manager.get_holdings()
+        except Exception:
+            return 0
+
+        holding_symbols = {h.symbol for h in holdings if h.symbol}
+        confirmed = 0
+
+        # 1. 메모리 pending sells 점검
+        for symbol in list(self._pending_sells.keys()):
+            if symbol in holding_symbols:
+                continue
+
+            pending = self._pending_sells.pop(symbol)
+            fill_price = await self._get_fill_price(pending["order_id"], symbol)
+            actual_price = fill_price or pending["expected_price"]
+
+            await self._record_trade_result(
+                symbol=symbol, side="SELL", order_id=pending["order_id"],
+                filled_qty=pending["quantity"], filled_price=actual_price,
+                exit_reason=pending["exit_reason"],
+            )
+            logger.info("[매도확인] {} 메모리 체결 확인: {:,.0f}원", symbol, actual_price)
+            account_manager.invalidate_cache()
+            confirmed += 1
+
+        # 2. DB PENDING_CONFIRM SELL 레코드 점검 (서버 재시작 복구)
+        try:
+            from sqlalchemy import select, and_
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(TradeResult).where(and_(
+                        TradeResult.side == "SELL",
+                        TradeResult.status == "PENDING_CONFIRM",
+                    ))
+                )
+                pending_db = list(result.scalars().all())
+
+                for tr in pending_db:
+                    symbol = tr.stock_symbol
+                    if symbol in holding_symbols:
+                        continue  # 아직 보유 → 미체결
+
+                    # 보유목록에서 사라짐 → 체결 확인
+                    fill_price = await self._get_fill_price(tr.order_id, symbol)
+                    actual_price = fill_price or tr.exit_price or 0
+
+                    if actual_price > 0:
+                        await self._confirm_pending_record(
+                            pending_record_id=tr.id,
+                            symbol=symbol, side="SELL",
+                            filled_qty=tr.quantity, filled_price=actual_price,
+                            exit_reason=tr.exit_reason or "RECOVERED",
+                        )
+                        logger.info("[매도확인] {} DB 복구 체결 확인: {:,.0f}원", symbol, actual_price)
+                        account_manager.invalidate_cache()
+                        confirmed += 1
+        except Exception as e:
+            logger.warning("DB PENDING_CONFIRM 점검 오류: {}", str(e))
+
+        return confirmed
+
+    async def _get_fill_price(self, order_id: str, symbol: str) -> float:
+        """주문내역에서 체결가 조회"""
+        try:
+            resp = await mcp_client.get_order_list()
+            if not resp.success:
+                return 0.0
+
+            orders = []
+            if isinstance(resp.data, dict):
+                orders = resp.data.get("output", []) or resp.data.get("output1", []) or []
+            elif isinstance(resp.data, list):
+                orders = resp.data
+
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                kis_odno = order.get("odno") or order.get("ODNO") or order.get("order_id") or ""
+                if str(kis_odno) == str(order_id):
+                    raw_price = (
+                        order.get("avg_prvs") or order.get("ccld_pric") or order.get("filled_price")
+                    )
+                    if raw_price:
+                        return mcp_client._to_float(raw_price)
+
+            # order_id 매칭 실패 → 종목+매도로 폴백
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                o_symbol = order.get("pdno") or order.get("symbol") or ""
+                o_side = order.get("sll_buy_dvsn_cd") or ""
+                if o_symbol == symbol and o_side == "02":
+                    raw_price = (
+                        order.get("avg_prvs") or order.get("ccld_pric") or order.get("filled_price")
+                    )
+                    if raw_price:
+                        return mcp_client._to_float(raw_price)
+        except Exception as e:
+            logger.warning("[매도확인] 체결가 조회 실패 ({}): {}", symbol, str(e))
+        return 0.0
 
 
 decision_maker = DecisionMaker()

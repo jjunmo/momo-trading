@@ -6,6 +6,10 @@ let currentView = 'live';
 let activityCount = 0;
 let autoScroll = true;
 let accountPollTimer = null;
+let currentAgentFilter = 'all';
+
+// 종목 심볼 → 이름 매핑 (서버에서 로드)
+let symbolNames = {};
 
 // Stock card tracking: key = "cycleId:symbol" → { element, headerEl, bodyEl, stepsEl, activities[], outcome }
 let stockCards = {};
@@ -26,12 +30,22 @@ document.addEventListener('DOMContentLoaded', () => {
   loadReportList();
   loadAccountInfo();
   loadLLMStatus();
+  loadSymbolNames();
   connectSSE();
   loadTodayActivities();
   initSidebarSections();
   setInterval(loadSystemStatus, 15000);
+  setInterval(loadSymbolNames, 60000); // 1분마다 종목명 갱신
   accountPollTimer = setInterval(loadAccountInfo, 30000);
 });
+
+async function loadSymbolNames() {
+  try {
+    const resp = await fetch(`${API}/symbol-names`);
+    const json = await resp.json();
+    if (json.data) symbolNames = json.data;
+  } catch (e) { /* ignore */ }
+}
 
 // ── Sidebar Accordion ──
 function initSidebarSections() {
@@ -238,13 +252,15 @@ function appendActivity(data) {
   const isDailyPlan = data.activity_type === 'DAILY_PLAN';
   const isLLMCall = data.activity_type === 'LLM_CALL';
 
+  const agentCategory = getAgentCategory(data);
+
   // Non-symbol activities → inline (cycle dividers, daily plan, events without symbol)
   if (!symbol || isCycleActivity || isDailyPlan) {
     if (isCycleActivity && data.phase === 'START') {
       const divider = createCycleDivider(data, true);
+      divider.dataset.agentCategory = 'system';
       container.appendChild(divider);
     } else if (isCycleActivity && (data.phase === 'COMPLETE' || data.phase === 'ERROR')) {
-      // Remove matching START divider spinner
       const startKey = `cycle-start-${data.cycle_id}`;
       const existing = container.querySelector(`[data-cycle-start="${startKey}"]`);
       if (existing) {
@@ -252,24 +268,28 @@ function appendActivity(data) {
         if (spinner) spinner.remove();
         existing.querySelector('.cycle-text').textContent += ' → 완료';
       }
-      container.appendChild(createCycleDivider(data, false));
+      const divider = createCycleDivider(data, false);
+      divider.dataset.agentCategory = 'system';
+      container.appendChild(divider);
     } else if (isLLMCall && !symbol) {
-      // LLM calls without symbol → inline
-      container.appendChild(createBubble(data));
+      const bubble = createBubble(data);
+      bubble.dataset.agentCategory = agentCategory;
+      container.appendChild(bubble);
     } else {
-      container.appendChild(createBubble(data));
+      const bubble = createBubble(data);
+      bubble.dataset.agentCategory = agentCategory;
+      container.appendChild(bubble);
     }
   } else {
     // Symbol-specific → route to stock card
     const cardKey = `${data.cycle_id || 'ev'}:${symbol}`;
     let card = stockCards[cardKey];
 
-    // 정확한 키 매칭 실패 시 → 같은 종목의 진행 중인 카드에 합류
     if (!card) {
       for (const [key, existing] of Object.entries(stockCards)) {
-        if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress' || existing.outcome === 'buy')) {
+        if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress' || existing.outcome === 'buy' || existing.outcome === 'hold')) {
           card = existing;
-          stockCards[cardKey] = card;  // alias 등록
+          stockCards[cardKey] = card;
           break;
         }
       }
@@ -278,10 +298,27 @@ function appendActivity(data) {
     if (!card) {
       card = createStockCard(symbol, data);
       stockCards[cardKey] = card;
+      card.agentCategories = new Set();
       container.appendChild(card.element);
     }
+    // 카드 카테고리: 매수/매도 확정 시 해당 탭에만 노출
+    card.agentCategories = card.agentCategories || new Set();
+    if (agentCategory === 'buy' || agentCategory === 'sell') {
+      // 매수/매도 확정 → 기존 카테고리(analysis 등) 제거, 해당 탭에만
+      card.agentCategories.clear();
+      card.agentCategories.add(agentCategory);
+    } else if (!card.agentCategories.has('buy') && !card.agentCategories.has('sell')) {
+      // 아직 매수/매도 미확정 → 카테고리 누적
+      card.agentCategories.add(agentCategory);
+    }
+    card.element.dataset.agentCategory = Array.from(card.agentCategories).join(',');
     addStepToCard(card, data);
     updateCardHeader(card);
+  }
+
+  // Apply current filter to new element
+  if (currentAgentFilter !== 'all') {
+    applyAgentFilter();
   }
 
   activityCount++;
@@ -316,9 +353,18 @@ function createStockCard(symbol, firstActivity) {
   const el = document.createElement('div');
   el.className = 'stock-card outcome-progress';
 
-  // Extract stock name from summary: [종목명] or [심볼]
-  const nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
-  const stockName = nameMatch ? nameMatch[1] : symbol;
+  // 종목명: symbolNames 매핑 → summary 추출 → fallback symbol
+  const summary = firstActivity.summary || '';
+  let stockName = symbolNames[symbol] || null;
+  if (!stockName) {
+    const bracketMatch = summary.match(/\[(?!TIER[12]\b)([^\]]+)\]/);
+    if (bracketMatch) {
+      stockName = bracketMatch[1];
+    } else {
+      const purposeMatch = summary.match(/\[TIER[12]\]\s+(.+?)\s+분석/);
+      stockName = purposeMatch ? purposeMatch[1] : symbol;
+    }
+  }
 
   // Header
   const header = document.createElement('div');
@@ -515,6 +561,15 @@ function updateCardHeader(card) {
       }
     }
 
+    // LLM_CALL 분석 완료 → "분석 완료" 표시 (BUY/SELL 결과는 매수/매도 탭에서 확인)
+    if (a.activity_type === 'LLM_CALL' && a.phase === 'COMPLETE') {
+      if (outcome === 'progress') {
+        outcome = 'hold';
+        outcomeText = '✅ 분석 완료';
+        outcomeBg = 'bg-gray-700/60 text-gray-300';
+      }
+    }
+
     // Strategy eval — HOLD/스킵
     if (a.activity_type === 'STRATEGY_EVAL' && a.phase === 'COMPLETE') {
       const summ = a.summary || '';
@@ -526,7 +581,7 @@ function updateCardHeader(card) {
     }
 
     // 주문 실행/체결 — 방향 유지, 상태만 갱신
-    if (a.activity_type === 'DECISION' || a.activity_type === 'ORDER') {
+    if (a.activity_type === 'DECISION' || a.activity_type === 'ORDER' || a.activity_type === 'TRADE_RESULT') {
       const summ = a.summary || '';
       const isSell = outcome === 'sell' || summ.includes('SELL') || summ.includes('매도');
       if (a.phase === 'COMPLETE' && (summ.includes('주문 접수') || summ.includes('체결'))) {
@@ -791,6 +846,86 @@ async function askQuestion() {
     btn.disabled = false;
     btn.textContent = '질문';
     input.value = '';
+  }
+}
+
+// ── Agent Filter ──
+const AGENT_MAP = {
+  'CYCLE': 'system', 'SCHEDULE': 'system', 'DAILY_PLAN': 'system',
+  'SCAN': 'scan', 'SCREENING': 'scan',
+  'TIER1_ANALYSIS': 'analysis', 'TIER2_REVIEW': 'analysis',
+  'STRATEGY_EVAL': 'analysis', 'RISK_CHECK': 'analysis', 'RISK_GATE': 'analysis',
+  'TRADING_RULE': 'analysis',
+  // LLM_CALL은 getAgentCategory에서 summary 기반 분류 (고정 매핑 제거)
+};
+
+const SELL_KEYWORDS = ['매도', 'sell', '손절', '익절', '스탑', 'stop', '청산', '트레일링'];
+const BUY_KEYWORDS = ['매수', 'buy'];
+
+function _isSellSummary(summary) {
+  return SELL_KEYWORDS.some(k => summary.includes(k));
+}
+
+function _isBuySummary(summary) {
+  return BUY_KEYWORDS.some(k => summary.includes(k));
+}
+
+function getAgentCategory(data) {
+  const type = data.activity_type || '';
+  const summary = (data.summary || '').toLowerCase();
+
+  // LLM_CALL: summary 키워드로 세분화
+  if (type === 'LLM_CALL') {
+    if (summary.includes('리스크') || summary.includes('한도')) return 'system';
+    if (summary.includes('스캔') || summary.includes('스크리너') || summary.includes('선별')) return 'scan';
+    if (summary.includes('재평가') || summary.includes('보유')) return 'sell';
+    return 'analysis';
+  }
+
+  // 고정 매핑
+  if (AGENT_MAP[type]) return AGENT_MAP[type];
+
+  // ORDER / DECISION / TRADE_RESULT: summary 키워드로 매수/매도 판별
+  if (type === 'ORDER' || type === 'DECISION' || type === 'TRADE_RESULT') {
+    if (_isSellSummary(summary)) return 'sell';
+    if (_isBuySummary(summary)) return 'buy';
+    return 'buy'; // fallback
+  }
+
+  // EVENT: 손절/익절이면 guard, 아니면 regime
+  if (type === 'EVENT') {
+    if (_isSellSummary(summary)) return 'guard';
+    return 'regime';
+  }
+
+  return 'system';
+}
+
+function setAgentFilter(filter) {
+  currentAgentFilter = filter;
+  // Update tab styles
+  document.querySelectorAll('.agent-tab').forEach(btn => {
+    if (btn.dataset.agent === filter) {
+      btn.className = 'agent-tab px-2.5 py-1 rounded text-xs font-medium bg-blue-900/30 text-blue-300 whitespace-nowrap';
+    } else {
+      btn.className = 'agent-tab px-2.5 py-1 rounded text-xs text-gray-400 hover:bg-dark-700 whitespace-nowrap';
+    }
+  });
+  // Apply filter to existing elements
+  applyAgentFilter();
+}
+
+function applyAgentFilter() {
+  const container = document.getElementById('chat-container');
+  for (const child of container.children) {
+    const agentCat = child.dataset.agentCategory || '';
+    if (!agentCat || currentAgentFilter === 'all') {
+      child.style.display = '';
+    } else {
+      // 카드는 여러 카테고리를 가질 수 있음 (쉼표 구분)
+      const cats = agentCat.split(',');
+      child.style.display = cats.includes(currentAgentFilter) ? '' : 'none';
+    }
   }
 }
 
