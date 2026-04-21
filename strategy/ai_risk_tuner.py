@@ -22,7 +22,7 @@ class AIRiskTuner:
 
     async def compute_limits(
         self,
-        risk_appetite: str = "MODERATE",
+        risk_appetite: str = "",  # deprecated: AI가 자율 판단
         cycle_id: str | None = None,
     ) -> dict:
         """적정 한도 계산"""
@@ -49,9 +49,14 @@ class AIRiskTuner:
             except Exception as e:
                 logger.warning("성과 데이터 조회 실패: {}", str(e))
 
-            # 3. 리스크 성향 가이드라인
-            risk_guideline = RISK_APPETITE_GUIDELINES.get(
-                risk_appetite, RISK_APPETITE_GUIDELINES["MODERATE"]
+            # 3. 리스크 성향: AI가 시장 국면 + 성과 보고 자율 판단
+            from agent.market_regime_agent import market_regime_agent
+            regime = market_regime_agent.current_regime or "정보 없음"
+            risk_guideline = (
+                f"[AI 자율 판단]\n"
+                f"현재 시장 국면: {regime}\n"
+                f"계좌 상태와 매매 성과, 시장 국면을 종합하여 리스크 성향을 자율적으로 판단하세요.\n"
+                f"보수적/중립/공격적 중 현 상황에 가장 적합한 성향을 선택하고 그에 맞는 한도를 설정하세요."
             )
 
             # 4. 현금 비율 계산
@@ -86,11 +91,15 @@ class AIRiskTuner:
             limits = self._clamp_limits(parsed)
             elapsed = activity_logger.elapsed_ms(timer)
 
+            reasoning = limits.get("reasoning", "")
+            reasoning_short = reasoning[:100] if reasoning else ""
             await activity_logger.log(
                 ActivityType.RISK_TUNING, ActivityPhase.COMPLETE,
                 f"\U0001f3af AI 한도 결정 ({risk_appetite}): "
                 f"일일거래 {limits['max_daily_trades']}회, "
-                f"주문한도 {limits['max_single_order_krw']:,.0f}원",
+                f"주문한도 {limits['max_single_order_krw']:,.0f}원, "
+                f"포지션 {limits['max_position_pct']:.0f}%"
+                f"{f' — {reasoning_short}' if reasoning_short else ''}",
                 cycle_id=cycle_id,
                 detail=limits,
                 llm_provider=provider,
