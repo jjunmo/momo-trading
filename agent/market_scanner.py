@@ -62,6 +62,44 @@ class MarketScanner:
                     continue
         return lookup
 
+    @staticmethod
+    def _update_market_breadth(
+        volume_rank: list[dict], surge_data: list[dict], drop_data: list[dict]
+    ) -> None:
+        """스캔 데이터에서 상승/하락 종목수를 계산하여 regime_agent에 전달"""
+        seen: set[str] = set()
+        advancing = 0
+        declining = 0
+        for data_list in (volume_rank, surge_data, drop_data):
+            for s in data_list:
+                sym = s.get("symbol", s.get("code", ""))
+                if not sym or sym in seen:
+                    continue
+                seen.add(sym)
+                try:
+                    rate = float(str(s.get("change_rate", "0")).replace(",", ""))
+                except (ValueError, TypeError):
+                    continue
+                if rate > 0:
+                    advancing += 1
+                elif rate < 0:
+                    declining += 1
+        if advancing + declining > 0:
+            from agent.market_regime_agent import market_regime_agent
+            market_regime_agent.update_breadth(advancing, declining)
+            logger.debug("시장 폭 업데이트: 상승 {}종목 / 하락 {}종목", advancing, declining)
+
+    def _build_market_lookup(self, *data_lists: list[dict]) -> dict[str, str]:
+        """스캔 데이터에서 종목코드→시장구분(KRX/NXT) 매핑"""
+        lookup: dict[str, str] = {}
+        for data in data_lists:
+            for item in data:
+                sym = item.get("symbol", item.get("code", ""))
+                market = item.get("market", "")
+                if sym and market and sym not in lookup:
+                    lookup[sym] = market
+        return lookup
+
     async def scan(self, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
         logger.debug("시장 스캔 시작")
@@ -108,16 +146,18 @@ class MarketScanner:
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.debug("MCP 데이터 수집 완료: {}ms", data_elapsed)
 
+        # 시장 폭 계산: 상승/하락 종목수 → regime_agent에 전달
+        self._update_market_breadth(volume_rank, surge_data, drop_data)
+
         # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
         from util.time_util import now_kst
         from core.config import settings as _settings
 
         now = now_kst()
-        cutoff_time = now.replace(
-            hour=_settings.BUY_CUTOFF_HOUR,
-            minute=_settings.BUY_CUTOFF_MINUTE,
-            second=0, microsecond=0,
-        )
+        # 현재 세션 마감까지 남은 시간 (KRX 15:10 / NXT 프리 8:45 / NXT 애프터 19:50)
+        from scheduler.market_calendar import market_calendar
+        _cutoff = market_calendar.get_trading_cutoff(now)
+        cutoff_time = now.replace(hour=_cutoff.hour, minute=_cutoff.minute, second=0, microsecond=0)
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
 
         # 시장 지수 포맷
@@ -172,13 +212,24 @@ class MarketScanner:
                 provider, len(selected), data_elapsed, elapsed - data_elapsed,
             )
 
-            # 활동 로그 요약
+            # 시장 라벨 lookup (KRX/NXT) — selected 종목에 출처 표기용
+            market_lookup = self._build_market_lookup(volume_rank, surge_data, drop_data)
+
+            # 활동 로그 요약 + 각 selected에 market 필드 주입
             selected_lines = []
+            for s in selected:
+                sym = s.get("symbol", "")
+                if sym and "market" not in s:
+                    mk = market_lookup.get(sym)
+                    if mk:
+                        s["market"] = mk
             for s in selected[:8]:
                 name = s.get("name", s.get("symbol", "?"))
                 strategy = s.get("strategy_type", "")
                 reason = s.get("reason", "")
-                line = f"  {name} [{strategy}]"
+                market = s.get("market", "")
+                market_tag = f"[{market}] " if market else ""
+                line = f"  {market_tag}{name} [{strategy}]"
                 if reason:
                     line += f" — {reason}"
                 selected_lines.append(line)
@@ -260,19 +311,119 @@ class MarketScanner:
             logger.warning("성과 요약 조회 실패: {}", str(e))
             return "매매 이력 없음"
 
+    def _markets_to_scan(self) -> list[str]:
+        """현재 세션 → 스캔할 시장 목록.
+
+        - 정규장(KRX_NXT, 09:00~15:20): KRX+NXT 동시 거래 → 양쪽 모두 스캔
+        - NXT 단독(NXT_PRE, NXT_AFTER): NXT만 스캔
+        - KRX 종가경매(KRX_CLOSE): KRX만 스캔
+        - 그 외(CLOSED): 빈 리스트 — 호출자가 처리하지 않으면 빈 결과 반환
+        """
+        from scheduler.market_calendar import market_calendar
+        session = market_calendar.get_market_session()
+        if session == "KRX_NXT":
+            return ["KRX", "NXT"]
+        if session in ("NXT_PRE", "NXT_AFTER"):
+            return ["NXT"]
+        if session == "KRX_CLOSE":
+            return ["KRX"]
+        # CLOSED — 사이클이 도는 경우 안전하게 KRX 사용
+        return ["KRX"]
+
+    @staticmethod
+    def _to_int(raw, default: int = 0) -> int:
+        try:
+            return int(float(str(raw).replace(",", "")))
+        except (ValueError, TypeError):
+            return default
+
+    def _merge_market_results(
+        self, results_per_market: list[tuple[str, list[dict]]]
+    ) -> list[dict]:
+        """여러 시장의 종목 리스트를 종목코드 기준 dedup.
+
+        - 동일 종목코드가 양쪽 시장에 등장하면 거래대금(trade_amount)이 큰 쪽 채택
+        - 각 종목에 `market` 필드(`"KRX"` / `"NXT"`) 부여
+        """
+        merged: dict[str, dict] = {}
+        for market_label, stocks in results_per_market:
+            for s in stocks:
+                sym = s.get("symbol", s.get("code", ""))
+                if not sym:
+                    continue
+                enriched = {**s, "market": market_label}
+                existing = merged.get(sym)
+                if existing is None:
+                    merged[sym] = enriched
+                    continue
+                # 양쪽에 있으면 거래대금 큰 쪽 채택
+                if self._to_int(enriched.get("trade_amount")) > self._to_int(
+                    existing.get("trade_amount")
+                ):
+                    merged[sym] = enriched
+        return list(merged.values())
+
     async def _get_volume_rank(self) -> list[dict]:
-        resp = await mcp_client.get_volume_rank()
-        if resp.success and resp.data:
-            stocks = resp.data.get("stocks", resp.data.get("items", []))
-            return self._filter_untradeable(stocks)
-        return []
+        markets = self._markets_to_scan()
+        responses = await asyncio.gather(
+            *[mcp_client.get_volume_rank(market=m) for m in markets],
+            return_exceptions=True,
+        )
+        per_market: list[tuple[str, list[dict]]] = []
+        for market_label, resp in zip(markets, responses):
+            if isinstance(resp, Exception):
+                logger.warning("거래량 순위 조회 실패 [{}]: {}", market_label, resp)
+                continue
+            if resp.success and resp.data:
+                stocks = resp.data.get("stocks", resp.data.get("items", []))
+                per_market.append((market_label, stocks))
+        merged = self._merge_market_results(per_market)
+        if len(markets) > 1:
+            counts = {m: len(s) for m, s in per_market}
+            logger.debug(
+                "거래량 순위 시장별 합산: {} → dedup {}건", counts, len(merged)
+            )
+        return self._filter_untradeable(merged)
 
     async def _get_fluctuation_rank(self, sort: str) -> list[dict]:
-        resp = await mcp_client.get_fluctuation_rank(sort=sort)
-        if resp.success and resp.data:
-            stocks = resp.data.get("stocks", resp.data.get("items", []))
-            return self._filter_untradeable(stocks)
-        return []
+        markets = self._markets_to_scan()
+        responses = await asyncio.gather(
+            *[mcp_client.get_fluctuation_rank(market=m, sort=sort) for m in markets],
+            return_exceptions=True,
+        )
+        per_market: list[tuple[str, list[dict]]] = []
+        for market_label, resp in zip(markets, responses):
+            if isinstance(resp, Exception):
+                logger.warning(
+                    "등락률 순위({}) 조회 실패 [{}]: {}", sort, market_label, resp
+                )
+                continue
+            if resp.success and resp.data:
+                stocks = resp.data.get("stocks", resp.data.get("items", []))
+                per_market.append((market_label, stocks))
+        merged = self._merge_market_results(per_market)
+        if len(markets) > 1:
+            counts = {m: len(s) for m, s in per_market}
+            logger.debug(
+                "등락률 순위({}) 시장별 합산: {} → dedup {}건",
+                sort, counts, len(merged),
+            )
+        return self._filter_untradeable(merged)
+
+    @staticmethod
+    def _format_trade_amount(raw) -> str:
+        """거래대금(원) → '624억' / '8.5천억' 등 가독성 포맷"""
+        try:
+            v = float(str(raw).replace(",", ""))
+        except (ValueError, TypeError):
+            return ""
+        if v <= 0:
+            return ""
+        if v >= 1_0000_0000_0000:  # 1조 이상
+            return f"{v / 1_0000_0000_0000:.1f}조"
+        if v >= 100_000_000:  # 1억 이상
+            return f"{v / 100_000_000:,.0f}억"
+        return f"{v / 10_000:,.0f}만"
 
     def _format_data(self, data: list[dict]) -> str:
         if not data:
@@ -284,7 +435,21 @@ class MarketScanner:
             price = item.get("price", item.get("current_price", ""))
             change_rate = item.get("change_rate", "")
             volume = item.get("volume", "")
-            lines.append(f"{i}. {name}({symbol}) {price}원 {change_rate}% 거래량:{volume}")
+            market = item.get("market", "")
+            market_tag = f"[{market}] " if market else ""
+            trade_amount = self._format_trade_amount(item.get("trade_amount"))
+            amount_str = f" 거래대금:{trade_amount}" if trade_amount else ""
+            # 전일 대비 거래량 증가율
+            vol_inc = item.get("volume_increase_rate", "")
+            try:
+                vol_inc_f = float(str(vol_inc).replace(",", ""))
+                vol_inc_str = f"(전일비{vol_inc_f:+.0f}%)" if vol_inc_f != 0 else ""
+            except (ValueError, TypeError):
+                vol_inc_str = ""
+            lines.append(
+                f"{i}. {market_tag}{name}({symbol}) {price}원 {change_rate}% "
+                f"거래량:{volume}{vol_inc_str}{amount_str}"
+            )
         return "\n".join(lines)
 
     def _format_holdings(self, holdings) -> str:

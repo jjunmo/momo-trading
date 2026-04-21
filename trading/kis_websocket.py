@@ -112,7 +112,7 @@ class KISWebSocket:
 
     async def _get_ws(self, market: str):
         """시장별 WebSocket 연결 반환 (없으면 생성)"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        if market in ("KOSPI", "KOSDAQ", "KRX", "NXT"):
             if not self._ws_domestic or _ws_is_closed(self._ws_domestic):
                 try:
                     self._ws_domestic = await websockets.connect(
@@ -143,11 +143,21 @@ class KISWebSocket:
             },
             "body": {
                 "input": {
-                    "tr_id": "H0STCNT0" if market in ("KOSPI", "KOSDAQ", "KRX") else "HDFSCNT0",
+                    "tr_id": self._resolve_tr_id(market),
                     "tr_key": symbol,
                 }
             },
         }
+
+    @staticmethod
+    def _resolve_tr_id(market: str) -> str:
+        """시장별 실시간 체결가 tr_id"""
+        if market in ("KOSPI", "KOSDAQ", "KRX", "NXT"):
+            # 통합(H0UNCNT0): KRX+NXT 어디서든 체결 수신 (모의투자 미지원)
+            if settings.is_paper_trading:
+                return "H0STCNT0"  # 모의투자는 KRX만
+            return "H0UNCNT0"
+        return "HDFSCNT0"
 
     def _build_unsubscribe_msg(self, symbol: str, market: str) -> dict:
         msg = self._build_subscribe_msg(symbol, market)
@@ -218,11 +228,11 @@ class KISWebSocket:
         if not fields:
             return None
 
-        if tr_id in ("H0STCNT0",):  # 국내 실시간 체결
+        if tr_id in ("H0STCNT0", "H0NXCNT0", "H0UNCNT0"):  # 국내 실시간 체결 (KRX/NXT/통합)
             if len(fields) < 20:
                 return None
             return {
-                "market": "KRX",
+                "market": "KRX",  # 통합(H0UNCNT0)은 KRX/NXT 구분 없이 수신
                 "symbol": fields[0],
                 "time": fields[1],
                 "price": float(fields[2]) if fields[2] else 0,

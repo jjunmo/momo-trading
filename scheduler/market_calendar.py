@@ -143,6 +143,36 @@ class MarketCalendar:
             return True
         return False
 
+    # ── 세션별 마켓 라우팅 ──
+
+    @staticmethod
+    def get_active_market(dt: datetime | None = None) -> str:
+        """현재 세션 → market 파라미터 ("KRX" or "NXT")"""
+        session = MarketCalendar.get_market_session(dt)
+        if session in ("NXT_PRE", "NXT_AFTER"):
+            return "NXT"
+        return "KRX"
+
+    @staticmethod
+    def get_excg_dvsn_cd(dt: datetime | None = None) -> str:
+        """현재 세션 → KIS 주문 EXCG_ID_DVSN_CD"""
+        session = MarketCalendar.get_market_session(dt)
+        if session in ("NXT_PRE", "NXT_AFTER"):
+            return "NXT"
+        if session == "KRX_NXT":
+            return "KRX"  # SOR은 NXT 미상장 종목(ETF 등) 실패 → KRX로 주문
+        return "KRX"
+
+    @staticmethod
+    def get_trading_cutoff(dt: datetime | None = None) -> time:
+        """현재 세션의 매수 마감 시각 (이 시각 이후 신규 매수 차단)"""
+        session = MarketCalendar.get_market_session(dt)
+        if session == "NXT_AFTER":
+            return time(19, 50)   # NXT 애프터 마감 10분 전
+        if session == "NXT_PRE":
+            return time(8, 45)    # NXT 프리 마감 5분 전
+        return time(15, 10)       # KRX 정규장 마감 10분 전
+
     # ── 다음 개장 ──
 
     @staticmethod

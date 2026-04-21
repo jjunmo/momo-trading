@@ -73,7 +73,7 @@ class RealtimeMonitor:
 
                 # 장외 시간: 폴링 불필요 (WebSocket 끊김은 정상)
                 from scheduler.market_calendar import market_calendar
-                if not market_calendar.is_krx_trading_hours():
+                if not market_calendar.is_domestic_trading_hours():
                     if self._polling_active:
                         self._polling_active = False
                         if self._poll_task and not self._poll_task.done():

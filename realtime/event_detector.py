@@ -1,79 +1,63 @@
-"""실시간 이벤트 감지 — 종목별 AI 설정 임계값 기반"""
-from collections import defaultdict
-from dataclasses import dataclass, field
+"""PriceGuard — 보유종목 실시간 가격 감시 + 안전장치
+
+보유종목만 감시. LLM이 설정한 손절/익절/트레일링 수치 기반.
+- 손절 도달 → 즉시 매도 (안전장치)
+- 익절 도달 → StockAnalysisAgent 재분석 트리거
+- 트레일링 스탑 → 기계적 고점 추적
+- 가격 변동 추적 → 재평가 주기 조절 (review_threshold_pct 기반)
+"""
+import math
+from dataclasses import dataclass
 
 from loguru import logger
-
-from core.events import Event, EventType, event_bus
 
 
 @dataclass
 class StockThresholds:
-    """종목별 감시 임계값 (AI가 종목 선정 시 설정)"""
-    surge_pct: float = 3.0        # 급등 기준 (%)
-    drop_pct: float = -3.0        # 급락 기준 (%)
-    volume_spike_ratio: float = 3.0  # 거래량 급증 배수
-    stop_loss: float = 0.0        # 손절 가격
-    take_profit: float = 0.0      # 익절 가격
-    trailing_stop_pct: float = 0.0   # 트레일링 스탑 (%, 0이면 미사용)
+    """보유종목 감시 임계값 (LLM 분석 결과에서 설정)"""
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    trailing_stop_pct: float = 0.0
 
-    # 트레일링 스탑용 고점 추적
+    # 트레일링 스탑용
     highest_price: float = 0.0
+    entry_price: float = 0.0
+    initial_take_profit: float = 0.0
+    initial_stop_loss: float = 0.0
+    breakeven_trigger_pct: float = 0.0
 
-    # 동적 출구 전략 (구간별 트레일링 + 소프트 익절)
-    entry_price: float = 0.0           # 매수 진입가 (본전 보호 기준)
-    initial_take_profit: float = 0.0   # 최초 익절가 (구간 계산 기준)
-    initial_stop_loss: float = 0.0     # 최초 손절가 (트레일링 구분 기준)
-    breakeven_trigger_pct: float = 0.0 # 본전 보호 활성 수익률 % (AI가 국면별 결정, 0이면 미사용)
-    strategy_type: str = ""            # 전략 유형 (기본 trailing % 결정)
+    # 재평가 주기 조절 (LLM이 ATR 기반 결정)
+    review_threshold_pct: float = 0.0
 
 
-# 기본 임계값 (AI 미설정 시 폴백)
 DEFAULT_THRESHOLDS = StockThresholds()
 
 
-class EventDetector:
-    """
-    실시간 가격 데이터에서 이벤트 감지 — 종목별 임계값 기반
+class PriceGuard:
+    """보유종목 실시간 가격 감시 + 안전장치
 
-    AI Agent가 종목 선정 시 set_thresholds()로 종목별 기준을 설정하고,
-    WebSocket 체결 데이터가 들어올 때마다 해당 기준으로 이벤트를 감지한다.
+    매수 체결된 종목만 등록. LLM이 설정한 수치를 그대로 실행.
+    자체 판단 없음 — 손절/익절/트레일링/재평가 기준 모두 LLM이 결정.
     """
 
     def __init__(self):
-        # 종목별 임계값 (AI가 설정)
         self._thresholds: dict[str, StockThresholds] = {}
-
-        # 실시간 데이터 캐시
         self._prev_prices: dict[str, float] = {}
-        self._volume_history: dict[str, list[int]] = defaultdict(list)
+        # 재평가 주기 조절용 누적 변동
+        self._movement_score: dict[str, float] = {}
+        # 익절 재분석 쿨다운 (종목별 진행 중 플래그)
+        self._review_in_progress: set[str] = set()
 
-        # 이벤트 중복 발행 방지 (종목별 마지막 이벤트 타입+시간)
-        self._last_events: dict[str, tuple[str, float]] = {}
-        self.EVENT_DEDUP_SEC = 60  # 같은 이벤트 60초 내 재발행 방지
+    # ── 임계값 관리 ──
 
     def set_thresholds(self, symbol: str, **kwargs) -> None:
-        """종목별 감시 임계값 설정 (AI Agent가 호출)
-
-        사용 예:
-            event_detector.set_thresholds("005930",
-                surge_pct=2.0, drop_pct=-2.0,
-                volume_spike_ratio=2.5,
-                stop_loss=71000, take_profit=76000,
-                trailing_stop_pct=2.0,
-            )
-        """
-        import math
-
-        # 값 검증: NaN, None 필터링 (문자열 필드는 그대로 통과)
+        """보유종목 감시 임계값 설정 (매수 체결 시 BuyAgent가 호출)"""
         validated = {}
         for k, v in kwargs.items():
             if isinstance(v, str):
                 validated[k] = v
             elif isinstance(v, (int, float)) and not math.isnan(v):
                 validated[k] = v
-            else:
-                logger.warning("유효하지 않은 임계값 무시: {} {} = {}", symbol, k, v)
 
         if symbol in self._thresholds:
             th = self._thresholds[symbol]
@@ -83,202 +67,184 @@ class EventDetector:
         else:
             self._thresholds[symbol] = StockThresholds(**validated)
 
-        # trailing_stop 설정 시 highest_price를 stop_loss 기반으로 초기화
+        # trailing_stop 설정 시 highest_price 초기화
         th = self._thresholds[symbol]
         if 0 < th.trailing_stop_pct < 100 and th.highest_price == 0 and th.stop_loss > 0:
-            # stop_loss = highest × (1 - pct/100) → highest = stop_loss / (1 - pct/100)
             th.highest_price = th.stop_loss / (1 - th.trailing_stop_pct / 100)
-
-        logger.debug("임계값 설정: {} → {}", symbol, self._thresholds[symbol])
 
     def get_thresholds(self, symbol: str) -> StockThresholds:
         return self._thresholds.get(symbol, DEFAULT_THRESHOLDS)
 
-    def set_stop_loss(self, symbol: str, price: float) -> None:
-        self.set_thresholds(symbol, stop_loss=price)
-
-    def set_take_profit(self, symbol: str, price: float) -> None:
-        self.set_thresholds(symbol, take_profit=price)
-
     def remove_levels(self, symbol: str) -> None:
         self._thresholds.pop(symbol, None)
+        self._prev_prices.pop(symbol, None)
+        self._movement_score.pop(symbol, None)
+        self._review_in_progress.discard(symbol)
 
     def clear_all(self) -> None:
-        """전체 초기화 (장 시작 시)"""
         self._thresholds.clear()
         self._prev_prices.clear()
-        self._volume_history.clear()
-        self._last_events.clear()
+        self._review_in_progress.clear()
+        self._movement_score.clear()
 
     @property
     def monitored_symbols(self) -> list[str]:
         return list(self._thresholds.keys())
 
+    # ── 실시간 가격 처리 ──
+
     async def on_price_update(self, data: dict) -> None:
-        """실시간 가격 업데이트 처리 + 이벤트 감지"""
-        # 장외 시간: 이벤트 감지 불필요
+        """WebSocket 가격 업데이트 → 안전장치 + 변동 추적"""
         from scheduler.market_calendar import market_calendar
-        if not market_calendar.is_krx_trading_hours():
+        if not market_calendar.is_domestic_trading_hours():
             return
 
         symbol = data.get("symbol", "")
         price = data.get("price", 0)
-        volume = data.get("volume", 0)
-        change_rate = data.get("change_rate", 0)
-
         if not symbol or price <= 0:
             return
 
-        th = self.get_thresholds(symbol)
+        th = self._thresholds.get(symbol)
+        if not th:
+            return  # 미등록 종목 → 무시
 
-        # 가격 업데이트 이벤트 발행
-        await event_bus.publish(Event(
-            type=EventType.PRICE_UPDATE,
-            data=data,
-            source="event_detector",
-        ))
-
-        # 구간별 동적 트레일링 스탑
+        # 1. 트레일링 스탑 추적
         if th.trailing_stop_pct > 0:
-            effective_pct = th.trailing_stop_pct  # 기본값
-
             if th.entry_price > 0:
                 profit_pct = (price - th.entry_price) / th.entry_price * 100
-
-                # 본전 보호: AI가 설정한 breakeven_trigger_pct 도달 시 활성
                 if (th.breakeven_trigger_pct > 0
                         and profit_pct >= th.breakeven_trigger_pct
                         and th.stop_loss < th.entry_price):
                     th.stop_loss = th.entry_price
-                    logger.info("본전 보호 활성: {} 손절 → {:,.0f}원 (수익률 {:.1f}%, 기준 {:.1f}%)",
-                                symbol, th.entry_price, profit_pct, th.breakeven_trigger_pct)
-                    effective_pct = min(effective_pct, 2.0)
+                    logger.info("본전 보호 활성: {} 손절 → {:,.0f}원 (수익률 {:.1f}%)",
+                                symbol, th.entry_price, profit_pct)
 
-                # 본전 보호 이후 구간: trailing 강화
-                if th.breakeven_trigger_pct > 0 and profit_pct >= th.breakeven_trigger_pct:
-                    effective_pct = min(effective_pct, 2.0)
-
-                # 목표가 초과: 최대 강화
-                if (th.initial_take_profit > th.entry_price
-                        and price >= th.initial_take_profit):
-                    effective_pct = min(effective_pct, 1.5)
-
-            # 고점 갱신 + 트레일링 스탑 상향
             if price > th.highest_price:
                 th.highest_price = price
-                new_stop = price * (1 - effective_pct / 100)
+                new_stop = price * (1 - th.trailing_stop_pct / 100)
                 if new_stop > th.stop_loss:
                     th.stop_loss = new_stop
-                    logger.debug("트레일링 스탑 상향: {} → 손절 {:,.0f}원 (고점 {:,.0f}, trailing {:.1f}%)",
-                                 symbol, new_stop, price, effective_pct)
+                    logger.debug("트레일링 스탑 상향: {} 손절 {:,.0f}원 (고점 {:,.0f})",
+                                 symbol, new_stop, price)
 
-        # 거래량 급증 감지
-        await self._check_volume_spike(symbol, volume, th, data)
+        # 2. 손절/익절 안전장치
+        await self._check_stop_take(symbol, price, th)
 
-        # 급등/급락 감지
-        await self._check_price_movement(symbol, price, change_rate, th, data)
-
-        # 손절/익절 감지
-        await self._check_stop_take(symbol, price, th, data)
-
-        # 캐시 업데이트
+        # 3. 가격 변동 추적 → 재평가 주기 조절
+        prev = self._prev_prices.get(symbol)
+        if prev and prev > 0:
+            change_pct = abs(price - prev) / prev * 100
+            self._movement_score[symbol] = self._movement_score.get(symbol, 0) + change_pct
         self._prev_prices[symbol] = price
-        self._volume_history[symbol].append(volume)
-        if len(self._volume_history[symbol]) > 20:
-            self._volume_history[symbol] = self._volume_history[symbol][-20:]
 
-    async def _check_volume_spike(
-        self, symbol: str, volume: int, th: StockThresholds, data: dict,
-    ) -> None:
-        history = self._volume_history.get(symbol, [])
-        if len(history) < 5:
-            return
-
-        avg_volume = sum(history[-10:]) / len(history[-10:])
-        if avg_volume > 0 and volume > avg_volume * th.volume_spike_ratio:
-            if not self._should_dedup(symbol, "VOLUME_SPIKE"):
-                spike_ratio = volume / avg_volume
-                logger.debug("거래량 급증: {} ({:.1f}배, 기준 {:.1f}배)",
-                            symbol, spike_ratio, th.volume_spike_ratio)
-                await event_bus.publish(Event(
-                    type=EventType.VOLUME_SPIKE,
-                    data={**data, "avg_volume": avg_volume, "spike_ratio": spike_ratio},
-                    source="event_detector",
-                ))
-
-    async def _check_price_movement(
-        self, symbol: str, price: float, change_rate: float,
-        th: StockThresholds, data: dict,
-    ) -> None:
-        if change_rate >= th.surge_pct:
-            if not self._should_dedup(symbol, "PRICE_SURGE"):
-                logger.debug("급등: {} ({:+.2f}%, 기준 {:.1f}%)",
-                            symbol, change_rate, th.surge_pct)
-                await event_bus.publish(Event(
-                    type=EventType.PRICE_SURGE,
-                    data=data,
-                    source="event_detector",
-                ))
-        elif change_rate <= th.drop_pct:
-            if not self._should_dedup(symbol, "PRICE_DROP"):
-                logger.debug("급락: {} ({:+.2f}%, 기준 {:.1f}%)",
-                            symbol, change_rate, th.drop_pct)
-                await event_bus.publish(Event(
-                    type=EventType.PRICE_DROP,
-                    data=data,
-                    source="event_detector",
-                ))
+    # ── 손절/익절 안전장치 ──
 
     async def _check_stop_take(
-        self, symbol: str, price: float, th: StockThresholds, data: dict,
+        self, symbol: str, price: float, th: StockThresholds,
     ) -> None:
+        """손절 → 즉시 매도 / 익절 → 재분석 트리거"""
+        # 손절 도달 → SellAgent에 매도 요청
         if th.stop_loss > 0 and price <= th.stop_loss:
-            if not self._should_dedup(symbol, "STOP_LOSS"):
-                # 실제로 손절선이 상향 조정된 경우만 트레일링 스탑으로 구분
-                is_trailing = (th.trailing_stop_pct > 0
-                               and th.initial_stop_loss > 0
-                               and th.stop_loss > th.initial_stop_loss)
-                logger.warning("{}도달: {} (현재 {:,.0f}, 손절 {:,.0f}{})",
-                               "트레일링 스탑 " if is_trailing else "손절선 ",
-                               symbol, price, th.stop_loss,
-                               f", 고점 {th.highest_price:,.0f}" if is_trailing else "")
-                await event_bus.publish(Event(
-                    type=EventType.STOP_LOSS_HIT,
-                    data={**data, "stop_loss_price": th.stop_loss,
-                          "is_trailing_stop": is_trailing,
-                          "highest_price": th.highest_price},
-                    source="event_detector",
+            is_trailing = (th.trailing_stop_pct > 0
+                           and th.initial_stop_loss > 0
+                           and th.stop_loss > th.initial_stop_loss)
+            label = "트레일링 스탑" if is_trailing else "손절선"
+            exit_reason = "TRAILING_STOP" if is_trailing else "STOP_LOSS"
+            logger.warning("{} 도달: {} (현재 {:,.0f}, 손절 {:,.0f})",
+                           label, symbol, price, th.stop_loss)
+            from agent.sell_agent import SellParams, sell_agent
+            import asyncio
+            asyncio.create_task(sell_agent.execute_sell(SellParams(symbol=symbol, exit_reason=exit_reason)))
+
+        # 익절 도달 → 재분석 트리거 (즉시 매도 대신, 쿨다운 적용)
+        elif th.take_profit > 0 and price >= th.take_profit:
+            if symbol not in self._review_in_progress:
+                logger.info("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f}) → 재분석 트리거",
+                            symbol, price, th.take_profit)
+                await self._trigger_take_profit_review(symbol, price)
+
+    async def _trigger_take_profit_review(self, symbol: str, price: float) -> None:
+        """익절 도달 → 재분석 요청 (PriceGuard는 분석하지 않음)
+
+        StockAnalysisAgent에 분석 요청 → 결과를 SellAgent에 전달.
+        PriceGuard는 트리거만 하고 분석/실행은 각 Agent가 담당.
+        """
+        import asyncio
+        asyncio.create_task(self._request_review(symbol))
+
+    async def _request_review(self, symbol: str) -> None:
+        """분석 Agent에 재분석 요청 → 결과를 매도 Agent에 전달"""
+        self._review_in_progress.add(symbol)
+        try:
+            from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
+            from trading.account_manager import account_manager
+
+            holdings = await account_manager.get_holdings()
+            holding = next((h for h in holdings if h.symbol == symbol), None)
+            if not holding or holding.quantity <= 0:
+                return
+
+            th = self.get_thresholds(symbol)
+
+            request = StockAnalysisRequest(
+                symbol=symbol,
+                name=holding.name or symbol,
+                is_holding=True,
+                purpose="TAKE_PROFIT_REVIEW",
+                avg_price=holding.avg_buy_price,
+                pnl_rate=holding.pnl_rate,
+                quantity=holding.quantity,
+                active_stop_loss=th.stop_loss,
+                active_take_profit=th.take_profit,
+                active_trailing_stop_pct=th.trailing_stop_pct,
+            )
+
+            result = await stock_analysis_agent.analyze(request, force=True)
+            if not result.success:
+                return
+
+            # 분석 결과에 따라 라우팅
+            if result.recommendation == "SELL":
+                from agent.sell_agent import SellParams, sell_agent
+                await sell_agent.execute_sell(SellParams(symbol=symbol, exit_reason="TAKE_PROFIT_REVIEW"))
+            elif result.recommendation == "BUY":
+                from agent.buy_agent import BuyParams, buy_agent
+                await buy_agent.execute(BuyParams(
+                    symbol=symbol, name=holding.name or symbol,
+                    strategy_type="STABLE_SHORT", price=result.current_price,
+                    confidence=result.confidence, reason=result.reason,
+                    stop_loss_price=result.stop_loss_price,
+                    take_profit_price=result.target_price,
+                    trailing_stop_pct=result.trailing_stop_pct,
+                    breakeven_trigger_pct=result.breakeven_trigger_pct,
+                    review_threshold_pct=result.review_threshold_pct,
                 ))
+            # HOLD → 임계값은 StockAnalysisAgent가 분석 시 직접 설정 완료
 
-        if th.take_profit > 0 and price >= th.take_profit:
-            if th.trailing_stop_pct > 0:
-                # 소프트 익절: 트레일링 스탑이 활성이면 익절선 상향, 매도하지 않음
-                new_tp = price * 1.03
-                old_tp = th.take_profit
-                th.take_profit = new_tp
-                logger.info("소프트 익절: {} 익절선 {:,.0f} → {:,.0f} (현재가 {:,.0f}, 트레일링 보호 중)",
-                            symbol, old_tp, new_tp, price)
-            else:
-                # 트레일링 미사용: 기존 동작 (즉시 매도 이벤트)
-                if not self._should_dedup(symbol, "TAKE_PROFIT"):
-                    logger.debug("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f})",
-                                symbol, price, th.take_profit)
-                    await event_bus.publish(Event(
-                        type=EventType.TAKE_PROFIT_HIT,
-                        data={**data, "take_profit_price": th.take_profit},
-                        source="event_detector",
-                    ))
+        except Exception as e:
+            logger.error("익절 재분석 요청 실패 ({}): {}", symbol, str(e))
+        finally:
+            self._review_in_progress.discard(symbol)
 
-    def _should_dedup(self, symbol: str, event_type: str) -> bool:
-        """같은 종목+이벤트 중복 발행 방지"""
-        import time
-        key = f"{symbol}:{event_type}"
-        now = time.time()
-        last = self._last_events.get(key)
-        if last and now - last[1] < self.EVENT_DEDUP_SEC:
-            return True
-        self._last_events[key] = (event_type, now)
-        return False
+    # ── 재평가 주기 조절 ──
+
+    def needs_urgent_review(self, symbol: str) -> bool:
+        """누적 변동이 LLM 설정 기준 초과 → 즉시 재평가 필요"""
+        th = self._thresholds.get(symbol)
+        if not th or th.review_threshold_pct <= 0:
+            return False
+        score = self._movement_score.get(symbol, 0)
+        return score >= th.review_threshold_pct
+
+    def reset_movement_score(self, symbol: str) -> None:
+        """재평가 완료 후 누적 변동 초기화"""
+        self._movement_score[symbol] = 0.0
+
+    def get_urgent_symbols(self) -> list[str]:
+        """즉시 재평가가 필요한 종목 목록"""
+        return [s for s in self._thresholds if self.needs_urgent_review(s)]
 
 
-event_detector = EventDetector()
+price_guard = PriceGuard()
+# 하위 호환
+event_detector = price_guard

@@ -1,12 +1,28 @@
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from core.config import settings
 
 # ── Async Engine & Session ──
+_connect_args = {}
+if "sqlite" in settings.async_database_url:
+    _connect_args["timeout"] = 30  # SQLite busy timeout (초)
+
 async_engine = create_async_engine(
     settings.async_database_url,
-    echo=settings.is_local,
+    echo=False,
+    connect_args=_connect_args,
 )
+
+# SQLite WAL 모드: 동시 읽기/쓰기 허용, database locked 방지
+if "sqlite" in settings.async_database_url:
+    @event.listens_for(async_engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
 AsyncSessionLocal = async_sessionmaker(async_engine, expire_on_commit=False)
 
 

@@ -40,30 +40,30 @@ class Settings(BaseSettings):
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
     RECOMMENDATION_EXPIRE_MIN: int = 60
-    MIN_BUY_QUANTITY: int = 1
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
-    DAY_TRADING_ONLY: bool = False  # True=당일 청산 필수, False=스윙 (유망 종목 오버나이트 보유)
-    BUY_CUTOFF_HOUR: int = 14  # 신규 매수 마감 시각 (14시 이후 매수 차단)
-    BUY_CUTOFF_MINUTE: int = 30
-    FORCE_LIQUIDATION_HOUR: int = 15  # 강제 청산 시각 (종가경매 전)
-    FORCE_LIQUIDATION_MINUTE: int = 10
-    MAX_HOLD_DAYS_STABLE: int = 5  # STABLE_SHORT 최대 보유일
-    MAX_HOLD_DAYS_AGGRESSIVE: int = 3  # AGGRESSIVE_SHORT 최대 보유일
-    MAX_DAILY_TRADES: int = 0  # 0 = 무제한
-    MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정 (시스템 하드 리밋 없음)
+    FORCE_LIQUIDATION_HOUR: int = 15  # 장 마감 청산 시각
+    FORCE_LIQUIDATION_MINUTE: int = 15
+    MAX_DAILY_TRADES: int = 0  # 0 = 무제한 (AI Risk Tuner가 동적 조정)
+    MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
+    MIN_BUY_QUANTITY: int = 1
 
-    # === Circuit Breaker ===
-    DAILY_LOSS_LIMIT_SOFT: float = -2.0   # 일일 손실 소프트 리밋 (%) → BUY만 차단
-    DAILY_LOSS_LIMIT_HARD: float = -3.0   # 일일 손실 하드 리밋 (%) → 전체 매매 중단
-    MAX_CONSECUTIVE_LOSSES: int = 3        # 연속 N패 → BUY 30분 일시정지
+    # === System Hard Limit (AI도 무시 못함) ===
+    DAILY_LOSS_LIMIT_HARD: float = -7.0   # 일일 손실 -7% → 전체 매매 즉시 중단
 
-    # === AI Risk Tuning ===
-    AI_RISK_TUNING_ENABLED: bool = True
-    RISK_APPETITE: str = "AGGRESSIVE"  # CONSERVATIVE / MODERATE / AGGRESSIVE
-    MIN_CASH_RATIO: float = 0.0  # 최소 현금 비중 (0 = 제한 없음, 소액 계좌에서 매수 차단 방지)
+    # === 하위 호환 (AI가 동적 판단하지만 참조 코드 존재) ===
+    DAY_TRADING_ONLY: bool = False       # deprecated: AI가 종목별 hold_strategy 판단
+    BUY_CUTOFF_HOUR: int = 15            # deprecated: AI가 판단
+    BUY_CUTOFF_MINUTE: int = 0
+    DAILY_LOSS_LIMIT_SOFT: float = -3.0  # deprecated: AI Risk Tuner가 동적 결정
+    MAX_CONSECUTIVE_LOSSES: int = 5      # deprecated: AI Risk Tuner가 동적 결정
+    AI_RISK_TUNING_ENABLED: bool = True  # deprecated: 항상 활성
+    RISK_APPETITE: str = "AGGRESSIVE"    # deprecated: AI가 국면별 판단
+    MIN_CASH_RATIO: float = 0.0          # deprecated: AI Risk Tuner가 결정
+    MAX_HOLD_DAYS_STABLE: int = 5        # deprecated: AI가 종목별 판단
+    MAX_HOLD_DAYS_AGGRESSIVE: int = 3    # deprecated: AI가 종목별 판단
 
     # === Scheduler ===
     SCHEDULER_ENABLED: bool = True

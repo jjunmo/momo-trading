@@ -586,7 +586,7 @@ class MCPClient:
 
     async def get_current_price(self, symbol: str, market: str = "KRX") -> MCPResponse:
         """현재가 조회 (KIS 원본 키 → 정규화)"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        if market in ("KOSPI", "KOSDAQ", "KRX", "NXT"):
             resp = await self.call_tool("inquery-stock-price", {"symbol": symbol})
         else:
             resp = await self.call_tool("inquery-overseas-stock-price", {
@@ -622,7 +622,7 @@ class MCPClient:
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=count * 2)).strftime("%Y%m%d")
 
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        if market in ("KOSPI", "KOSDAQ", "KRX", "NXT"):
             resp = await self.call_tool("inquery-stock-info", {
                 "symbol": symbol, "start_date": start_date, "end_date": end_date,
             })
@@ -662,6 +662,24 @@ class MCPClient:
         price: float | None = None, market: str = "KRX"
     ) -> MCPResponse:
         """주문 실행 (KIS 원본 키 → 정규화)"""
+        # NXT/SOR: MCP 미지원 → KIS API 직접 호출
+        if market in ("NXT", "SOR"):
+            from trading.kis_api import place_order_direct
+            try:
+                result = await place_order_direct(
+                    symbol=symbol, side=side, quantity=quantity,
+                    price=int(price) if price else 0, excg_cd=market,
+                )
+                resp = MCPResponse(success=result.get("success", False), data=result)
+                if resp.success and resp.data:
+                    resp.data["order_id"] = result.get("order_id", "")
+                elif not resp.success:
+                    resp.error = result.get("error", "NXT 주문 실패")
+                return resp
+            except Exception as e:
+                logger.error("NXT/SOR 직접 주문 실패 [{}]: {}", market, str(e))
+                return MCPResponse(success=False, error=str(e))
+
         order_type = "buy" if side == "BUY" else "sell"
         if market in ("KOSPI", "KOSDAQ", "KRX"):
             resp = await self.call_tool("order-stock", {
@@ -679,10 +697,11 @@ class MCPClient:
             })
         if resp.success and resp.data:
             d = resp.data
-            # KIS rt_cd='1' → 주문 실패 (잔고 부족 등)
-            if d.get("rt_cd") == "1":
+            # KIS rt_cd='0'만 성공, 그 외 모두 실패 (1=일반실패, 7=금액초과 등)
+            rt_cd = d.get("rt_cd", "")
+            if rt_cd != "0":
                 error_msg = d.get("msg1", "KIS 주문 실패")
-                logger.warning("KIS 주문 거부: {}", error_msg)
+                logger.warning("KIS 주문 거부 (rt_cd={}): {}", rt_cd, error_msg)
                 resp.success = False
                 resp.error = error_msg
                 return resp
@@ -713,7 +732,7 @@ class MCPClient:
         """거래량 상위 종목 조회 (KIS API 직접 호출)"""
         from trading.kis_api import get_volume_rank
 
-        market_code = "J" if market in ("KOSPI", "KOSDAQ", "KRX") else market
+        market_code = {"KOSPI": "J", "KOSDAQ": "J", "KRX": "J", "NXT": "NX"}.get(market, market)
         try:
             result = await get_volume_rank(market=market_code)
             return MCPResponse(success=result.get("success", False), data=result)
@@ -738,7 +757,7 @@ class MCPClient:
         """등락률 상위/하위 종목 조회 (KIS API 직접 호출)"""
         from trading.kis_api import get_fluctuation_rank
 
-        market_code = "J" if market in ("KOSPI", "KOSDAQ", "KRX") else market
+        market_code = {"KOSPI": "J", "KOSDAQ": "J", "KRX": "J", "NXT": "NX"}.get(market, market)
         try:
             result = await get_fluctuation_rank(sort=sort, market=market_code)
             return MCPResponse(success=result.get("success", False), data=result)

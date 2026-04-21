@@ -128,36 +128,80 @@ async def _cancel_unfilled_order(order_id: str, symbol: str) -> None:
 
 
 async def _check_account_db_consistency() -> None:
-    """계좌 보유종목 vs DB 미청산 포지션 비교 (경고 로그만, 수정 없음)"""
+    """계좌 보유종목 vs DB 미청산 포지션 비교 → 불일치 자동 청산"""
     try:
         from core.database import AsyncSessionLocal
+        from models.trade_result import TradeResult
         from repositories.trade_result_repository import TradeResultRepository
         from trading.account_manager import account_manager
+        from util.time_util import ensure_kst, now_kst
+        from sqlalchemy import select, and_
 
         holdings = await account_manager.get_holdings()
         holding_symbols = {h.symbol for h in holdings if h.quantity > 0}
 
         async with AsyncSessionLocal() as session:
-            repo = TradeResultRepository(session)
-            open_positions = await repo.get_all_open()
-            db_symbols = {tr.stock_symbol for tr in open_positions}
+            async with session.begin():
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open()
+                db_symbols = {tr.stock_symbol for tr in open_positions}
 
-        # 계좌에만 있는 종목 (DB에 기록 없음)
-        only_account = holding_symbols - db_symbols
-        # DB에만 있는 종목 (계좌에 없음 = stale 레코드 가능)
-        only_db = db_symbols - holding_symbols
+                # 계좌에만 있는 종목 (DB에 기록 없음)
+                only_account = holding_symbols - db_symbols
+                # DB에만 있는 종목 (계좌에 없음)
+                only_db = db_symbols - holding_symbols
 
-        if only_account:
-            logger.warning(
-                "계좌에만 존재 (DB 미등록): {} — 수동 확인 필요",
-                ", ".join(only_account),
-            )
-        if only_db:
-            logger.warning(
-                "DB에만 존재 (계좌 미보유): {} — stale 레코드 가능성",
-                ", ".join(only_db),
-            )
-        if not only_account and not only_db:
-            logger.debug("계좌/DB 포지션 일치 ({}종목)", len(holding_symbols))
+                if only_account:
+                    logger.warning(
+                        "계좌에만 존재 (DB 미등록): {} — 수동 확인 필요",
+                        ", ".join(only_account),
+                    )
+
+                # DB에만 있는 종목 → SELL 기록이 있으면 BUY 자동 청산
+                if only_db:
+                    now = now_kst()
+                    for symbol in only_db:
+                        # 해당 종목의 SELL 기록 확인 (매도 체결가 조회)
+                        sell_result = await session.execute(
+                            select(TradeResult).where(and_(
+                                TradeResult.stock_symbol == symbol,
+                                TradeResult.side == "SELL",
+                                TradeResult.exit_price > 0,
+                            )).order_by(TradeResult.created_at.desc())
+                        )
+                        sell_record = sell_result.scalars().first()
+
+                        # 미청산 BUY 조회
+                        open_buys = [
+                            tr for tr in open_positions
+                            if tr.stock_symbol == symbol
+                        ]
+
+                        if sell_record and open_buys:
+                            # SELL 체결가로 BUY 일괄 청산
+                            sell_price = sell_record.exit_price
+                            for buy in open_buys:
+                                buy.exit_price = sell_price
+                                buy.pnl = (sell_price - buy.entry_price) * buy.quantity
+                                buy.return_pct = round(
+                                    (sell_price - buy.entry_price) / buy.entry_price * 100, 2
+                                ) if buy.entry_price > 0 else 0.0
+                                buy.is_win = buy.pnl > 0
+                                buy.hold_days = (now - ensure_kst(buy.entry_at)).days if buy.entry_at else 0
+                                buy.exit_reason = buy.exit_reason or "SYNC_CLOSE"
+                                buy.exit_at = sell_record.exit_at or now
+                            logger.info(
+                                "[정산] {} 미청산 BUY {}건 → SELL 체결가({:,.0f}원)로 자동 청산",
+                                symbol, len(open_buys), sell_price,
+                            )
+                        elif open_buys:
+                            # SELL 기록 없음 → 경고만 (함부로 삭제하지 않음)
+                            logger.warning(
+                                "DB에만 존재 (계좌 미보유, SELL 기록 없음): {} — 수동 확인 필요",
+                                symbol,
+                            )
+
+                if not only_account and not only_db:
+                    logger.debug("계좌/DB 포지션 일치 ({}종목)", len(holding_symbols))
     except Exception as e:
         logger.error("계좌/DB 일관성 체크 오류: {}", str(e))

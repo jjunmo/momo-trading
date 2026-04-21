@@ -126,27 +126,26 @@ class AccountManager:
         return holdings
 
     async def get_account_snapshot(self) -> tuple[AccountBalance, list[HoldingInfo]]:
-        """잔고 + 보유종목을 단일 MCP 호출로 조회
+        """잔고 + 보유종목 조회
 
-        장중: 매번 MCP 호출 → 양쪽 캐시 갱신
-        장외 + 캐시 있음: 캐시 반환, MCP 미호출
-        장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
+        KRX 장중: MCP inquery-balance (AFHR_FLPR_YN=N)
+        NXT 장중: KIS REST API 직접 호출 (AFHR_FLPR_YN=X → NXT 실시간 가격 반영)
+        장외 + 캐시 있음: 캐시 반환
         """
-        # 장외 + 양쪽 캐시 모두 있음 → MCP 호출 없이 캐시 반환
-        if not market_calendar.is_krx_trading_hours():
+        # 장외 + 캐시 있음 → 바로 반환
+        if not market_calendar.is_domestic_trading_hours():
             if self._balance_cache and self._holdings_cache is not None:
                 logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
                 return self._balance_cache, self._holdings_cache
 
-        response = await mcp_client.get_account_balance()
-        if not response.success:
-            logger.warning("계좌 조회 실패: {}", response.error)
+        # KIS REST API 직접 호출 (AFHR_FLPR_YN=X: KRX+NXT 통합 가격 반영)
+        # MCP inquery-balance는 AFHR_FLPR_YN 미지원 → 항상 직접 호출
+        data = await self._fetch_balance_direct("X")
+
+        if data is None:
             balance = self._balance_cache if self._balance_cache else self._empty_balance()
             holdings = self._holdings_cache if self._holdings_cache is not None else []
             return balance, holdings
-
-        data = response.data or {}
-        logger.debug("계좌 MCP 응답: {}", str(data)[:500])
 
         holdings = self._parse_holdings(data)
         balance = self._parse_balance(data, holdings=holdings)
@@ -154,6 +153,15 @@ class AccountManager:
         self._balance_cache = balance
         self._holdings_cache = holdings
         return balance, holdings
+
+    async def _fetch_balance_direct(self, afhr_flpr_yn: str = "X") -> dict | None:
+        """KIS REST API 직접 잔고 조회 (NXT 시간용, AFHR_FLPR_YN=X)"""
+        from trading.kis_api import get_balance_direct
+        result = await get_balance_direct(afhr_flpr_yn=afhr_flpr_yn)
+        if not result.get("success"):
+            logger.warning("계좌 직접 조회 실패: {}", result.get("error"))
+            return None
+        return result
 
     async def get_balance(self) -> AccountBalance:
         """계좌 잔고 조회 (하위 호환)"""
@@ -199,7 +207,7 @@ class AccountManager:
         장외 + 캐시 있음: 캐시 반환
         장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
         """
-        if not market_calendar.is_krx_trading_hours():
+        if not market_calendar.is_domestic_trading_hours():
             if self._pending_orders_cache is not None:
                 logger.debug("장외 시간 → 미체결 주문 캐시 반환")
                 return self._pending_orders_cache

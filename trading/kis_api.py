@@ -186,6 +186,69 @@ async def get_minute_chart(symbol: str, period: str = "5") -> dict:
         return {"success": False, "error": str(e), "prices": []}
 
 
+async def get_stock_daily_chart(symbol: str, count: int = 15) -> dict:
+    """주식 일봉 차트 조회 (시장 국면 판단용 MA 계산 기초 데이터)
+
+    Args:
+        symbol: 종목코드 (예: 069500=KODEX200, 229200=KODEX코스닥150)
+        count: 조회 일수 (기본 15일, 3일/10일 SMA에 충분)
+
+    Returns:
+        {"success": True, "prices": [{"date", "close", "volume", "open", "high", "low"}, ...]}
+        최신→과거 순서 (prices[0]이 최근)
+    """
+    today = datetime.now().strftime("%Y%m%d")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token = await _get_access_token(client)
+            response = await client.get(
+                f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": "FHKST03010100",
+                },
+                params={
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_INPUT_ISCD": symbol,
+                    "FID_INPUT_DATE_1": (datetime.now() - timedelta(days=count * 2)).strftime("%Y%m%d"),
+                    "FID_INPUT_DATE_2": today,
+                    "FID_PERIOD_DIV_CODE": "D",
+                    "FID_ORG_ADJ_PRC": "0",
+                },
+            )
+
+            if response.status_code != 200:
+                logger.warning("일봉 조회 실패 ({}): HTTP {}", symbol, response.status_code)
+                return {"success": False, "error": f"HTTP {response.status_code}", "prices": []}
+
+            result = response.json()
+
+        output = result.get("output2", [])
+        if not output:
+            return {"success": False, "error": "일봉 데이터 없음", "prices": []}
+
+        prices = []
+        for item in output[:count]:
+            prices.append({
+                "date": item.get("stck_bsop_date", ""),
+                "open": item.get("stck_oprc", "0"),
+                "high": item.get("stck_hgpr", "0"),
+                "low": item.get("stck_lwpr", "0"),
+                "close": item.get("stck_clpr", "0"),
+                "volume": item.get("acml_vol", "0"),
+            })
+
+        logger.debug("일봉 조회 완료 ({}): {}일", symbol, len(prices))
+        return {"success": True, "symbol": symbol, "prices": prices}
+    except Exception as e:
+        logger.error("일봉 조회 오류 ({}): {}", symbol, str(e))
+        return {"success": False, "error": str(e), "prices": []}
+
+
 async def get_volume_rank(market: str = "J") -> dict:
     """거래량순위 조회 (KIS REST API 직접 호출)
 
@@ -211,13 +274,13 @@ async def get_volume_rank(market: str = "J") -> dict:
                     "FID_COND_MRKT_DIV_CODE": market,
                     "FID_COND_SCR_DIV_CODE": "20171",
                     "FID_INPUT_ISCD": "0000",           # 전체 종목
-                    "FID_DIV_CLS_CODE": "0",             # 전체 (보통주+우선주)
+                    "FID_DIV_CLS_CODE": "1",             # 보통주만 (우선주 제외)
                     "FID_BLNG_CLS_CODE": "0",            # 평균거래량 기준
                     "FID_TRGT_CLS_CODE": "111111111",    # 전체 대상
                     "FID_TRGT_EXLS_CLS_CODE": "0000000110",  # 관리종목·감리종목 제외
-                    "FID_INPUT_PRICE_1": "",              # 가격 필터 없음
+                    "FID_INPUT_PRICE_1": "100",          # 100원 이상 (동전주/폐지위험 차단)
                     "FID_INPUT_PRICE_2": "",
-                    "FID_VOL_CNT": "",                   # 거래량 필터 없음
+                    "FID_VOL_CNT": "",                   # 거래량 필터 없음 (LLM 판단)
                     "FID_INPUT_DATE_1": "",
                 },
             )
@@ -382,6 +445,67 @@ async def get_buying_power(symbol: str, price: int = 0, order_dvsn: str = "01") 
         return {"success": False, "max_qty": 0, "available_cash": 0}
 
 
+async def get_balance_direct(afhr_flpr_yn: str = "N") -> dict:
+    """주식 잔고 조회 (KIS REST API 직접 호출)
+
+    공식 규격서 기반 (v1_국내주식-006):
+    엔드포인트: /uapi/domestic-stock/v1/trading/inquire-balance
+    tr_id: TTTC8434R(실전) / VTTC8434R(모의)
+
+    Args:
+        afhr_flpr_yn: 시간외/NXT 구분
+            "N" — 기본값 (KRX 종가 기준)
+            "Y" — 시간외단일가
+            "X" — NXT 정규장 (프리마켓, 메인, 애프터마켓) → NXT 실시간 가격 반영
+    """
+    cano, acnt_prdt_cd = _get_account()
+    domain = _get_trading_domain()
+    is_paper = settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
+    tr_id = "VTTC8434R" if is_paper else "TTTC8434R"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token = await _get_access_token(client)
+            response = await client.get(
+                f"{domain}/uapi/domestic-stock/v1/trading/inquire-balance",
+                headers={
+                    "content-type": "application/json; charset=utf-8",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": tr_id,
+                },
+                params={
+                    "CANO": cano,
+                    "ACNT_PRDT_CD": acnt_prdt_cd,
+                    "AFHR_FLPR_YN": afhr_flpr_yn,
+                    "OFL_YN": "",
+                    "INQR_DVSN": "01",
+                    "UNPR_DVSN": "01",
+                    "FUND_STTL_ICLD_YN": "N",
+                    "FNCG_AMT_AUTO_RDPT_YN": "N",
+                    "PRCS_DVSN": "00",
+                    "CTX_AREA_FK100": "",
+                    "CTX_AREA_NK100": "",
+                },
+            )
+
+        if response.status_code != 200:
+            logger.warning("잔고 조회 실패: HTTP {}", response.status_code)
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+
+        result = response.json()
+        if result.get("rt_cd") != "0":
+            error_msg = result.get("msg1", "잔고 조회 실패")
+            logger.warning("잔고 조회 거부: {}", error_msg)
+            return {"success": False, "error": error_msg}
+
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error("잔고 조회 오류: {}", str(e))
+        return {"success": False, "error": str(e)}
+
+
 async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
     """등락률순위 조회 (KIS REST API 직접 호출)
 
@@ -415,12 +539,12 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
                     "fid_rank_sort_cls_code": rank_sort,
                     "fid_input_cnt_1": "0",               # 조회 종목 수 (0=기본값 30)
                     "fid_prc_cls_code": "0",              # 전체 가격대
-                    "fid_input_price_1": "",               # 가격 필터 없음
+                    "fid_input_price_1": "100",           # 100원 이상 (동전주/폐지위험 차단)
                     "fid_input_price_2": "",
-                    "fid_vol_cnt": "",                    # 거래량 필터 없음
+                    "fid_vol_cnt": "",                    # 거래량 필터 없음 (LLM 판단)
                     "fid_trgt_cls_code": "111111111",     # 전체 대상
                     "fid_trgt_exls_cls_code": "0000000110",  # 관리종목·감리종목 제외
-                    "fid_div_cls_code": "0",              # 전체 (보통주+우선주)
+                    "fid_div_cls_code": "1",              # 보통주만 (우선주 제외)
                     "fid_rsfl_rate1": "",                  # 등락률 필터 없음
                     "fid_rsfl_rate2": "",
                 },
@@ -455,3 +579,165 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
     except Exception as e:
         logger.error("등락률순위 조회 오류: {}", str(e))
         return {"success": False, "error": str(e), "stocks": []}
+
+
+async def place_order_direct(
+    symbol: str,
+    side: str,
+    quantity: int,
+    price: int = 0,
+    excg_cd: str = "KRX",
+) -> dict:
+    """KIS REST API 직접 주문 (NXT/SOR 지원)
+
+    MCP order-stock이 EXCG_ID_DVSN_CD 미지원이므로 직접 호출.
+    엔드포인트: /uapi/domestic-stock/v1/trading/order-cash
+    tr_id: TTTC0012U(매수)/TTTC0011U(매도) [실전]
+           VTTC0012U(매수)/VTTC0011U(매도) [모의]
+
+    Args:
+        symbol: 종목코드 (6자리)
+        side: "BUY" 또는 "SELL"
+        quantity: 주문수량
+        price: 주문단가 (지정가)
+        excg_cd: 거래소 구분 - "KRX", "NXT", "SOR"
+    """
+    cano, acnt_prdt_cd = _get_account()
+    domain = _get_trading_domain()
+    is_paper = settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
+
+    if side == "BUY":
+        tr_id = "VTTC0012U" if is_paper else "TTTC0012U"
+    else:
+        tr_id = "VTTC0011U" if is_paper else "TTTC0011U"
+
+    if price <= 0:
+        logger.warning("직접 주문 거부: 가격 미지정 (지정가 필수) [{}] {}", excg_cd, symbol)
+        return {"success": False, "error": "지정가 주문에 가격이 필요합니다"}
+
+    ord_dvsn = "00"  # 지정가 (AI가 항상 가격 결정)
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token = await _get_access_token(client)
+            response = await client.post(
+                f"{domain}/uapi/domestic-stock/v1/trading/order-cash",
+                headers={
+                    "content-type": "application/json; charset=utf-8",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": tr_id,
+                },
+                json={
+                    "CANO": cano,
+                    "ACNT_PRDT_CD": acnt_prdt_cd,
+                    "PDNO": symbol,
+                    "ORD_DVSN": ord_dvsn,
+                    "ORD_QTY": str(quantity),
+                    "ORD_UNPR": str(price),
+                    "EXCG_ID_DVSN_CD": excg_cd,
+                },
+            )
+
+        if response.status_code != 200:
+            body = ""
+            try:
+                body = response.json().get("msg1", response.text[:200])
+            except Exception:
+                body = response.text[:200]
+            logger.warning("직접 주문 실패: HTTP {} — {}", response.status_code, body)
+            return {"success": False, "error": f"HTTP {response.status_code}: {body}"}
+
+        result = response.json()
+        rt_cd = result.get("rt_cd", "")
+
+        # rt_cd="0"만 성공, 그 외 모두 실패 (mcp_client.py:702 동일 패턴)
+        if rt_cd != "0":
+            error_msg = result.get("msg1", "KIS 주문 거부")
+            logger.warning("직접 주문 거부 [{}] {} (rt_cd={}): {}", excg_cd, symbol, rt_cd, error_msg)
+            return {"success": False, "error": error_msg, **result}
+
+        # output 타입 안전 체크 + ODNO 탐색 (mcp_client.py:709-714 동일 패턴)
+        output = result.get("output", {}) if isinstance(result.get("output"), dict) else {}
+        order_id = (
+            result.get("ODNO") or result.get("odno")
+            or output.get("ODNO") or output.get("odno")
+            or ""
+        )
+        if not order_id:
+            logger.warning("직접 주문 응답에서 주문번호 미발견 [{}] {}, 원본: {}", excg_cd, symbol, str(result)[:500])
+        logger.info(
+            "직접 주문 성공 [{}] {} {} {}주 @{:,}원 (주문번호: {})",
+            excg_cd, side, symbol, quantity, price, order_id,
+        )
+        return {
+            "success": True,
+            "order_id": order_id,
+            "order_time": output.get("ORD_TMD", ""),
+            "excg_cd": excg_cd,
+            **result,
+        }
+    except Exception as e:
+        logger.error("직접 주문 오류 [{}] {}: {}", excg_cd, symbol, str(e))
+        return {"success": False, "error": str(e)}
+
+
+async def cancel_order_direct(order_id: str, order_branch: str = "") -> dict:
+    """KIS REST API 직접 주문 취소
+
+    엔드포인트: /uapi/domestic-stock/v1/trading/order-rvsecncl
+    tr_id: TTTC0013U(실전) / VTTC0013U(모의)
+
+    공식 규격서 기반 (v1_국내주식-003):
+    - RVSE_CNCL_DVSN_CD: 01=정정, 02=취소
+    - QTY_ALL_ORD_YN: Y=전량, N=일부
+    - EXCG_ID_DVSN_CD: KRX/NXT/SOR (미입력시 KRX)
+    """
+    from scheduler.market_calendar import market_calendar
+
+    cano, acnt_prdt_cd = _get_account()
+    domain = _get_trading_domain()
+    is_paper = settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
+    tr_id = "VTTC0013U" if is_paper else "TTTC0013U"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token = await _get_access_token(client)
+            response = await client.post(
+                f"{domain}/uapi/domestic-stock/v1/trading/order-rvsecncl",
+                headers={
+                    "content-type": "application/json; charset=utf-8",
+                    "authorization": f"Bearer {token}",
+                    "appkey": _get_app_key(),
+                    "appsecret": _get_app_secret(),
+                    "tr_id": tr_id,
+                },
+                json={
+                    "CANO": cano,
+                    "ACNT_PRDT_CD": acnt_prdt_cd,
+                    "KRX_FWDG_ORD_ORGNO": order_branch or "",
+                    "ORGN_ODNO": order_id,
+                    "ORD_DVSN": "00",
+                    "RVSE_CNCL_DVSN_CD": "02",  # 02=취소
+                    "ORD_QTY": "0",
+                    "ORD_UNPR": "0",
+                    "QTY_ALL_ORD_YN": "Y",  # 잔량 전부
+                    "EXCG_ID_DVSN_CD": market_calendar.get_excg_dvsn_cd(),
+                },
+            )
+
+        if response.status_code != 200:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+
+        result = response.json()
+        if result.get("rt_cd") != "0":
+            error_msg = result.get("msg1", "취소 실패")
+            logger.warning("주문 취소 거부: {} — {}", order_id, error_msg)
+            return {"success": False, "error": error_msg}
+
+        logger.info("주문 취소 성공: {}", order_id)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error("주문 취소 오류: {} — {}", order_id, str(e))
+        return {"success": False, "error": str(e)}
