@@ -37,12 +37,12 @@ class MarketRegimeAgent(BaseAgent):
 
     # 국면별 시장 스캔 주기 (초)
     SCAN_INTERVAL: dict[str, int] = {
-        "BULL": 1800,     # 30분 — 모멘텀 종목 포착
-        "THEME": 1200,    # 20분 — 테마 급등 빠르게 포착
-        "SIDEWAYS": 3600, # 60분 — 기본 주기
-        "BEAR": 5400,     # 90분 — 스캔 줄이고 보유 재평가에 집중
+        "BULL": 1200,     # 20분 — 모멘텀 종목 빠른 포착
+        "THEME": 900,     # 15분 — 테마 급등 가장 빠르게 포착
+        "SIDEWAYS": 1800, # 30분 — 방향 전환 초기 포착
+        "BEAR": 1800,     # 30분 — 과매도 반등/섹터 순환 기회 포착
     }
-    DEFAULT_SCAN_INTERVAL = 3600  # 60분
+    DEFAULT_SCAN_INTERVAL = 1800  # 30분
 
     @property
     def name(self) -> str:

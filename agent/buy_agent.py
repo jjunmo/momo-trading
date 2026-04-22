@@ -32,6 +32,7 @@ class BuyParams:
     trailing_stop_pct: float = 0.0
     breakeven_trigger_pct: float = 0.0
     review_threshold_pct: float = 0.0
+    review_interval_min: int = 0  # 다음 재평가까지 분 (LLM이 분석 결과 기반 결정)
 
 
 class BuyAgent(BaseAgent):
@@ -158,6 +159,8 @@ class BuyAgent(BaseAgent):
                     kwargs["breakeven_trigger_pct"] = params.breakeven_trigger_pct
                 if params.review_threshold_pct > 0:
                     kwargs["review_threshold_pct"] = params.review_threshold_pct
+                if params.review_interval_min > 0:
+                    kwargs["review_interval_min"] = params.review_interval_min
                 if params.price > 0:
                     kwargs["entry_price"] = params.price
                 if kwargs:

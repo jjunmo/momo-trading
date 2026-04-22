@@ -18,14 +18,12 @@ let stockCards = {};
 const sidebarState = {
   account: true,
   holdings: true,
-  pending: false,
-  settings: false,
+  'agent-limits': true,
   system: true,
 };
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
-  loadSettings();
   loadSystemStatus();
   loadReportList();
   loadAccountInfo();
@@ -37,7 +35,35 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(loadSystemStatus, 15000);
   setInterval(loadSymbolNames, 60000); // 1분마다 종목명 갱신
   accountPollTimer = setInterval(loadAccountInfo, 30000);
+  setInterval(updateReviewCountdowns, 1000); // 재평가 카운트다운 1초 갱신
 });
+
+// 보유종목 카드의 재평가 카운트다운 갱신
+function updateReviewCountdowns() {
+  const now = Date.now();
+  document.querySelectorAll('.review-countdown').forEach(el => {
+    const iso = el.dataset.reviewAt;
+    if (!iso) return;
+    const target = new Date(iso).getTime();
+    const diff = target - now;
+    if (diff <= 0) {
+      el.textContent = '재평가 중...';
+      el.classList.add('text-yellow-300');
+      el.classList.remove('text-purple-300');
+      return;
+    }
+    const totalSec = Math.floor(diff / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    if (min > 0) {
+      el.textContent = `${min}분 ${sec}초 후`;
+    } else {
+      el.textContent = `${sec}초 후`;
+    }
+    el.classList.add('text-purple-300');
+    el.classList.remove('text-yellow-300');
+  });
+}
 
 async function loadSymbolNames() {
   try {
@@ -88,6 +114,14 @@ function connectSSE() {
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
           setTimeout(loadAccountInfo, 2000);
         }
+        // AI 한도 결정 / 국면 변화 → 즉시 에이전트 판단 갱신
+        if (msg.data && msg.data.activity_type === 'RISK_TUNING' && msg.data.phase === 'COMPLETE') {
+          loadAccountInfo();
+        }
+        if (msg.data && msg.data.activity_type === 'EVENT' &&
+            typeof msg.data.summary === 'string' && msg.data.summary.includes('국면 변경')) {
+          loadAccountInfo();
+        }
       }
       if (msg.type === 'account_changed') {
         loadAccountInfo();
@@ -109,17 +143,17 @@ function connectSSE() {
 // ── Account Info ──
 async function loadAccountInfo() {
   try {
-    const [balResp, holdResp, pendResp] = await Promise.all([
+    const [balResp, holdResp, limitsResp] = await Promise.all([
       fetch(`${API}/account/balance`),
       fetch(`${API}/account/holdings`),
-      fetch(`${API}/account/pending-orders`),
+      fetch(`${API}/agent/limits`),
     ]);
     const balJson = await balResp.json();
     const holdJson = await holdResp.json();
-    const pendJson = await pendResp.json();
+    const limitsJson = await limitsResp.json();
     renderAccountBalance(balJson.data);
     renderAccountHoldings(holdJson.data);
-    renderPendingOrders(pendJson.data);
+    renderAgentLimits(limitsJson.data);
   } catch (err) {
     console.error('Account info error:', err);
     const el = document.getElementById('account-info');
@@ -172,6 +206,26 @@ function renderAccountHoldings(data) {
     const evalAmt = h.current_price * h.quantity;
     const barColor = h.pnl_rate >= 0 ? 'bg-green-500' : 'bg-red-500';
     const barWidth = Math.min(Math.abs(h.pnl_rate) * 10, 100);
+    // 손절/익절가 (event_detector에서 활성 임계값)
+    const th = h.thresholds || {};
+    const sl = Number(th.stop_loss) || 0;
+    const tp = Number(th.take_profit) || 0;
+    const trailPct = Number(th.trailing_stop_pct) || 0;
+    let thresholdLine = '';
+    if (sl > 0 || tp > 0 || trailPct > 0) {
+      const slStr = sl > 0 ? `<span class="text-red-400">손 ${Number(sl).toLocaleString()}</span>` : '<span class="text-gray-600">손 미설정</span>';
+      const tpStr = tp > 0 ? `<span class="text-green-400">익 ${Number(tp).toLocaleString()}</span>` : '<span class="text-gray-600">익 미설정</span>';
+      const trStr = trailPct > 0 ? `<span class="text-blue-400">트레일 ${trailPct.toFixed(1)}%</span>` : '';
+      thresholdLine = `<div class="flex justify-between text-gray-500 gap-1">${slStr}${tpStr}${trStr || '<span></span>'}</div>`;
+    }
+    // 재평가 카운트다운 (data-review-at 속성 → updateReviewCountdowns에서 매초 갱신)
+    let reviewLine = '';
+    if (th.next_review_at) {
+      reviewLine = `<div class="flex justify-between text-gray-500">
+        <span class="text-purple-300">🔍 다음 재평가</span>
+        <span class="review-countdown text-purple-300" data-review-at="${th.next_review_at}">계산 중...</span>
+      </div>`;
+    }
     return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5 ${bgTint}">
       <div class="flex justify-between items-center">
         <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}${h.tradeable_market === 'NXT' ? ' <span class="text-green-400 text-xs">[NXT]</span>' : h.tradeable_market === 'KRX_ONLY' ? ' <span class="text-yellow-500 text-xs">[KRX종가]</span>' : ''}</span>
@@ -188,42 +242,135 @@ function renderAccountHoldings(data) {
         <span>평가 ${formatKRW(evalAmt)}</span>
         <span class="${pnlColor} font-medium">${h.pnl >= 0 ? '+' : ''}${formatKRW(h.pnl)}</span>
       </div>
+      ${thresholdLine}
+      ${reviewLine}
     </div>`;
   }).join('');
 }
 
-function renderPendingOrders(data) {
-  const el = document.getElementById('pending-orders-info');
-  const countEl = document.getElementById('pending-count');
+function renderAgentLimits(data) {
+  const el = document.getElementById('agent-limits-info');
   if (!el) return;
-  if (!data || !data.length) {
-    if (countEl) countEl.textContent = '0';
-    el.innerHTML = '';
+  if (!data) {
+    el.innerHTML = '<div class="text-gray-600">조회 실패</div>';
     return;
   }
-  if (countEl) {
-    countEl.textContent = `${data.length}`;
-  }
-  el.innerHTML = data.map(o => {
-    const sideColor = o.side === '매수' ? 'text-red-400' : 'text-blue-400';
-    const borderColor = o.side === '매수' ? 'border-yellow-700/60' : 'border-yellow-700/60';
-    const orderAmt = o.order_price * o.remaining_qty;
-    const timeStr = o.order_time ? o.order_time.slice(0,2) + ':' + o.order_time.slice(2,4) + ':' + o.order_time.slice(4,6) : '';
-    return `<div class="border ${borderColor} bg-yellow-900/10 rounded p-1.5 space-y-0.5">
-      <div class="flex justify-between items-center">
-        <span class="text-gray-200 font-medium truncate" title="${o.symbol}">${o.name}</span>
-        <span class="${sideColor} font-medium text-xs px-1.5 py-0.5 rounded ${o.side === '매수' ? 'bg-red-900/30' : 'bg-blue-900/30'}">${o.side}</span>
+  const rt = data.risk_tuner || {};
+  const rg = data.regime_agent || {};
+  const tr = data.trading || {};
+
+  // 시장 국면 뱃지 색상
+  const regime = rg.current_regime || tr.market_regime || '미판단';
+  const regimeColor = {
+    'BULL': 'bg-green-900/40 text-green-300',
+    'BEAR': 'bg-red-900/40 text-red-300',
+    'THEME': 'bg-purple-900/40 text-purple-300',
+    'SIDEWAYS': 'bg-gray-700 text-gray-300',
+  }[regime] || 'bg-gray-700 text-gray-400';
+
+  // 숫자 포맷: 0은 "무제한", 그 외는 값
+  const fmtLimit = (v, unit) => {
+    const n = Number(v) || 0;
+    if (n === 0) return '<span class="text-green-400">무제한</span>';
+    if (unit === 'KRW') return formatKRW(n);
+    if (unit === '%') return `${Number(n).toFixed(0)}%`;
+    return `${n}${unit || ''}`;
+  };
+
+  const fmtTime = (iso) => {
+    if (!iso) return '-';
+    try {
+      const d = new Date(iso);
+      return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch { return '-'; }
+  };
+
+  // 지수 등락률
+  const kospi = rg.kospi || {};
+  const kosdaq = rg.kosdaq || {};
+  const kospiRate = kospi.change_rate != null ? Number(kospi.change_rate).toFixed(2) : null;
+  const kosdaqRate = kosdaq.change_rate != null ? Number(kosdaq.change_rate).toFixed(2) : null;
+  const rateColor = (r) => r == null ? 'text-gray-500' : (Number(r) >= 0 ? 'text-green-400' : 'text-red-400');
+
+  const tradeCount = tr.today_trade_count || 0;
+  const maxTrades = rt.max_daily_trades || 0;
+  const tradeCountStr = maxTrades > 0 ? `${tradeCount}/${maxTrades}` : `${tradeCount}`;
+
+  el.innerHTML = `
+    <!-- 시장 국면 -->
+    <div class="flex justify-between items-center">
+      <span class="text-gray-400">시장 국면</span>
+      <span class="px-2 py-0.5 rounded text-xs font-medium ${regimeColor}">${regime}</span>
+    </div>
+    ${rg.previous_regime ? `
+    <div class="flex justify-between text-gray-500">
+      <span>이전 국면</span>
+      <span>${rg.previous_regime}</span>
+    </div>` : ''}
+    ${kospiRate != null ? `
+    <div class="flex justify-between text-gray-500">
+      <span>KOSPI</span>
+      <span class="${rateColor(kospiRate)}">${kospiRate >= 0 ? '+' : ''}${kospiRate}%</span>
+    </div>` : ''}
+    ${kosdaqRate != null ? `
+    <div class="flex justify-between text-gray-500">
+      <span>KOSDAQ</span>
+      <span class="${rateColor(kosdaqRate)}">${kosdaqRate >= 0 ? '+' : ''}${kosdaqRate}%</span>
+    </div>` : ''}
+
+    <!-- AI 한도 결정 -->
+    <div class="border-t border-gray-700 pt-1.5 mt-1.5">
+      <div class="text-gray-500 font-medium mb-1">🎯 AI 한도 결정</div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">일일 거래</span>
+        <span class="text-white">${tradeCountStr}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">주문 한도</span>
+        <span class="text-white">${fmtLimit(rt.max_single_order_krw, 'KRW')}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">포지션 한도</span>
+        <span class="text-white">${fmtLimit(rt.max_position_pct, '%')}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">최소 현금</span>
+        <span class="text-white">${Number(rt.min_cash_ratio || 0).toFixed(0)}%</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">최소 매수량</span>
+        <span class="text-white">${rt.min_buy_quantity || 1}주</span>
+      </div>
+    </div>
+
+    <!-- 스케줄 -->
+    <div class="border-t border-gray-700 pt-1.5 mt-1.5">
+      <div class="text-gray-500 font-medium mb-1">⏱ 모니터링</div>
+      <div class="flex justify-between text-gray-500">
+        <span>국면 체크</span>
+        <span>${Math.round((rg.regime_check_interval_sec || 0) / 60)}분 간격</span>
       </div>
       <div class="flex justify-between text-gray-500">
-        <span>미체결 ${o.remaining_qty}주 / ${o.order_qty}주</span>
-        <span>${Number(o.order_price).toLocaleString()}원</span>
+        <span>스캔 주기</span>
+        <span>${Math.round((rg.scan_interval_sec || 0) / 60)}분 간격</span>
       </div>
       <div class="flex justify-between text-gray-500">
-        <span>${formatKRW(orderAmt)}</span>
-        <span>${timeStr}</span>
+        <span>최근 체크</span>
+        <span>${fmtTime(rg.last_check_at)}</span>
       </div>
-    </div>`;
-  }).join('');
+      <div class="flex justify-between text-gray-500">
+        <span>최근 스캔</span>
+        <span>${fmtTime(rg.last_scan_at)}</span>
+      </div>
+    </div>
+
+    ${rt.reasoning ? `
+    <!-- AI 판단 근거 -->
+    <div class="border-t border-gray-700 pt-1.5 mt-1.5">
+      <div class="text-gray-500 font-medium mb-1">💭 판단 근거</div>
+      <div class="text-gray-400 text-xs leading-relaxed">${escapeHtml(rt.reasoning)}</div>
+    </div>` : ''}
+  `;
 }
 
 function formatKRW(amount) {
@@ -300,6 +447,10 @@ function appendActivity(data) {
       stockCards[cardKey] = card;
       card.agentCategories = new Set();
       container.appendChild(card.element);
+    } else if (card.element.parentNode === container &&
+               card.element !== container.lastElementChild) {
+      // 이미 존재하는 카드 → 맨 아래로 부드럽게 이동 (FLIP 애니메이션)
+      moveCardToBottom(card.element, container);
     }
     // 카드 카테고리: 매수/매도 확정 시 해당 탭에만 노출
     card.agentCategories = card.agentCategories || new Set();
@@ -344,6 +495,33 @@ function createCycleDivider(data, isStart) {
     div.innerHTML = `<span>${escapeHtml(data.summary)}${elapsed}</span><span class="text-gray-600">${time}</span>`;
   }
   return div;
+}
+
+/**
+ * 카드를 맨 아래로 부드럽게 이동 (FLIP 애니메이션)
+ * - First: 현재 위치 기록
+ * - Last: DOM 이동 후 최종 위치 계산
+ * - Invert: 이전 위치로 transform 순간 이동
+ * - Play: 다음 프레임에서 transition 켜고 원래 위치로 슬라이드
+ */
+function moveCardToBottom(element, container) {
+  const firstRect = element.getBoundingClientRect();
+  container.appendChild(element);
+  const lastRect = element.getBoundingClientRect();
+  const deltaY = firstRect.top - lastRect.top;
+  if (deltaY === 0) return;
+
+  element.style.transition = 'none';
+  element.style.transform = `translateY(${deltaY}px)`;
+
+  requestAnimationFrame(() => {
+    element.style.transition = 'transform 400ms cubic-bezier(0.4, 0, 0.2, 1)';
+    element.style.transform = '';
+    element.addEventListener('transitionend', () => {
+      element.style.transition = '';
+      element.style.transform = '';
+    }, { once: true });
+  });
 }
 
 /**
@@ -927,6 +1105,10 @@ function applyAgentFilter() {
       child.style.display = cats.includes(currentAgentFilter) ? '' : 'none';
     }
   }
+  // 필터 적용 후 최신 항목(맨 아래)로 스크롤 (display 변경 후 scrollHeight 재계산 대기)
+  requestAnimationFrame(() => {
+    container.scrollTop = container.scrollHeight;
+  });
 }
 
 function escapeHtml(text) {
@@ -1167,38 +1349,6 @@ function renderTradeCard(t, type) {
   </div>`;
 }
 
-// ── Settings ──
-async function loadSettings() {
-  try {
-    const resp = await fetch(`${API}/settings`);
-    const json = await resp.json();
-    const s = json.data;
-    if (!s) return;
-    document.getElementById('set-trading').checked = s.TRADING_ENABLED;
-    document.getElementById('set-mode').value = s.AUTONOMY_MODE;
-    const riskEl = document.getElementById('set-risk-appetite');
-    if (riskEl && s.RISK_APPETITE) riskEl.value = s.RISK_APPETITE;
-    updateBadge('badge-trading', s.TRADING_ENABLED ? '매매:ON' : '매매:OFF', s.TRADING_ENABLED ? 'green' : 'red');
-    updateBadge('badge-mode', s.AUTONOMY_MODE, 'purple');
-  } catch (err) {
-    console.error('Settings load error:', err);
-  }
-}
-
-async function updateSetting(key, value) {
-  try {
-    await fetch(`${API}/settings`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [key]: value }),
-    });
-    loadSettings();
-    loadSystemStatus();
-  } catch (err) {
-    console.error('Setting update error:', err);
-  }
-}
-
 // ── LLM Status ──
 async function loadLLMStatus() {
   try {
@@ -1221,6 +1371,7 @@ async function loadSystemStatus() {
     const s = json.data;
     if (!s) return;
     updateBadge('badge-trading', s.trading_enabled ? '매매:ON' : '매매:OFF', s.trading_enabled ? 'green' : 'red');
+    if (s.autonomy_mode) updateBadge('badge-mode', s.autonomy_mode, 'purple');
     updateBadge('badge-mcp', s.mcp_connected ? 'MCP:✓' : 'MCP:✗', s.mcp_connected ? 'green' : 'red');
     const statusEl = document.getElementById('sys-status');
     const isHoliday = !!s.market_holiday;

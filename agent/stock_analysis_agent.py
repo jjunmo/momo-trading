@@ -72,8 +72,10 @@ class StockAnalysisResult:
     current_price: float = 0.0
     chart_result: ChartAnalysisResult = field(default_factory=ChartAnalysisResult)
     price_data: dict = field(default_factory=dict)
-    # 재평가 주기 조절 (LLM이 ATR 기반 결정)
+    # 재평가 주기 조절 (LLM이 ATR 기반 결정, 가격 트리거)
     review_threshold_pct: float = 0.0
+    # 다음 재평가까지 분 (LLM이 종목 특성 기반 결정, 시간 트리거)
+    review_interval_min: int = 0
     # 보유 전략 (LLM이 종목별 판단)
     hold_strategy: str = "DAY_CLOSE"  # OVERNIGHT / DAY_CLOSE
     # 메타
@@ -160,6 +162,10 @@ class StockAnalysisAgent(BaseAgent):
         result.trailing_stop_pct = float(parsed.get("trailing_stop_pct", 0))
         result.breakeven_trigger_pct = float(parsed.get("breakeven_trigger_pct", 0))
         result.review_threshold_pct = float(parsed.get("review_threshold_pct", 0))
+        try:
+            result.review_interval_min = int(float(parsed.get("review_interval_min", 0) or 0))
+        except (TypeError, ValueError):
+            result.review_interval_min = 0
         result.hold_strategy = parsed.get("hold_strategy", "DAY_CLOSE")
         result.provider = parsed.get("provider", "")
         result.key_factors = parsed.get("key_factors", [])
@@ -184,15 +190,20 @@ class StockAnalysisAgent(BaseAgent):
                 kwargs["breakeven_trigger_pct"] = result.breakeven_trigger_pct
             if result.review_threshold_pct > 0:
                 kwargs["review_threshold_pct"] = result.review_threshold_pct
+            if result.review_interval_min > 0:
+                kwargs["review_interval_min"] = result.review_interval_min
+                logger.info("[분석] {} 다음 재평가: {}분 후", request.symbol, result.review_interval_min)
             if kwargs:
                 event_detector.set_thresholds(request.symbol, **kwargs)
                 logger.info("[분석] {} 임계값 설정: {}", request.symbol, kwargs)
 
             # DB 동기화: trade_results의 open BUY 레코드 업데이트 → 서버 재시작 시 복원값이 최신
-            if result.target_price > 0 or result.stop_loss_price > 0:
+            if result.target_price > 0 or result.stop_loss_price > 0 or result.review_interval_min > 0:
                 try:
+                    from datetime import datetime, timedelta
                     from core.database import AsyncSessionLocal
                     from repositories.trade_result_repository import TradeResultRepository
+                    from util.time_util import now_kst
                     async with AsyncSessionLocal() as session:
                         async with session.begin():
                             repo = TradeResultRepository(session)
@@ -203,6 +214,8 @@ class StockAnalysisAgent(BaseAgent):
                                         tr.ai_target_price = result.target_price
                                     if result.stop_loss_price > 0:
                                         tr.ai_stop_loss_price = result.stop_loss_price
+                                    if result.review_interval_min > 0:
+                                        tr.next_review_at = now_kst() + timedelta(minutes=result.review_interval_min)
                 except Exception as e:
                     logger.warning("[분석] {} 임계값 DB 동기화 실패: {}", request.symbol, str(e))
 
