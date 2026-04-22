@@ -163,7 +163,17 @@ class StockAnalysisAgent(BaseAgent):
         result.breakeven_trigger_pct = float(parsed.get("breakeven_trigger_pct", 0))
         result.review_threshold_pct = float(parsed.get("review_threshold_pct", 0))
         try:
-            result.review_interval_min = int(float(parsed.get("review_interval_min", 0) or 0))
+            raw_interval = int(float(parsed.get("review_interval_min", 0) or 0))
+            if raw_interval > 0:
+                from core.config import settings as _s
+                clamped = max(_s.REVIEW_INTERVAL_MIN_SAFE_LOW,
+                              min(raw_interval, _s.REVIEW_INTERVAL_MIN_SAFE_HIGH))
+                if clamped != raw_interval:
+                    logger.info("[분석] {} review_interval_min clamp: {}분 → {}분",
+                                request.symbol, raw_interval, clamped)
+                result.review_interval_min = clamped
+            else:
+                result.review_interval_min = 0
         except (TypeError, ValueError):
             result.review_interval_min = 0
         result.hold_strategy = parsed.get("hold_strategy", "DAY_CLOSE")

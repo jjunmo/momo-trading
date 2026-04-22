@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     # === Scheduler ===
     SCHEDULER_ENABLED: bool = True
 
+    # === LLM 재평가 주기 안전망 (AI가 도출한 값의 극단치만 방지) ===
+    REVIEW_INTERVAL_MIN_SAFE_LOW: int = 3    # 분 — 이보다 작으면 노이즈 재호출로 차단
+    REVIEW_INTERVAL_MIN_SAFE_HIGH: int = 240  # 분 — 이보다 크면 장중 망각 방지로 차단
+
     @property
     def async_database_url(self) -> str:
         """Sync URL에서 async 드라이버 URL을 자동 생성"""
