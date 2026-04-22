@@ -54,6 +54,8 @@ class TradingAgent:
         self._market_context: str = ""
         # 시장 국면 (전략/리스크에 전달)
         self._market_regime: str = ""
+        # AI Risk Tuner가 결정한 동적 한도 (Admin API / buy_agent 참조)
+        self._dynamic_limits: dict = {}
         # 데이트레이딩 컨텍스트 캐시 (시간/손익/매매성적)
         self._trading_context: str = ""
         # 데이트레이딩 일일 기준 자산 (손익 계산용)
@@ -150,6 +152,8 @@ class TradingAgent:
             )
         except Exception as e:
             logger.warning("AI 한도 결정 실패, 기본값 사용: {}", str(e))
+        # 싱글톤 속성에 저장 → Admin API, buy_agent 등에서 참조
+        self._dynamic_limits = dynamic_limits or {}
 
         try:
             # 0. 포트폴리오 스냅샷 (스캔 전 현금 확인, MCP 1회)
@@ -382,6 +386,7 @@ class TradingAgent:
                             trailing_stop_pct=analysis.trailing_stop_pct,
                             breakeven_trigger_pct=analysis.breakeven_trigger_pct,
                             review_threshold_pct=analysis.review_threshold_pct,
+                            review_interval_min=analysis.review_interval_min,
                         ))
                         return {**r, "signal": True, "route": "buy"}
                     elif rec == "SELL" and is_holding:

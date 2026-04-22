@@ -127,16 +127,17 @@ class TradingScheduler:
             misfire_grace_time=300,
         )
 
-        # ── 장중 보유종목 AI 재평가 (30분 간격, 09:00~14:00) — 맥락 기반 HOLD/SELL + 임계값 조정 ──
+        # ── 장중 보유종목 AI 재평가 (3분 주기 체크, 종목별 next_review_at 기반) ──
+        # 각 종목의 재평가 주기는 LLM이 분석 결과 기반으로 결정 (5~60분 동적)
         self.scheduler.add_job(
             self._intraday_holdings_review,
             "cron",
-            minute="0,30",
+            minute="*/3",
             hour="9-14",
             day_of_week="mon-fri",
             id="intraday_holdings_review",
-            name="장중 보유종목 AI 재평가",
-            misfire_grace_time=600,
+            name="장중 보유종목 AI 재평가 (종목별 due 기반)",
+            misfire_grace_time=120,
         )
 
         # ── 장 마감 전 청산 (15:10 평일) — DAY_TRADING: 전량 매도 / 스윙: 스마트 청산 ──
@@ -839,7 +840,12 @@ class TradingScheduler:
         return to_sell, to_hold
 
     async def _intraday_holdings_review(self) -> None:
-        """장중 보유종목 AI 재평가 (30분 간격) — Agent에 위임"""
+        """장중 보유종목 AI 재평가 (3분 주기 체크, 종목별 due 기반)
+
+        각 종목은 LLM이 결정한 `next_review_at` 시각 이후에만 재평가됨.
+        급등주는 짧은 주기, 안정주는 긴 주기로 동적 관리.
+        """
+        import time as _time
         from scheduler.market_calendar import market_calendar
         if not market_calendar.is_domestic_trading_hours():
             return
@@ -858,8 +864,26 @@ class TradingScheduler:
             if not sellable:
                 return
 
-            log_lines = []
+            # 종목별 due 판단: next_review_at 미설정 또는 지난 종목만 재평가
+            now = _time.time()
+            due_holdings = []
+            skipped = []
             for h in sellable:
+                th = event_detector.get_thresholds(h.symbol)
+                next_review = getattr(th, "next_review_at", 0) or 0
+                if next_review <= now:
+                    due_holdings.append(h)
+                else:
+                    remain_min = int((next_review - now) / 60)
+                    skipped.append(f"{h.name or h.symbol}(-{remain_min}분)")
+
+            if not due_holdings:
+                logger.debug("[재평가] due 종목 없음 (대기 중: {}건)", len(skipped))
+                return
+            logger.info("[재평가] {}건 실행 (스킵: {}건 {})", len(due_holdings), len(skipped), ', '.join(skipped[:3]))
+
+            log_lines = []
+            for h in due_holdings:
                 try:
                     th = event_detector.get_thresholds(h.symbol)
                     request = StockAnalysisRequest(
@@ -891,6 +915,7 @@ class TradingScheduler:
                             trailing_stop_pct=result.trailing_stop_pct,
                             breakeven_trigger_pct=result.breakeven_trigger_pct,
                             review_threshold_pct=result.review_threshold_pct,
+                            review_interval_min=result.review_interval_min,
                         ))
                         log_lines.append(f"  - {h.name}({h.symbol}): ADD_BUY")
                     elif rec == "SELL":

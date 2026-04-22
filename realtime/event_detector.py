@@ -26,8 +26,11 @@ class StockThresholds:
     initial_stop_loss: float = 0.0
     breakeven_trigger_pct: float = 0.0
 
-    # 재평가 주기 조절 (LLM이 ATR 기반 결정)
+    # 재평가 주기 조절 (LLM이 ATR 기반 결정, 가격 변동 트리거)
     review_threshold_pct: float = 0.0
+
+    # 시간 기반 재평가 주기 (LLM이 결정, 다음 재평가 시각)
+    next_review_at: float = 0.0  # time.time() 기준 epoch seconds
 
 
 DEFAULT_THRESHOLDS = StockThresholds()
@@ -51,7 +54,22 @@ class PriceGuard:
     # ── 임계값 관리 ──
 
     def set_thresholds(self, symbol: str, **kwargs) -> None:
-        """보유종목 감시 임계값 설정 (매수 체결 시 BuyAgent가 호출)"""
+        """보유종목 감시 임계값 설정 (매수 체결 시 BuyAgent가 호출)
+
+        review_interval_min을 넘기면 now + (min * 60)으로 next_review_at 자동 계산.
+        직접 next_review_at을 넘기면 그 값을 사용 (DB 복원 등).
+        """
+        import time as _time
+        # review_interval_min → next_review_at 변환
+        if "review_interval_min" in kwargs:
+            mins = kwargs.pop("review_interval_min")
+            try:
+                mins_f = float(mins)
+                if mins_f > 0:
+                    kwargs["next_review_at"] = _time.time() + mins_f * 60
+            except (TypeError, ValueError):
+                pass
+
         validated = {}
         for k, v in kwargs.items():
             if isinstance(v, str):

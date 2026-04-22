@@ -59,3 +59,5 @@ class TradeResult(Base, TimestampMixin):
 
     entry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     exit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 다음 재평가 시각 (LLM이 결정, 종목별 동적 주기)
+    next_review_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

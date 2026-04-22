@@ -198,10 +198,11 @@ async def get_account_balance():
 
 @router.get("/account/holdings")
 async def get_account_holdings():
-    """보유 종목 조회 (KRX/NXT 시세 구분 포함)"""
+    """보유 종목 조회 (KRX/NXT 시세 구분 + 활성 손절/익절 포함)"""
     try:
         from scheduler.market_calendar import market_calendar
         from agent.market_scanner import market_scanner
+        from realtime.event_detector import event_detector
 
         holdings = await account_manager.get_holdings()
         session = market_calendar.get_market_session()
@@ -214,6 +215,24 @@ async def get_account_holdings():
                 return "NXT"
             return "KRX"
 
+        def _thresholds(symbol: str) -> dict:
+            from datetime import datetime
+            th = event_detector.get_thresholds(symbol)
+            next_review_ts = getattr(th, "next_review_at", 0) or 0
+            next_review_iso = None
+            if next_review_ts > 0:
+                try:
+                    next_review_iso = datetime.fromtimestamp(next_review_ts).isoformat()
+                except Exception:
+                    next_review_iso = None
+            return {
+                "stop_loss": getattr(th, "stop_loss", 0) or 0,
+                "take_profit": getattr(th, "take_profit", 0) or 0,
+                "trailing_stop_pct": getattr(th, "trailing_stop_pct", 0) or 0,
+                "breakeven_trigger_pct": getattr(th, "breakeven_trigger_pct", 0) or 0,
+                "next_review_at": next_review_iso,  # ISO 문자열 (브라우저에서 Date 파싱)
+            }
+
         return SuccessResponse(data=[
             {
                 "symbol": h.symbol,
@@ -224,6 +243,7 @@ async def get_account_holdings():
                 "pnl": h.pnl,
                 "pnl_rate": h.pnl_rate,
                 "tradeable_market": _market_label(h.symbol),
+                "thresholds": _thresholds(h.symbol),
             }
             for h in holdings
         ])
@@ -462,6 +482,84 @@ async def get_system_status():
         "market_session": market_calendar.get_market_session(),
         "market_holiday": market_calendar.get_holiday_name(),
         "next_market_open": market_calendar.next_market_open().strftime("%m/%d %H:%M"),
+    })
+
+
+# ── AI Agent 실시간 판단 정보 ──
+@router.get("/agent/limits")
+async def get_agent_limits():
+    """AI Risk Tuner가 결정한 전체 한도 + 시장 국면 에이전트 상태"""
+    import json
+    from datetime import datetime
+    from sqlalchemy import select, desc
+    from agent.trading_agent import trading_agent
+    from agent.market_regime_agent import market_regime_agent
+    from core.database import AsyncSessionLocal
+    from models.agent_activity import AgentActivityLog
+
+    limits = getattr(trading_agent, '_dynamic_limits', None) or {}
+
+    # Fallback: 메모리 비어있으면 최근 RISK_TUNING DB 로그에서 복원
+    if not limits:
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(AgentActivityLog)
+                    .where(AgentActivityLog.activity_type == "RISK_TUNING")
+                    .where(AgentActivityLog.phase == "COMPLETE")
+                    .order_by(desc(AgentActivityLog.created_at))
+                    .limit(1)
+                )
+                row = result.scalar_one_or_none()
+                if row and row.detail:
+                    limits = json.loads(row.detail) if isinstance(row.detail, str) else row.detail
+                    # 메모리에도 캐시 (다음 요청부터는 즉시 반환)
+                    trading_agent._dynamic_limits = limits
+        except Exception as e:
+            logger.warning("RISK_TUNING DB fallback 실패: {}", str(e))
+
+    regime_status = market_regime_agent.get_status()
+
+    today_trade_count = 0
+    try:
+        today_trade_count = await trading_agent._get_today_trade_count()
+    except Exception:
+        pass
+
+    # Market regime agent의 타임스탬프를 ISO 포맷으로 변환
+    def _ts_to_iso(ts):
+        try:
+            return datetime.fromtimestamp(ts).isoformat() if ts else None
+        except Exception:
+            return None
+
+    return SuccessResponse(data={
+        # === AI Risk Tuner 결정값 (전체) ===
+        "risk_tuner": {
+            "max_daily_trades": limits.get("max_daily_trades", 0),
+            "max_single_order_krw": limits.get("max_single_order_krw", 0),
+            "min_buy_quantity": limits.get("min_buy_quantity", 0),
+            "max_position_pct": limits.get("max_position_pct", 0),
+            "min_cash_ratio": limits.get("min_cash_ratio", 0),
+            "reasoning": limits.get("reasoning", ""),
+        },
+        # === 시장 국면 에이전트 상태 ===
+        "regime_agent": {
+            "current_regime": regime_status.get("current_regime") or "미판단",
+            "previous_regime": regime_status.get("previous_regime") or "",
+            "last_check_at": _ts_to_iso(regime_status.get("last_check_at")),
+            "regime_changed_at": _ts_to_iso(regime_status.get("regime_changed_at")),
+            "regime_check_interval_sec": regime_status.get("regime_check_interval_sec", 0),
+            "scan_interval_sec": regime_status.get("scan_interval_sec", 0),
+            "last_scan_at": _ts_to_iso(regime_status.get("last_scan_at")),
+            "kospi": regime_status.get("kospi", {}),
+            "kosdaq": regime_status.get("kosdaq", {}),
+        },
+        # === 트레이딩 컨텍스트 ===
+        "trading": {
+            "today_trade_count": today_trade_count,
+            "market_regime": trading_agent._market_regime or "",
+        },
     })
 
 
