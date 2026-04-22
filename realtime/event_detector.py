@@ -258,6 +258,10 @@ class PriceGuard:
         """재평가 완료 후 누적 변동 초기화"""
         self._movement_score[symbol] = 0.0
 
+    def get_movement_score(self, symbol: str) -> float:
+        """현재까지 누적된 가격 변동률(%) — 가격 게이트용"""
+        return self._movement_score.get(symbol, 0.0)
+
     def get_urgent_symbols(self) -> list[str]:
         """즉시 재평가가 필요한 종목 목록"""
         return [s for s in self._thresholds if self.needs_urgent_review(s)]

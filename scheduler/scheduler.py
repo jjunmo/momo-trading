@@ -864,23 +864,55 @@ class TradingScheduler:
             if not sellable:
                 return
 
-            # 종목별 due 판단: next_review_at 미설정 또는 지난 종목만 재평가
+            # 종목별 due 판단: (1) 시간 도래 + (2) 가격 게이트
+            # 가격 게이트: 누적 변동률이 threshold의 절반 미만이면 skip (조용한 종목)
+            # 안전망: 시간이 GRACE_CEILING 이상 지나면 게이트 bypass 강제 호출
+            GRACE_CEILING_SEC = 60 * 60  # 1시간 — 이 이상 조용해도 한 번은 호출
+            QUIET_PUSH_SEC = 5 * 60      # 조용한 종목은 5분 뒤 재확인 (다음 cron에서)
+
             now = _time.time()
             due_holdings = []
             skipped = []
+            quiet_pushed = []
             for h in sellable:
                 th = event_detector.get_thresholds(h.symbol)
                 next_review = getattr(th, "next_review_at", 0) or 0
-                if next_review <= now:
+
+                # 첫 체크(next_review_at 미설정) → 즉시 분석
+                if next_review <= 0:
                     due_holdings.append(h)
-                else:
+                    continue
+
+                # 시간 미도래 → skip
+                if next_review > now:
                     remain_min = int((next_review - now) / 60)
                     skipped.append(f"{h.name or h.symbol}(-{remain_min}분)")
+                    continue
+
+                # 시간 도래 → 가격 게이트 검사
+                overdue_sec = now - next_review
+                if th.review_threshold_pct > 0 and overdue_sec < GRACE_CEILING_SEC:
+                    score = event_detector.get_movement_score(h.symbol)
+                    if score < th.review_threshold_pct * 0.5:
+                        # 조용 → 5분 뒤 재확인 (movement 계속 누적)
+                        th.next_review_at = now + QUIET_PUSH_SEC
+                        quiet_pushed.append(
+                            f"{h.name or h.symbol}(누적 {score:.2f}%<{th.review_threshold_pct*0.5:.2f}%)"
+                        )
+                        continue
+
+                due_holdings.append(h)
 
             if not due_holdings:
-                logger.debug("[재평가] due 종목 없음 (대기 중: {}건)", len(skipped))
+                if quiet_pushed:
+                    logger.info("[재평가] due 0건 / 조용 skip {}건: {}",
+                                len(quiet_pushed), ', '.join(quiet_pushed[:3]))
+                else:
+                    logger.debug("[재평가] due 종목 없음 (대기 중: {}건)", len(skipped))
                 return
-            logger.info("[재평가] {}건 실행 (스킵: {}건 {})", len(due_holdings), len(skipped), ', '.join(skipped[:3]))
+
+            logger.info("[재평가] {}건 실행 (시간대기 {}건, 조용 skip {}건)",
+                        len(due_holdings), len(skipped), len(quiet_pushed))
 
             log_lines = []
             for h in due_holdings:
@@ -902,6 +934,9 @@ class TradingScheduler:
                     if not result.success:
                         log_lines.append(f"  - {h.name}({h.symbol}): 분석 실패")
                         continue
+
+                    # 재평가 완료 → 누적 변동 초기화 (다음 주기는 새 누적으로 시작)
+                    event_detector.reset_movement_score(h.symbol)
 
                     # 임계값은 StockAnalysisAgent가 분석 시 직접 설정
                     rec = result.recommendation
