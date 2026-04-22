@@ -161,57 +161,16 @@
           </div>
         </div>
 
-        <!-- Pending Orders -->
-        <div class="sidebar-section" id="section-pending">
-          <div class="sidebar-section-header" onclick="toggleSidebarSection('pending')">
-            <span>&#x23f3; &#xbbf8;&#xccb4;&#xacb0; &#xc8fc;&#xbb38; <span id="pending-count" class="ml-1 px-1.5 py-0.5 rounded-full bg-yellow-900/40 text-yellow-400 text-xs">0</span></span>
-            <span class="sidebar-section-arrow collapsed" id="arrow-pending">&#x25BC;</span>
+        <!-- Agent Limits (AI Risk Tuner 실시간 판단) -->
+        <div class="sidebar-section" id="section-agent-limits">
+          <div class="sidebar-section-header" onclick="toggleSidebarSection('agent-limits')">
+            <span>&#x1f3af; &#xc5d0;&#xc774;&#xc804;&#xd2b8; &#xd310;&#xb2e8;</span>
+            <span class="sidebar-section-arrow" id="arrow-agent-limits">&#x25BC;</span>
           </div>
-          <div class="sidebar-section-body" id="body-pending">
+          <div class="sidebar-section-body open" id="body-agent-limits">
             <div class="px-3 pb-2">
-              <div id="pending-orders-info" class="text-xs space-y-1"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Settings -->
-        <div class="sidebar-section" id="section-settings">
-          <div class="sidebar-section-header" onclick="toggleSidebarSection('settings')">
-            <span>&#x2699;&#xfe0f; &#xc124;&#xc815;</span>
-            <span class="sidebar-section-arrow collapsed" id="arrow-settings">&#x25BC;</span>
-          </div>
-          <div class="sidebar-section-body" id="body-settings">
-            <div class="px-3 pb-2 space-y-3">
-              <label class="flex items-center justify-between">
-                <span class="text-sm">&#xb9e4;&#xb9e4; &#xd65c;&#xc131;&#xd654;</span>
-                <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
-                  class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
-                  after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
-              </label>
-
-              <div>
-                <label class="text-sm block mb-1">&#xbaa8;&#xb4dc;</label>
-                <select id="set-mode" onchange="updateSetting('AUTONOMY_MODE', this.value)"
-                  class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-                  <option value="SEMI_AUTO">SEMI_AUTO</option>
-                  <option value="AUTONOMOUS">AUTONOMOUS</option>
-                </select>
-              </div>
-
-              <div>
-                <label class="text-sm block mb-1">&#xb9ac;&#xc2a4;&#xd06c; &#xc131;&#xd5a5;</label>
-                <select id="set-risk-appetite" onchange="updateSetting('RISK_APPETITE', this.value)"
-                  class="w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-sm">
-                  <option value="CONSERVATIVE">&#xbcf4;&#xc218;&#xc801; (CONSERVATIVE)</option>
-                  <option value="MODERATE">&#xc911;&#xb9bd; (MODERATE)</option>
-                  <option value="AGGRESSIVE">&#xacf5;&#xaca9;&#xc801; (AGGRESSIVE)</option>
-                </select>
-              </div>
-
-              <div class="border-t border-gray-700 pt-2">
-                <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
-                <div class="text-xs text-gray-400">Claude Code (&#xb85c;&#xceec; CLI)</div>
-                <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+              <div id="agent-limits-info" class="text-xs space-y-1.5">
+                <div class="text-gray-600">&#xb85c;&#xb529; &#xc911;...</div>
               </div>
             </div>
           </div>
