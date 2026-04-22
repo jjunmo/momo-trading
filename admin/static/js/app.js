@@ -204,19 +204,47 @@ function renderAccountHoldings(data) {
     const pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
     const bgTint = h.pnl_rate >= 0 ? 'bg-green-900/5' : 'bg-red-900/5';
     const evalAmt = h.current_price * h.quantity;
-    const barColor = h.pnl_rate >= 0 ? 'bg-green-500' : 'bg-red-500';
-    const barWidth = Math.min(Math.abs(h.pnl_rate) * 10, 100);
     // 손절/익절가 (event_detector에서 활성 임계값)
     const th = h.thresholds || {};
     const sl = Number(th.stop_loss) || 0;
     const tp = Number(th.take_profit) || 0;
     const trailPct = Number(th.trailing_stop_pct) || 0;
+    // 평단가 중심 발산형 바: sl ← 평단가 → tp, 현재가에 따라 중앙에서 좌/우 채움
+    const entry = Number(h.avg_buy_price) || 0;
+    const cur = Number(h.current_price) || 0;
+    let entryBarHtml = '';
+    let entryBarLabel = '';
+    if (entry > 0) {
+      let lossPct = 0, profitPct = 0, overflowLeft = false, overflowRight = false;
+      if (cur < entry && sl > 0 && sl < entry) {
+        const ratio = (entry - cur) / (entry - sl);
+        lossPct = Math.min(Math.max(ratio, 0), 1) * 50;
+        if (ratio > 1) overflowLeft = true;
+      } else if (cur > entry && tp > entry) {
+        const ratio = (cur - entry) / (tp - entry);
+        profitPct = Math.min(Math.max(ratio, 0), 1) * 50;
+        if (ratio > 1) overflowRight = true;
+      }
+      const lossHtml = lossPct > 0 ? `<div class="entry-bar-loss" style="width:${lossPct.toFixed(2)}%"></div>` : '';
+      const profitHtml = profitPct > 0 ? `<div class="entry-bar-profit" style="width:${profitPct.toFixed(2)}%"></div>` : '';
+      const ovlHtml = overflowLeft ? '<div class="entry-bar-overflow-left"></div>' : '';
+      const ovrHtml = overflowRight ? '<div class="entry-bar-overflow-right"></div>' : '';
+      entryBarHtml = `<div class="entry-bar" title="손절 ${sl > 0 ? Number(sl).toLocaleString() : '—'} ← 평단 ${Number(entry).toLocaleString()} → 익절 ${tp > 0 ? Number(tp).toLocaleString() : '—'}">${lossHtml}${profitHtml}<div class="entry-bar-center"></div>${ovlHtml}${ovrHtml}</div>`;
+      // 바 아래 3포인트 라벨: 손절 | 평단 | 익절
+      const slLabel = sl > 0 ? Number(sl).toLocaleString() : '—';
+      const tpLabel = tp > 0 ? Number(tp).toLocaleString() : '—';
+      entryBarLabel = `<div class="flex justify-between text-[10px] text-gray-500">
+        <span class="${sl > 0 ? 'text-red-400' : 'text-gray-600'}">${slLabel}</span>
+        <span class="text-gray-400">${Number(entry).toLocaleString()}</span>
+        <span class="${tp > 0 ? 'text-green-400' : 'text-gray-600'}">${tpLabel}</span>
+      </div>`;
+    }
+    // 트레일링 스탑은 별도 한 줄 유지 (바에 표시 불가)
     let thresholdLine = '';
-    if (sl > 0 || tp > 0 || trailPct > 0) {
-      const slStr = sl > 0 ? `<span class="text-red-400">손 ${Number(sl).toLocaleString()}</span>` : '<span class="text-gray-600">손 미설정</span>';
-      const tpStr = tp > 0 ? `<span class="text-green-400">익 ${Number(tp).toLocaleString()}</span>` : '<span class="text-gray-600">익 미설정</span>';
-      const trStr = trailPct > 0 ? `<span class="text-blue-400">트레일 ${trailPct.toFixed(1)}%</span>` : '';
-      thresholdLine = `<div class="flex justify-between text-gray-500 gap-1">${slStr}${tpStr}${trStr || '<span></span>'}</div>`;
+    if (trailPct > 0) {
+      thresholdLine = `<div class="flex justify-end text-gray-500">
+        <span class="text-blue-400">트레일 ${trailPct.toFixed(1)}%</span>
+      </div>`;
     }
     // 재평가 카운트다운 (data-review-at 속성 → updateReviewCountdowns에서 매초 갱신)
     let reviewLine = '';
@@ -231,9 +259,8 @@ function renderAccountHoldings(data) {
         <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}${h.tradeable_market === 'NXT' ? ' <span class="text-green-400 text-xs">[NXT]</span>' : h.tradeable_market === 'KRX_ONLY' ? ' <span class="text-yellow-500 text-xs">[KRX종가]</span>' : ''}</span>
         <span class="${pnlColor} font-bold text-sm">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
       </div>
-      <div class="pnl-bar">
-        <div class="pnl-bar-fill ${barColor}" style="width:${barWidth}%"></div>
-      </div>
+      ${entryBarHtml}
+      ${entryBarLabel}
       <div class="flex justify-between text-gray-500">
         <span>${h.quantity}주 | 평단 ${Number(h.avg_buy_price).toLocaleString()}원</span>
         <span>현재 ${Number(h.current_price).toLocaleString()}원</span>
@@ -431,6 +458,14 @@ function appendActivity(data) {
     // Symbol-specific → route to stock card
     const cardKey = `${data.cycle_id || 'ev'}:${symbol}`;
     let card = stockCards[cardKey];
+
+    // 매도 완료 카드는 재사용 금지 — frozen 처리 후 새 카드 생성 경로로
+    if (card && card.outcome === 'sell') {
+      const frozenKey = `${cardKey}:sold:${card.soldAt || Date.now()}`;
+      stockCards[frozenKey] = card;
+      delete stockCards[cardKey];
+      card = null;
+    }
 
     if (!card) {
       for (const [key, existing] of Object.entries(stockCards)) {
@@ -784,6 +819,10 @@ function updateCardHeader(card) {
 
   card.outcome = outcome;
   card.totalElapsed = totalMs;
+  // 매도 확정 시각 기록 → frozenKey 생성에 사용 (같은 심볼 새 분석 시 별도 카드)
+  if (outcome === 'sell' && !card.soldAt) {
+    card.soldAt = Date.now();
+  }
 
   // Update outcome badge
   const outcomeEl = card.headerEl.querySelector('.stock-outcome');
@@ -1053,10 +1092,10 @@ function getAgentCategory(data) {
   const summary = (data.summary || '').toLowerCase();
 
   // LLM_CALL: summary 키워드로 세분화
+  // 재평가/보유 LLM_CALL은 분석 활동이므로 analysis로 분류 (실제 매도 주문만 sell 탭)
   if (type === 'LLM_CALL') {
     if (summary.includes('리스크') || summary.includes('한도')) return 'system';
     if (summary.includes('스캔') || summary.includes('스크리너') || summary.includes('선별')) return 'scan';
-    if (summary.includes('재평가') || summary.includes('보유')) return 'sell';
     return 'analysis';
   }
 
