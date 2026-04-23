@@ -51,8 +51,12 @@ venv.bak/
 .env.production
 !.env.example
 
-# KIS API 토큰 (런타임 생성, 절대 커밋 금지)
-data/kis_token.json
+# KIS API 토큰·런타임 데이터 (절대 커밋 금지)
+data/*
+.momo.pid
+
+# 업무용 엑셀 파일 (KIS HTS 다운로드)
+*.xlsx
 
 # Python 버전 관리
 .python-version
