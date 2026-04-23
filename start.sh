@@ -8,13 +8,16 @@
 #   (3) claude (기본값)
 #
 # 사용법:
-#   ./start.sh                       — env의 LLM_PROVIDER 자동 감지, 포그라운드 실행
-#   ./start.sh claude                — Claude Code CLI 모드 (기본 .env)
-#   ./start.sh codex                 — Codex CLI 모드 (기본 .env.multi-agent)
+#   ./start.sh                       — .env의 LLM_PROVIDER 자동 감지, 포그라운드 실행
+#   ./start.sh claude                — Claude Code CLI 모드
+#   ./start.sh codex                 — Codex CLI 모드
 #   ./start.sh [claude|codex] -d     — 백그라운드(데몬) 실행
 #   ./start.sh [claude|codex] stop   — 백그라운드 프로세스 종료
 #   ./start.sh [claude|codex] status — 실행 상태 확인
 #   ./start.sh [claude|codex] logs   — 실시간 로그 보기
+#
+# env 파일: 항상 .env 한 개. (MOMO_ENV_FILE로 다른 파일 지정 가능)
+# 모드별로는 port/pid/log만 분리되어 동시에 두 모드를 나란히 실행할 수 있다.
 #
 set -euo pipefail
 
@@ -59,25 +62,28 @@ fi
 
 MODE="${MODE:-claude}"
 
-# 모드별 기본값. 이미 export된 값이 있으면 그대로 사용.
+# env 파일은 양 모드 공통으로 .env 사용. MOMO_ENV_FILE로 오버라이드 가능.
+export MOMO_ENV_FILE="${MOMO_ENV_FILE:-$APP_DIR/.env}"
+export MOMO_AUTO_MIGRATE="${MOMO_AUTO_MIGRATE:-false}"
+
+# 모드별로 port/pid/log만 분리 — 두 모드를 동시에 띄울 수 있도록.
 case "$MODE" in
     codex)
-        export MOMO_ENV_FILE="${MOMO_ENV_FILE:-$APP_DIR/.env.multi-agent}"
         export MOMO_PORT="${MOMO_PORT:-9200}"
         export MOMO_PID_FILE="${MOMO_PID_FILE:-$APP_DIR/.momo-codex.pid}"
         export MOMO_LOG_FILE="${MOMO_LOG_FILE:-$APP_DIR/logs/momo-trading-codex.log}"
-        export MOMO_AUTO_MIGRATE="${MOMO_AUTO_MIGRATE:-true}"
         MODE_LABEL="Codex CLI"
         ;;
     claude)
-        export MOMO_ENV_FILE="${MOMO_ENV_FILE:-$APP_DIR/.env}"
         export MOMO_PORT="${MOMO_PORT:-9000}"
         export MOMO_PID_FILE="${MOMO_PID_FILE:-$APP_DIR/.momo.pid}"
         export MOMO_LOG_FILE="${MOMO_LOG_FILE:-$APP_DIR/logs/momo-trading.log}"
-        export MOMO_AUTO_MIGRATE="${MOMO_AUTO_MIGRATE:-false}"
         MODE_LABEL="Claude Code"
         ;;
 esac
+
+# 앱이 LLM_PROVIDER 로직에서 모드를 실제로 결정하도록 환경변수로 강제 전달
+export LLM_PROVIDER="${LLM_PROVIDER:-$([ "$MODE" = "codex" ] && echo "CODEX_CLI" || echo "CLAUDE_CODE")}"
 
 PID_FILE="$MOMO_PID_FILE"
 LOG_FILE="$MOMO_LOG_FILE"
@@ -99,7 +105,7 @@ cd "$APP_DIR"
 # env 체크
 if [ ! -f "$ENV_FILE" ]; then
     echo "⚠️  env 파일이 없습니다: $ENV_FILE"
-    echo "   .env.example 또는 .env.multi-agent.example을 참고하세요."
+    echo "   .env.example을 복사해 .env를 구성하세요."
 fi
 
 # 로그/데이터 디렉토리 준비

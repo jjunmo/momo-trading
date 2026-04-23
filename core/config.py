@@ -27,11 +27,7 @@ def _map_effort_for_claude(value: str) -> str:
 
 
 def _resolve_settings_env_file() -> str:
-    """런타임 env 파일 선택.
-
-    기본은 .env이고, multi-agent 실험처럼 별도 env를 쓸 때는
-    MOMO_ENV_FILE=.env.multi-agent 로 지정한다.
-    """
+    """런타임 env 파일 선택. 기본은 .env, 필요 시 MOMO_ENV_FILE로 다른 파일 지정."""
     return os.environ.get("MOMO_ENV_FILE", ".env")
 
 
