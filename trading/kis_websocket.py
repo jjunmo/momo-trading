@@ -182,18 +182,83 @@ class KISWebSocket:
                 task.cancel()
 
     async def _listen_ws(self, ws, ws_type: str) -> None:
-        """개별 WebSocket 메시지 수신"""
+        """개별 WebSocket 메시지 수신 + 단절 시 자동 재연결·재구독"""
+        triggered_reconnect = False
         try:
             async for raw_msg in ws:
                 if not self._running:
                     break
                 await self._handle_message(raw_msg, ws_type, ws)
-        except websockets.ConnectionClosed:
-            logger.warning("{} WebSocket 연결 끊김, 재연결 시도...", ws_type)
+        except websockets.ConnectionClosed as e:
+            code = getattr(e, "code", None)
+            reason = getattr(e, "reason", "") or ""
+            logger.warning("{} WebSocket 연결 끊김 (code={}, reason={}) → 재연결 예정",
+                           ws_type, code, reason[:80])
             if self._running:
-                await asyncio.sleep(self._reconnect_delay)
+                triggered_reconnect = True
+                asyncio.create_task(self._reconnect_and_resubscribe(ws_type))
+        except asyncio.CancelledError:
+            # listen 루프의 task.cancel()에 의한 정상 취소 — 재연결 트리거 금지
+            logger.debug("{} _listen_ws 취소됨 (정상)", ws_type)
+            raise
         except Exception as e:
-            logger.error("{} WebSocket 오류: {}", ws_type, str(e))
+            logger.error("{} WebSocket 오류: {} — 재연결 예정", ws_type, str(e)[:120])
+            if self._running:
+                triggered_reconnect = True
+                asyncio.create_task(self._reconnect_and_resubscribe(ws_type))
+        finally:
+            logger.debug("{} _listen_ws 종료 (reconnect 트리거={})", ws_type, triggered_reconnect)
+
+    async def _reconnect_and_resubscribe(self, ws_type: str) -> None:
+        """단절된 WS 정리 → approval_key 갱신 → 기존 구독 복원"""
+        logger.info("{} WebSocket 재연결 시작 ({}초 대기 후)", ws_type, self._reconnect_delay)
+        await asyncio.sleep(self._reconnect_delay)
+        if not self._running:
+            logger.debug("{} 재연결 중단 (_running=False)", ws_type)
+            return
+
+        try:
+            # 1. 기존 ws 레퍼런스 정리 + 해당 시장 구독 키 추출
+            if ws_type == "domestic":
+                old_ws = self._ws_domestic
+                self._ws_domestic = None
+                to_resub = [k for k in list(self._subscriptions)
+                            if k.split(":", 1)[0] in ("KOSPI", "KOSDAQ", "KRX", "NXT")]
+            else:
+                old_ws = self._ws_overseas
+                self._ws_overseas = None
+                to_resub = [k for k in list(self._subscriptions)
+                            if k.split(":", 1)[0] not in ("KOSPI", "KOSDAQ", "KRX", "NXT")]
+
+            if old_ws is not None:
+                try:
+                    await old_ws.close()
+                except Exception:
+                    pass
+
+            # 2. approval_key 갱신 (TTL 만료 가능성)
+            await self._get_approval_key()
+
+            # 3. 재구독 (subscribe()가 _get_ws()에서 새 WS 생성)
+            if not to_resub:
+                logger.warning("{} 재구독 대상 없음 — 기존 구독이 없어 WebSocket 재생성 안 됨. "
+                               "보유종목 있는데 이 로그가 보이면 subscribe 호출 경로를 확인하세요.", ws_type)
+                return
+
+            # 기존 구독 set에서 제거 후 subscribe()가 다시 추가
+            for key in to_resub:
+                self._subscriptions.discard(key)
+
+            restored = 0
+            for key in to_resub:
+                market, symbol = key.split(":", 1)
+                if await self.subscribe(symbol, market):
+                    restored += 1
+
+            logger.info("{} WebSocket 재연결 완료: {}/{} 재구독",
+                        ws_type, restored, len(to_resub))
+        except Exception as e:
+            logger.error("{} WebSocket 재연결 실패: {}", ws_type, str(e)[:120])
 
     async def _handle_message(self, raw_msg: str, ws_type: str, ws) -> None:
         """수신된 메시지 처리"""

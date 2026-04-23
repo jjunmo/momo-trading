@@ -96,8 +96,9 @@ class SellAgent(BaseAgent):
                         exit_reason=params.exit_reason,
                     )
                 )
-                from agent.market_scanner import market_scanner
-                market_scanner.add_untradeable(params.symbol)
+                # NOTE: 이전에 여기서 `market_scanner.add_untradeable(params.symbol)`를
+                # 무조건 호출했음 → 매도한 종목이 영구 블록되어 재매수 불가 (버그).
+                # 매매불가 블록은 decision_maker에서 실제 에러 메시지 기반으로만 수행.
                 return True
             else:
                 # 실패 → 임계값 복원

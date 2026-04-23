@@ -36,9 +36,34 @@ class RealtimeMonitor:
         self._last_ws_data_time = time.monotonic()
         kis_websocket.set_on_price(self._on_price_update)
         await stream_manager.start()
+
+        # 서버 재시작 복원 — 보유종목을 WebSocket 구독에 추가
+        # 이게 없으면 WebSocket이 lazy 생성이라 buy/cycle 전까지 연결 안 됨.
+        try:
+            await self._subscribe_current_holdings()
+        except Exception as e:
+            logger.warning("보유종목 초기 구독 실패 (다음 사이클에서 재시도): {}", str(e)[:100])
+
         # WebSocket 상태 점검 루프 시작
         self._health_task = asyncio.create_task(self._ws_health_loop())
         logger.debug("실시간 모니터 시작 (폴링 폴백 대기)")
+
+    async def _subscribe_current_holdings(self) -> None:
+        """현재 보유종목을 WebSocket에 구독 등록 — 서버 시작 시 1회"""
+        from scheduler.market_calendar import market_calendar
+        from trading.account_manager import account_manager
+
+        holdings = await account_manager.get_holdings()
+        sellable = [h for h in holdings if h.quantity > 0]
+        if not sellable:
+            logger.debug("보유종목 없음 — WebSocket 구독 skip (필요 시 매수·사이클에서 자동 구독)")
+            return
+
+        market = market_calendar.get_active_market() or "KRX"
+        symbols = [(h.symbol, market) for h in sellable]
+        await stream_manager.subscribe_symbols(symbols)
+        logger.info("서버 시작 — 보유종목 {}건 WebSocket 구독 등록 (market={})",
+                    len(sellable), market)
 
     async def stop(self) -> None:
         """실시간 모니터링 중지"""
@@ -98,6 +123,14 @@ class RealtimeMonitor:
                     self._polling_active = True
                     if self._poll_task is None or self._poll_task.done():
                         self._poll_task = asyncio.create_task(self._poll_loop())
+
+                # WS 재연결 성공 + 데이터 수신 정상 → 폴링 비활성화 (중복 조회 방지)
+                elif not ws_disconnected and not data_stale and self._polling_active and not nxt_only:
+                    logger.info("WebSocket 재연결 감지 → 폴링 폴백 비활성화")
+                    self._polling_active = False
+                    if self._poll_task and not self._poll_task.done():
+                        self._poll_task.cancel()
+                        self._poll_task = None
 
             except asyncio.CancelledError:
                 break
