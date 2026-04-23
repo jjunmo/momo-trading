@@ -1,9 +1,38 @@
+import os
+import shutil
+from pathlib import Path
+
 from loguru import logger
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from trading.enums import LLMProvider, LLMTier
+
+
+VALID_CODEX_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+VALID_CLAUDE_REASONING_EFFORTS = {"low", "medium", "high"}
+
+
+def _map_effort_for_claude(value: str) -> str:
+    """Codex-range 값(low/medium/high/xhigh)을 Claude가 받는 low/medium/high로 매핑."""
+    v = (value or "").strip().lower()
+    if not v:
+        return "medium"
+    if v == "xhigh":
+        logger.debug("Claude effort: xhigh → high 매핑")
+        return "high"
+    if v in VALID_CLAUDE_REASONING_EFFORTS:
+        return v
+    logger.warning("알 수 없는 effort={} — Claude에서 high로 대체", value)
+    return "high"
+
+
+def _resolve_settings_env_file() -> str:
+    """런타임 env 파일 선택. 기본은 .env, 필요 시 MOMO_ENV_FILE로 다른 파일 지정."""
+    return os.environ.get("MOMO_ENV_FILE", ".env")
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True)
+    model_config = SettingsConfigDict(env_ignore_empty=True, extra="ignore")
 
     APP_NAME: str = "momo-trading"
     APP_VERSION: str = "0.1.0"
@@ -31,11 +60,32 @@ class Settings(BaseSettings):
     KIS_WS_URL_DOMESTIC: str = "ws://ops.koreainvestment.com:21000"
     KIS_WS_URL_OVERSEAS: str = "ws://ops.koreainvestment.com:31000"
 
-    # === AI / LLM (Claude Code CLI — 구독 크레딧 사용) ===
+    # === AI / LLM ===
+    LLM_PROVIDER: str = LLMProvider.CLAUDE_CODE.value  # CLAUDE_CODE / CODEX_CLI
+
+    # Claude Code CLI — 구독 크레딧 사용
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
     CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
+    CLAUDE_CODE_MODEL_ORCHESTRATOR: str = ""  # 오케스트레이터 전용 (빈값 시 TIER2 모델 사용)
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
+
+    # 공통 추론 강도 — 두 provider가 동일한 설정을 사용. Claude는 xhigh를 high로 자동 매핑.
+    LLM_EFFORT_TIER1: str = ""  # 비우면 CODEX_REASONING_EFFORT_TIER1 또는 "medium"
+    LLM_EFFORT_TIER2: str = ""  # 비우면 CODEX_REASONING_EFFORT_TIER2 또는 "high"
+    LLM_EFFORT_ORCHESTRATOR: str = ""  # 비우면 CODEX_REASONING_EFFORT_ORCHESTRATOR 또는 "high"
+
+    # Codex CLI
+    CODEX_MODEL: str = "gpt-5.4"  # 기본 모델 (Tier별 미지정 시 사용)
+    CODEX_MODEL_TIER1: str = "gpt-5.4-mini"  # Tier1 (스캔/분석): 빠른 모델
+    CODEX_MODEL_TIER2: str = "gpt-5.4"  # Tier2 (최종 검토): 정확한 모델
+    CODEX_MODEL_ORCHESTRATOR: str = "gpt-5.4"  # 오케스트레이터 전용
+    CODEX_REASONING_EFFORT: str = ""  # 공통 fallback
+    CODEX_REASONING_EFFORT_TIER1: str = "medium"
+    CODEX_REASONING_EFFORT_TIER2: str = "high"
+    CODEX_REASONING_EFFORT_ORCHESTRATOR: str = "xhigh"
+    CODEX_CLI_PATH: str = ""  # 비어있으면 PATH 자동 탐색
+    CODEX_DISABLE_MCP: bool = True  # 자동매매 LLM 호출에서는 사용자 Codex MCP 설정 차단
 
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
@@ -92,15 +142,104 @@ class Settings(BaseSettings):
     def is_paper_trading(self) -> bool:
         return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
 
+    @property
+    def llm_provider(self) -> LLMProvider:
+        """선택된 LLM provider enum."""
+        raw = (self.LLM_PROVIDER or LLMProvider.CLAUDE_CODE.value).strip().upper()
+        try:
+            return LLMProvider(raw)
+        except ValueError:
+            logger.warning("알 수 없는 LLM_PROVIDER={} — CLAUDE_CODE로 대체", self.LLM_PROVIDER)
+            return LLMProvider.CLAUDE_CODE
+
+    @property
+    def runtime_env_file(self) -> str:
+        return _resolve_settings_env_file()
+
+    def get_llm_model(self, provider: LLMProvider, tier: LLMTier) -> str:
+        """provider/tier별 모델명. env 값이 있으면 우선, 없으면 내장 기본값."""
+        if provider == LLMProvider.CODEX_CLI:
+            if tier == LLMTier.TIER1:
+                return self.CODEX_MODEL_TIER1 or self.CODEX_MODEL or "gpt-5.4-mini"
+            return self.CODEX_MODEL_TIER2 or self.CODEX_MODEL or "gpt-5.4"
+
+        if tier == LLMTier.TIER1:
+            return self.CLAUDE_CODE_MODEL_TIER1 or self.CLAUDE_CODE_MODEL or "haiku"
+        return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
+
+    def get_llm_reasoning_effort(self, provider: LLMProvider, tier: LLMTier) -> str:
+        """provider/tier별 추론 강도.
+
+        공통 LLM_EFFORT_* → 레거시 CODEX_REASONING_EFFORT_* → 기본값 순.
+        기본값: Tier1=medium, Tier2=xhigh (Claude는 xhigh→high 매핑).
+        """
+        if tier == LLMTier.TIER1:
+            resolved = self._resolve_shared_effort(
+                self.LLM_EFFORT_TIER1,
+                self.CODEX_REASONING_EFFORT_TIER1 or self.CODEX_REASONING_EFFORT,
+                fallback="medium",
+            )
+        else:
+            resolved = self._resolve_shared_effort(
+                self.LLM_EFFORT_TIER2,
+                self.CODEX_REASONING_EFFORT_TIER2 or self.CODEX_REASONING_EFFORT,
+                fallback="xhigh",
+            )
+        if provider == LLMProvider.CLAUDE_CODE:
+            return _map_effort_for_claude(resolved)
+        return resolved
+
+    def get_orchestrator_llm_model_for_provider(self, provider: LLMProvider) -> str:
+        if provider == LLMProvider.CODEX_CLI:
+            return self.CODEX_MODEL_ORCHESTRATOR or self.CODEX_MODEL or "gpt-5.4"
+        return (
+            self.CLAUDE_CODE_MODEL_ORCHESTRATOR
+            or self.CLAUDE_CODE_MODEL_TIER2
+            or self.CLAUDE_CODE_MODEL
+            or "sonnet"
+        )
+
+    def get_orchestrator_llm_reasoning_effort_for_provider(self, provider: LLMProvider) -> str:
+        resolved = self._resolve_shared_effort(
+            self.LLM_EFFORT_ORCHESTRATOR,
+            self.CODEX_REASONING_EFFORT_ORCHESTRATOR,
+            fallback="xhigh",
+        )
+        if provider == LLMProvider.CLAUDE_CODE:
+            return _map_effort_for_claude(resolved)
+        return resolved
+
+    def _resolve_shared_effort(
+        self, primary: str, legacy: str, *, fallback: str
+    ) -> str:
+        """공통 env(primary) → 레거시 Codex env(legacy) → fallback 순으로 값을 선택."""
+        for candidate in (primary, legacy):
+            v = (candidate or "").strip().lower()
+            if not v:
+                continue
+            if v not in VALID_CODEX_REASONING_EFFORTS:
+                logger.warning("잘못된 reasoning effort={} — {}로 대체", candidate, fallback)
+                return fallback
+            return v
+        return fallback
+
+    def get_llm_cli_path(self, provider: LLMProvider) -> str | None:
+        if provider == LLMProvider.CODEX_CLI:
+            return self._find_codex_path()
+        return self._find_claude_path()
+
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
-        claude_path = self._find_claude_path()
-        if claude_path:
-            logger.debug("Claude Code CLI 감지: {} — CLAUDE_CODE 프로바이더 사용", claude_path)
+        self._validate_codex_reasoning_efforts()
+
+        provider = self.llm_provider
+        cli_path = self.get_llm_cli_path(provider)
+        if cli_path:
+            logger.debug("{} CLI 감지: {}", provider.value, cli_path)
         else:
             logger.warning(
-                "Claude Code CLI를 찾을 수 없음. "
-                "CLAUDE_CODE_PATH를 설정하거나 claude CLI를 설치하세요."
+                "{} CLI를 찾을 수 없음. CLI PATH 설정 또는 설치 상태를 확인하세요.",
+                provider.value,
             )
 
         if not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
@@ -112,11 +251,8 @@ class Settings(BaseSettings):
         if not self.TRADING_ENABLED:
             logger.debug("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")
 
-
     def _find_claude_path(self) -> str | None:
         """claude CLI 경로 탐색 (설정값 → PATH → 일반적 설치 경로)"""
-        import os
-        import shutil
         if self.CLAUDE_CODE_PATH:
             return self.CLAUDE_CODE_PATH
         path = shutil.which("claude")
@@ -132,5 +268,42 @@ class Settings(BaseSettings):
                 return candidate
         return None
 
+    def _find_codex_path(self) -> str | None:
+        """codex CLI 경로 탐색 (설정값 → PATH → 일반적 설치 경로)"""
+        if self.CODEX_CLI_PATH:
+            return self.CODEX_CLI_PATH
+        path = shutil.which("codex")
+        if path:
+            return path
+        for candidate in [
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            str(Path.home() / ".local/bin/codex"),
+            str(Path.home() / ".npm-global/bin/codex"),
+        ]:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
 
-settings = Settings()
+    def _parse_codex_reasoning_effort(self, value: str, *, fallback: str) -> str:
+        effort = (value or "").strip().lower()
+        if not effort:
+            return fallback
+        if effort not in VALID_CODEX_REASONING_EFFORTS:
+            logger.warning("잘못된 Codex reasoning effort={} — {}로 대체", value, fallback)
+            return fallback
+        return effort
+
+    def _validate_codex_reasoning_efforts(self) -> None:
+        for key, fallback in [
+            ("LLM_EFFORT_TIER1", "medium"),
+            ("LLM_EFFORT_TIER2", "high"),
+            ("LLM_EFFORT_ORCHESTRATOR", "high"),
+            ("CODEX_REASONING_EFFORT_TIER1", "medium"),
+            ("CODEX_REASONING_EFFORT_TIER2", "high"),
+            ("CODEX_REASONING_EFFORT_ORCHESTRATOR", "xhigh"),
+        ]:
+            self._parse_codex_reasoning_effort(getattr(self, key, ""), fallback=fallback)
+
+
+settings = Settings(_env_file=_resolve_settings_env_file())
