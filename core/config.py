@@ -9,6 +9,21 @@ from trading.enums import LLMProvider, LLMTier
 
 
 VALID_CODEX_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+VALID_CLAUDE_REASONING_EFFORTS = {"low", "medium", "high"}
+
+
+def _map_effort_for_claude(value: str) -> str:
+    """Codex-range 값(low/medium/high/xhigh)을 Claude가 받는 low/medium/high로 매핑."""
+    v = (value or "").strip().lower()
+    if not v:
+        return "medium"
+    if v == "xhigh":
+        logger.debug("Claude effort: xhigh → high 매핑")
+        return "high"
+    if v in VALID_CLAUDE_REASONING_EFFORTS:
+        return v
+    logger.warning("알 수 없는 effort={} — Claude에서 high로 대체", value)
+    return "high"
 
 
 def _resolve_settings_env_file() -> str:
@@ -56,7 +71,13 @@ class Settings(BaseSettings):
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
     CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
+    CLAUDE_CODE_MODEL_ORCHESTRATOR: str = ""  # 오케스트레이터 전용 (빈값 시 TIER2 모델 사용)
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
+
+    # 공통 추론 강도 — 두 provider가 동일한 설정을 사용. Claude는 xhigh를 high로 자동 매핑.
+    LLM_EFFORT_TIER1: str = ""  # 비우면 CODEX_REASONING_EFFORT_TIER1 또는 "medium"
+    LLM_EFFORT_TIER2: str = ""  # 비우면 CODEX_REASONING_EFFORT_TIER2 또는 "high"
+    LLM_EFFORT_ORCHESTRATOR: str = ""  # 비우면 CODEX_REASONING_EFFORT_ORCHESTRATOR 또는 "high"
 
     # Codex CLI
     CODEX_MODEL: str = "gpt-5.4"  # 기본 모델 (Tier별 미지정 시 사용)
@@ -140,7 +161,7 @@ class Settings(BaseSettings):
         return _resolve_settings_env_file()
 
     def get_llm_model(self, provider: LLMProvider, tier: LLMTier) -> str:
-        """provider/tier별 모델명."""
+        """provider/tier별 모델명. env 값이 있으면 우선, 없으면 내장 기본값."""
         if provider == LLMProvider.CODEX_CLI:
             if tier == LLMTier.TIER1:
                 return self.CODEX_MODEL_TIER1 or self.CODEX_MODEL or "gpt-5.4-mini"
@@ -151,31 +172,60 @@ class Settings(BaseSettings):
         return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
 
     def get_llm_reasoning_effort(self, provider: LLMProvider, tier: LLMTier) -> str:
-        """provider/tier별 추론 강도. Claude는 provider 내부 기본값을 사용."""
-        if provider != LLMProvider.CODEX_CLI:
-            return ""
+        """provider/tier별 추론 강도.
+
+        공통 LLM_EFFORT_* → 레거시 CODEX_REASONING_EFFORT_* → 기본값 순.
+        기본값: Tier1=medium, Tier2=xhigh (Claude는 xhigh→high 매핑).
+        """
         if tier == LLMTier.TIER1:
-            return self._parse_codex_reasoning_effort(
-                self.CODEX_REASONING_EFFORT_TIER1 or self.CODEX_REASONING_EFFORT or "medium",
+            resolved = self._resolve_shared_effort(
+                self.LLM_EFFORT_TIER1,
+                self.CODEX_REASONING_EFFORT_TIER1 or self.CODEX_REASONING_EFFORT,
                 fallback="medium",
             )
-        return self._parse_codex_reasoning_effort(
-            self.CODEX_REASONING_EFFORT_TIER2 or self.CODEX_REASONING_EFFORT or "high",
-            fallback="high",
-        )
+        else:
+            resolved = self._resolve_shared_effort(
+                self.LLM_EFFORT_TIER2,
+                self.CODEX_REASONING_EFFORT_TIER2 or self.CODEX_REASONING_EFFORT,
+                fallback="xhigh",
+            )
+        if provider == LLMProvider.CLAUDE_CODE:
+            return _map_effort_for_claude(resolved)
+        return resolved
 
     def get_orchestrator_llm_model_for_provider(self, provider: LLMProvider) -> str:
         if provider == LLMProvider.CODEX_CLI:
             return self.CODEX_MODEL_ORCHESTRATOR or self.CODEX_MODEL or "gpt-5.4"
-        return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
+        return (
+            self.CLAUDE_CODE_MODEL_ORCHESTRATOR
+            or self.CLAUDE_CODE_MODEL_TIER2
+            or self.CLAUDE_CODE_MODEL
+            or "sonnet"
+        )
 
     def get_orchestrator_llm_reasoning_effort_for_provider(self, provider: LLMProvider) -> str:
-        if provider != LLMProvider.CODEX_CLI:
-            return ""
-        return self._parse_codex_reasoning_effort(
-            self.CODEX_REASONING_EFFORT_ORCHESTRATOR or "xhigh",
+        resolved = self._resolve_shared_effort(
+            self.LLM_EFFORT_ORCHESTRATOR,
+            self.CODEX_REASONING_EFFORT_ORCHESTRATOR,
             fallback="xhigh",
         )
+        if provider == LLMProvider.CLAUDE_CODE:
+            return _map_effort_for_claude(resolved)
+        return resolved
+
+    def _resolve_shared_effort(
+        self, primary: str, legacy: str, *, fallback: str
+    ) -> str:
+        """공통 env(primary) → 레거시 Codex env(legacy) → fallback 순으로 값을 선택."""
+        for candidate in (primary, legacy):
+            v = (candidate or "").strip().lower()
+            if not v:
+                continue
+            if v not in VALID_CODEX_REASONING_EFFORTS:
+                logger.warning("잘못된 reasoning effort={} — {}로 대체", candidate, fallback)
+                return fallback
+            return v
+        return fallback
 
     def get_llm_cli_path(self, provider: LLMProvider) -> str | None:
         if provider == LLMProvider.CODEX_CLI:
@@ -250,6 +300,9 @@ class Settings(BaseSettings):
 
     def _validate_codex_reasoning_efforts(self) -> None:
         for key, fallback in [
+            ("LLM_EFFORT_TIER1", "medium"),
+            ("LLM_EFFORT_TIER2", "high"),
+            ("LLM_EFFORT_ORCHESTRATOR", "high"),
             ("CODEX_REASONING_EFFORT_TIER1", "medium"),
             ("CODEX_REASONING_EFFORT_TIER2", "high"),
             ("CODEX_REASONING_EFFORT_ORCHESTRATOR", "xhigh"),

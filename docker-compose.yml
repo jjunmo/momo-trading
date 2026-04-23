@@ -14,7 +14,10 @@ services:
       - KIS_CANO=${KIS_ACCT_STOCK}
       - KIS_PAPER_CANO=${KIS_PAPER_STOCK}
       - KIS_ACCOUNT_TYPE=${KIS_ACCOUNT_TYPE:-VIRTUAL}
+      - KIS_TOKEN_DIR=/app/data
       - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
     logging:
       driver: json-file
       options:

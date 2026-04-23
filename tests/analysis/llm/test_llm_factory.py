@@ -143,6 +143,27 @@ async def test_factory_falls_back_to_claude_when_codex_fails(monkeypatch):
     assert claude.calls == [(LLMTier.TIER2, "prompt", "")]
 
 
+@pytest.mark.asyncio
+async def test_factory_falls_back_to_codex_when_claude_fails(monkeypatch):
+    """양방향 폴백 — Claude 선택 + Claude 실패 → Codex 폴백."""
+    codex = make_dummy_provider(LLMProvider.CODEX_CLI, response="codex-ok")
+    claude = make_dummy_provider(LLMProvider.CLAUDE_CODE, response="", fail=True)
+
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "CLAUDE_CODE")
+    monkeypatch.setattr(LLMFactory, "_provider_classes", {
+        LLMProvider.CLAUDE_CODE: claude,
+        LLMProvider.CODEX_CLI: codex,
+    })
+
+    factory = LLMFactory()
+    result, provider = await factory.generate_tier1("prompt", "sys")
+
+    assert result == "codex-ok"
+    assert provider == "CODEX_CLI"
+    assert len(claude.calls) == 3  # 세션→새세션→stateless
+    assert codex.calls == [(LLMTier.TIER1, "prompt", "sys")]
+
+
 def test_factory_session_methods_delegate_to_selected_provider(monkeypatch):
     codex = make_dummy_provider(LLMProvider.CODEX_CLI, response="codex-ok")
     claude = make_dummy_provider(LLMProvider.CLAUDE_CODE, response="claude-ok")

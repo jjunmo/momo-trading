@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir httpx "mcp[cli]" xmltodict python-dotenv fastmcp
 RUN sed -i 's/from mcp.server.fastmcp.server import FastMCP/from fastmcp import FastMCP/' /app/server.py \
     && sed -i 's/FastMCP("KIS MCP Server", dependencies=\[.*\])/FastMCP("KIS MCP Server")/' /app/server.py
 
+# 토큰 캐시를 계좌 유형별로 분리하고 EGW00123 발생 시 자동 재발급/재시도
+COPY server_patch.py /tmp/server_patch.py
+RUN python /tmp/server_patch.py
+
 # httpcore/httpx DEBUG 로그 억제 entrypoint
 COPY entrypoint.py /app/entrypoint.py
 

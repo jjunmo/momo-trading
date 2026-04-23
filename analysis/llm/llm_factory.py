@@ -21,7 +21,7 @@ class LLMFactory:
 
     - Tier 1: 스캔/선별/빠른 분석
     - Tier 2: 최종 검토/매매 판단
-    - 선택 provider가 CODEX_CLI이고 실패하면 Claude Code를 폴백으로 시도
+    - 선택 provider가 실패하면 반대 provider로 자동 폴백 (양방향 대칭)
     """
 
     _provider_classes: dict[LLMProvider, ProviderClass] = {
@@ -31,10 +31,11 @@ class LLMFactory:
 
     def __init__(self):
         self._selected_provider = settings.llm_provider
+        self._fallback_provider = self._pick_fallback(self._selected_provider)
         self._providers = self._build_providers(self._selected_provider)
         self._fallback_providers = (
-            self._build_providers(LLMProvider.CLAUDE_CODE)
-            if self._selected_provider != LLMProvider.CLAUDE_CODE
+            self._build_providers(self._fallback_provider)
+            if self._fallback_provider is not None
             else {}
         )
 
@@ -42,6 +43,14 @@ class LLMFactory:
         self._last_error: str = ""
         self._last_failure_at: float = 0.0
         self._alert_sent: bool = False
+
+    @staticmethod
+    def _pick_fallback(selected: LLMProvider) -> LLMProvider | None:
+        """선택된 provider의 반대편을 폴백으로. 매핑에 없으면 None."""
+        for candidate in LLMProvider:
+            if candidate != selected:
+                return candidate
+        return None
 
     def _build_providers(self, provider: LLMProvider) -> dict[LLMTier, ProviderInstance]:
         provider_cls = self._provider_classes[provider]
@@ -82,11 +91,15 @@ class LLMFactory:
             primary_summary = f"{type(primary_error).__name__}: {str(primary_error)[:200]}"
             logger.warning("{} 1차 provider 실패: {}", self._selected_provider.value, primary_summary)
 
-            if self._fallback_providers:
+            if self._fallback_providers and self._fallback_provider is not None:
+                fallback_name = self._fallback_provider
                 try:
-                    logger.warning("{} 실패 → CLAUDE_CODE 폴백 시도", self._selected_provider.value)
+                    logger.warning(
+                        "{} 실패 → {} 폴백 시도",
+                        self._selected_provider.value, fallback_name.value,
+                    )
                     result = await self._generate_with_provider(
-                        provider_name=LLMProvider.CLAUDE_CODE,
+                        provider_name=fallback_name,
                         providers=self._fallback_providers,
                         prompt=prompt,
                         tier=tier,
@@ -98,7 +111,10 @@ class LLMFactory:
                     return result
                 except Exception as fallback_error:
                     fallback_summary = f"{type(fallback_error).__name__}: {str(fallback_error)[:200]}"
-                    error_summary = f"{self._selected_provider.value}: {primary_summary} | CLAUDE_CODE: {fallback_summary}"
+                    error_summary = (
+                        f"{self._selected_provider.value}: {primary_summary} | "
+                        f"{fallback_name.value}: {fallback_summary}"
+                    )
                     await self._on_failure(error_summary)
                     raise RuntimeError(f"LLM provider 연결 불가: {error_summary}") from fallback_error
 

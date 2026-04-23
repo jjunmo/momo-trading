@@ -7,7 +7,6 @@ Codex CLI는 임의 session id를 미리 지정할 수 없으므로, start_sessi
 import asyncio
 import json
 import os
-import signal
 import tempfile
 import time
 from collections import defaultdict
@@ -15,6 +14,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from analysis.llm._process_utils import terminate_process_group
 from core.config import settings
 from trading.enums import LLMProvider, LLMTier
 
@@ -225,10 +225,10 @@ class CodexCLIProvider:
                 timeout=300.0,
             )
         except asyncio.TimeoutError:
-            await self._terminate_process_group(proc, force=True)
+            await terminate_process_group(proc, force=True)
             raise RuntimeError("Codex CLI 응답 시간 초과 (300초)")
         except asyncio.CancelledError:
-            await self._terminate_process_group(proc, force=True)
+            await terminate_process_group(proc, force=True)
             raise
 
         raw_stdout = stdout.decode("utf-8", errors="replace")
@@ -250,38 +250,6 @@ class CodexCLIProvider:
 
         self._track_usage(events["usage"])
         return result_text
-
-    @staticmethod
-    async def _terminate_process_group(proc: asyncio.subprocess.Process, *, force: bool) -> None:
-        """Codex wrapper와 native child를 함께 종료."""
-        if proc.returncode is not None:
-            return
-
-        try:
-            pgid = os.getpgid(proc.pid)
-        except ProcessLookupError:
-            return
-
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        if force:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                logger.warning("Codex CLI 프로세스 강제 종료 대기 실패: pid={}", proc.pid)
 
     @staticmethod
     def _read_output_file(output_path: str) -> str:
