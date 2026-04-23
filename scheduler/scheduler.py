@@ -17,6 +17,8 @@
 ※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
 ※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
+import asyncio
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
 
@@ -543,12 +545,24 @@ class TradingScheduler:
             from realtime.event_detector import event_detector
             from trading.account_manager import account_manager
 
+            from agent.market_scanner import market_scanner
+
             holdings = await account_manager.get_holdings()
-            sellable = [h for h in holdings if h.quantity > 0]
+            all_sellable = [h for h in holdings if h.quantity > 0]
+            # KRX-only만 선별 (NXT-tradeable은 19:45 _nxt_close에서 처리)
+            sellable = [h for h in all_sellable if h.symbol in market_scanner._untradeable_symbols]
+            deferred = [h for h in all_sellable if h.symbol not in market_scanner._untradeable_symbols]
+
+            if deferred:
+                logger.info(
+                    "[15:15 청산] NXT-tradeable {}건은 19:45 NXT 마감 전 처리로 이월: {}",
+                    len(deferred), ', '.join(h.symbol for h in deferred[:5]),
+                )
+
             if not sellable:
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                    "\u2705 보유종목 없음 — 청산 불필요",
+                    f"\u2705 KRX-only 보유종목 없음 — 청산 불필요 (NXT 이월 {len(deferred)}건)",
                 )
                 return
 
@@ -914,33 +928,38 @@ class TradingScheduler:
             logger.info("[재평가] {}건 실행 (시간대기 {}건, 조용 skip {}건)",
                         len(due_holdings), len(skipped), len(quiet_pushed))
 
-            log_lines = []
-            for h in due_holdings:
+            # 병렬 실행 — Semaphore(3)으로 동시 분석 제한.
+            # 순차 루프는 3건만 되어도 3분 cron 초과 → max_instances 경고 발생.
+            semaphore = asyncio.Semaphore(3)
+
+            async def _analyze_and_route(h) -> str:
+                th_local = event_detector.get_thresholds(h.symbol)
+                request = StockAnalysisRequest(
+                    symbol=h.symbol,
+                    name=h.name or h.symbol,
+                    is_holding=True,
+                    purpose="PERIODIC_REVIEW",
+                    avg_price=h.avg_buy_price,
+                    pnl_rate=h.pnl_rate,
+                    quantity=h.quantity,
+                    active_stop_loss=th_local.stop_loss,
+                    active_take_profit=th_local.take_profit,
+                    active_trailing_stop_pct=th_local.trailing_stop_pct,
+                )
                 try:
-                    th = event_detector.get_thresholds(h.symbol)
-                    request = StockAnalysisRequest(
-                        symbol=h.symbol,
-                        name=h.name or h.symbol,
-                        is_holding=True,
-                        purpose="PERIODIC_REVIEW",
-                        avg_price=h.avg_buy_price,
-                        pnl_rate=h.pnl_rate,
-                        quantity=h.quantity,
-                        active_stop_loss=th.stop_loss,
-                        active_take_profit=th.take_profit,
-                        active_trailing_stop_pct=th.trailing_stop_pct,
-                    )
-                    result = await stock_analysis_agent.analyze(request, force=True)
-                    if not result.success:
-                        log_lines.append(f"  - {h.name}({h.symbol}): 분석 실패")
-                        continue
+                    async with semaphore:
+                        result = await stock_analysis_agent.analyze(request, force=True)
+                except Exception as e:
+                    return f"  - {h.symbol}: 오류 {str(e)[:50]}"
 
-                    # 재평가 완료 → 누적 변동 초기화 (다음 주기는 새 누적으로 시작)
-                    event_detector.reset_movement_score(h.symbol)
+                if not result.success:
+                    return f"  - {h.name}({h.symbol}): 분석 실패"
 
-                    # 임계값은 StockAnalysisAgent가 분석 시 직접 설정
-                    rec = result.recommendation
-                    if rec == "BUY":
+                event_detector.reset_movement_score(h.symbol)
+
+                rec = result.recommendation
+                if rec == "BUY":
+                    try:
                         await buy_agent.execute(BuyParams(
                             symbol=h.symbol, name=h.name or h.symbol,
                             strategy_type="STABLE_SHORT", price=result.current_price,
@@ -952,15 +971,19 @@ class TradingScheduler:
                             review_threshold_pct=result.review_threshold_pct,
                             review_interval_min=result.review_interval_min,
                         ))
-                        log_lines.append(f"  - {h.name}({h.symbol}): ADD_BUY")
-                    elif rec == "SELL":
+                    except Exception as e:
+                        return f"  - {h.symbol}: BUY 실행 오류 {str(e)[:50]}"
+                    return f"  - {h.name}({h.symbol}): ADD_BUY"
+                elif rec == "SELL":
+                    try:
                         await sell_agent.execute_sell(SellParams(symbol=h.symbol, exit_reason="HOLDINGS_REVIEW"))
-                        log_lines.append(f"  - {h.name}({h.symbol}): SELL")
-                    else:
-                        log_lines.append(f"  - {h.name}({h.symbol}): HOLD")
+                    except Exception as e:
+                        return f"  - {h.symbol}: SELL 실행 오류 {str(e)[:50]}"
+                    return f"  - {h.name}({h.symbol}): SELL"
+                else:
+                    return f"  - {h.name}({h.symbol}): HOLD"
 
-                except Exception as e:
-                    log_lines.append(f"  - {h.symbol}: 오류 {str(e)[:50]}")
+            log_lines = await asyncio.gather(*[_analyze_and_route(h) for h in due_holdings])
 
             if log_lines:
                 await activity_logger.log(
@@ -1171,7 +1194,13 @@ class TradingScheduler:
             logger.error("NXT 애프터 재스캔 오류: {}", str(e))
 
     async def _nxt_close(self) -> None:
-        """NXT 마감 전 포지션 정리 (19:45)"""
+        """NXT 마감 전 포지션 정리 (19:45) — NXT-tradeable 종목 오버나이트 판정
+
+        15:15 `_force_liquidation`에서 이월된 NXT-tradeable 종목들을 이제 최종 판정.
+        KRX_ONLY는 이미 15:15에서 처리됨 → 여기선 제외.
+
+        hold_strategy 기반: OVERNIGHT → 보유 / DAY_CLOSE (또는 분석 실패) → 매도.
+        """
         from scheduler.market_calendar import market_calendar
         if not market_calendar.is_nxt_after_market():
             return
@@ -1179,22 +1208,54 @@ class TradingScheduler:
             return
         logger.info("=== NXT 마감 전 포지션 정리 ===")
         try:
+            from agent.market_scanner import market_scanner
             from agent.sell_agent import SellParams, sell_agent
             from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
+            from realtime.event_detector import event_detector
             from trading.account_manager import account_manager
 
             holdings = await account_manager.get_holdings()
-            for h in [h for h in holdings if h.quantity > 0]:
-                # AI 분석으로 마감 전 매도 판단
-                request = StockAnalysisRequest(
-                    symbol=h.symbol, name=h.name,
-                    is_holding=True, purpose="PERIODIC_REVIEW",
-                )
-                result = await stock_analysis_agent.analyze(request, force=True)
-                if result and result.recommendation == "SELL":
-                    await sell_agent.execute_sell(SellParams(
-                        symbol=h.symbol, exit_reason="NXT_CLOSE",
-                    ))
+            all_sellable = [h for h in holdings if h.quantity > 0]
+            # NXT-tradeable만 (KRX_ONLY는 15:15에 이미 처리)
+            sellable = [h for h in all_sellable if h.symbol not in market_scanner._untradeable_symbols]
+            if not sellable:
+                logger.info("[19:45 NXT 마감] NXT-tradeable 보유 종목 없음")
+                return
+
+            sold = 0
+            held = 0
+
+            for h in sellable:
+                try:
+                    cached = stock_analysis_agent.get_result(h.symbol)
+                    if not cached or not cached.success:
+                        th = event_detector.get_thresholds(h.symbol)
+                        request = StockAnalysisRequest(
+                            symbol=h.symbol, name=h.name or h.symbol,
+                            is_holding=True, purpose="PERIODIC_REVIEW",
+                            avg_price=h.avg_buy_price, pnl_rate=h.pnl_rate,
+                            quantity=h.quantity,
+                            active_stop_loss=th.stop_loss,
+                            active_take_profit=th.take_profit,
+                            active_trailing_stop_pct=th.trailing_stop_pct,
+                        )
+                        cached = await stock_analysis_agent.analyze(request, force=True)
+
+                    if cached.success and cached.hold_strategy == "OVERNIGHT":
+                        held += 1
+                        logger.info("[NXT 마감] {} → OVERNIGHT 보유 유지", h.symbol)
+                    else:
+                        await sell_agent.execute_sell(SellParams(
+                            symbol=h.symbol,
+                            exit_reason="NXT_CLOSE" if cached.success else "NXT_FORCE_LIQUIDATION",
+                        ))
+                        sold += 1
+                except Exception as e:
+                    logger.warning("NXT 마감 판단 실패 ({}) → 매도: {}", h.symbol, str(e))
+                    await sell_agent.execute_sell(SellParams(symbol=h.symbol, exit_reason="NXT_FORCE_LIQUIDATION"))
+                    sold += 1
+
+            logger.info("[19:45 NXT 마감] 매도 {}건, OVERNIGHT {}건", sold, held)
         except Exception as e:
             logger.error("NXT 마감 정리 오류: {}", str(e))
 
