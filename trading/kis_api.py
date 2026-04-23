@@ -4,6 +4,7 @@ MCP를 거치지 않고 KIS API를 직접 호출하여
 분봉, 거래량순위, 등락률순위 등 MCP 미지원 데이터를 조회한다.
 """
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,8 @@ from core.config import settings
 DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
 TOKEN_FILE = Path("data/kis_token.json")
+TOKEN_EXPIRED_CODE = "EGW00123"
+TOKEN_REFRESH_SKEW = timedelta(minutes=5)
 
 # 토큰 동시 발급 방지용 Lock + 메모리 캐시
 _token_lock = asyncio.Lock()
@@ -29,18 +32,129 @@ def _get_domain() -> str:
 
 
 def _get_app_key() -> str:
-    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+    if settings.is_paper_trading:
         return settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY
     return settings.KIS_APP_KEY
 
 
 def _get_app_secret() -> str:
-    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+    if settings.is_paper_trading:
         return settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET
     return settings.KIS_APP_SECRET
 
 
-async def _get_access_token(client: httpx.AsyncClient) -> str:
+def _get_token_file() -> Path:
+    """계좌 유형별 토큰 파일.
+
+    KIS 토큰은 앱키/계좌 유형에 묶이므로 실전/모의가 같은 파일을 공유하면
+    모드 전환 후 만료 토큰을 재사용할 수 있다.
+    """
+    suffix = "virtual" if settings.is_paper_trading else "real"
+    return TOKEN_FILE.with_name(f"kis_token.{suffix}.json")
+
+
+def _get_token_context() -> dict:
+    app_key = _get_app_key() or ""
+    return {
+        "account_type": "VIRTUAL" if settings.is_paper_trading else "REAL",
+        "app_key_hash": hashlib.sha256(app_key.encode()).hexdigest() if app_key else "",
+    }
+
+
+def _parse_datetime(value) -> datetime | None:
+    if not value:
+        return None
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _token_expires_at(token_data: dict, issued_at: datetime | None = None) -> datetime:
+    issued_at = issued_at or datetime.now()
+    expires_at = (
+        _parse_datetime(token_data.get("access_token_token_expired"))
+        or _parse_datetime(token_data.get("expires_at"))
+    )
+    if expires_at:
+        return expires_at
+
+    expires_in = token_data.get("expires_in")
+    try:
+        if expires_in:
+            return issued_at + timedelta(seconds=int(expires_in))
+    except (TypeError, ValueError):
+        pass
+
+    return issued_at + timedelta(hours=23)
+
+
+def _is_token_valid(expires_at: datetime) -> bool:
+    return datetime.now() + TOKEN_REFRESH_SKEW < expires_at
+
+
+def _token_matches_context(token_data: dict) -> bool:
+    context = _get_token_context()
+    return (
+        token_data.get("account_type") == context["account_type"]
+        and token_data.get("app_key_hash") == context["app_key_hash"]
+    )
+
+
+def _clear_cached_token(remove_file: bool = False) -> None:
+    global _cached_token, _cached_expires_at
+
+    _cached_token = None
+    _cached_expires_at = None
+    if remove_file:
+        # 신규 suffix 파일과 레거시 단일 파일을 함께 정리해 모드 전환 후 찌꺼기 방지
+        for token_file in {_get_token_file(), TOKEN_FILE}:
+            try:
+                token_file.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _json_body(response: httpx.Response) -> dict | None:
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _response_summary(response: httpx.Response) -> str:
+    body = _json_body(response)
+    if body:
+        msg_cd = body.get("msg_cd", "")
+        msg = body.get("msg1", "")
+        if msg_cd or msg:
+            return f"{msg_cd}: {msg}".strip(": ")
+    return response.text[:200]
+
+
+def _is_token_expired_response(response: httpx.Response) -> bool:
+    body = _json_body(response)
+    if body and body.get("msg_cd") == TOKEN_EXPIRED_CODE:
+        return True
+    return TOKEN_EXPIRED_CODE in response.text
+
+
+async def _get_access_token(client: httpx.AsyncClient, force_refresh: bool = False) -> str:
     """토큰 발급 (메모리 캐시 + Lock으로 동시 발급 방지)
 
     asyncio.gather()로 병렬 호출 시 Lock으로 직렬화하여
@@ -50,29 +164,32 @@ async def _get_access_token(client: httpx.AsyncClient) -> str:
     global _cached_token, _cached_expires_at
 
     # 빠른 경로: 메모리 캐시에 유효한 토큰이 있으면 즉시 반환 (Lock 불필요)
-    if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
+    if not force_refresh and _cached_token and _cached_expires_at and _is_token_valid(_cached_expires_at):
         return _cached_token
 
     for attempt in range(2):
         async with _token_lock:
+            if force_refresh and attempt == 0:
+                _clear_cached_token(remove_file=True)
+
             # Double-check: 다른 태스크가 Lock 대기 중 이미 발급했을 수 있음
-            if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
+            if not force_refresh and _cached_token and _cached_expires_at and _is_token_valid(_cached_expires_at):
                 return _cached_token
 
-            # 파일 캐시 확인
-            if TOKEN_FILE.exists():
+            token_file = _get_token_file()
+            if (not force_refresh or attempt > 0) and token_file.exists():
                 try:
-                    token_data = json.loads(TOKEN_FILE.read_text())
-                    expires_at = datetime.fromisoformat(token_data["expires_at"])
-                    if datetime.now() < expires_at:
-                        _cached_token = token_data["token"]
+                    token_data = json.loads(token_file.read_text())
+                    expires_at = _token_expires_at(token_data)
+                    if _token_matches_context(token_data) and _is_token_valid(expires_at):
+                        token = token_data["token"]
+                        _cached_token = token
                         _cached_expires_at = expires_at
                         logger.debug("KIS 토큰: 파일 캐시에서 로드")
-                        return _cached_token
+                        return token
                 except Exception:
                     pass
 
-            # 새 토큰 발급
             token = await _issue_new_token(client)
             if token is not None:
                 return token
@@ -105,26 +222,64 @@ async def _issue_new_token(client: httpx.AsyncClient) -> str | None:
     if resp.status_code != 200:
         resp_text = resp.text
         if "EGW00133" in resp_text:
-            return None  # 호출자가 Lock 해제 후 대기·재시도
+            return None
         raise Exception(f"KIS 토큰 발급 실패: {resp_text}")
 
     data = resp.json()
     token = data["access_token"]
-    expires_at = datetime.now() + timedelta(hours=23)
+    issued_at = datetime.now()
+    expires_at = _token_expires_at(data, issued_at)
 
-    # 메모리 캐시 갱신
     _cached_token = token
     _cached_expires_at = expires_at
 
-    # 파일 캐시 저장
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps({
+    _atomic_write_token({
         "token": token,
         "expires_at": expires_at.isoformat(),
-    }))
+        "issued_at": issued_at.isoformat(),
+        **_get_token_context(),
+    })
 
     logger.debug("KIS 토큰 신규 발급 완료")
     return token
+
+
+def _atomic_write_token(payload: dict) -> None:
+    """토큰 파일은 app(host)와 KIS_MCP 컨테이너가 같은 디렉터리를 공유한다.
+    부분 쓰기 상태를 다른 프로세스가 읽어 JSON 파싱이 실패하고 재발급을 유발하는
+    경쟁 상황을 막기 위해 tmp → replace 순으로 원자적으로 교체한다.
+    """
+    token_file = _get_token_file()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = token_file.with_suffix(token_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(token_file)
+
+
+async def _kis_request(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    **kwargs,
+) -> httpx.Response:
+    """KIS 인증 요청.
+
+    KIS가 로컬 만료시각보다 먼저 기존 토큰을 폐기하는 경우가 있어
+    EGW00123 응답을 받으면 캐시를 버리고 새 토큰으로 1회 재시도한다.
+    """
+    async def _send(force_refresh: bool) -> httpx.Response:
+        token = await _get_access_token(client, force_refresh=force_refresh)
+        request_headers = {**headers, "authorization": f"Bearer {token}"}
+        return await client.request(method, url, headers=request_headers, **kwargs)
+
+    response = await _send(force_refresh=False)
+    if not _is_token_expired_response(response):
+        return response
+
+    logger.warning("KIS 토큰 만료 응답(EGW00123), 토큰 재발급 후 재시도")
+    return await _send(force_refresh=True)
 
 
 async def get_minute_chart(symbol: str, period: str = "5") -> dict:
@@ -141,12 +296,12 @@ async def get_minute_chart(symbol: str, period: str = "5") -> dict:
 
     try:
         async with httpx.AsyncClient() as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": "FHKST03010200",
@@ -201,12 +356,12 @@ async def get_stock_daily_chart(symbol: str, count: int = 15) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": "FHKST03010100",
@@ -260,12 +415,12 @@ async def get_volume_rank(market: str = "J") -> dict:
     """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{DOMAIN}/uapi/domestic-stock/v1/quotations/volume-rank",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": "FHPST01710000",
@@ -330,12 +485,12 @@ async def get_market_index(index_code: str = "0001") -> dict:
     """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-index-price",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": "FHPUP02100000",
@@ -401,12 +556,12 @@ async def get_buying_power(symbol: str, price: int = 0, order_dvsn: str = "01") 
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{domain}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": tr_id,
@@ -465,12 +620,12 @@ async def get_balance_direct(afhr_flpr_yn: str = "N") -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{domain}/uapi/domestic-stock/v1/trading/inquire-balance",
                 headers={
                     "content-type": "application/json; charset=utf-8",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": tr_id,
@@ -491,8 +646,9 @@ async def get_balance_direct(afhr_flpr_yn: str = "N") -> dict:
             )
 
         if response.status_code != 200:
-            logger.warning("잔고 조회 실패: HTTP {}", response.status_code)
-            return {"success": False, "error": f"HTTP {response.status_code}"}
+            error = _response_summary(response)
+            logger.warning("잔고 조회 실패: HTTP {} — {}", response.status_code, error)
+            return {"success": False, "error": f"HTTP {response.status_code}: {error}"}
 
         result = response.json()
         if result.get("rt_cd") != "0":
@@ -522,12 +678,12 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.get(
+            response = await _kis_request(
+                client,
+                "GET",
                 f"{DOMAIN}/uapi/domestic-stock/v1/ranking/fluctuation",
                 headers={
                     "content-type": "application/json",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": "FHPST01700000",
@@ -619,12 +775,12 @@ async def place_order_direct(
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.post(
+            response = await _kis_request(
+                client,
+                "POST",
                 f"{domain}/uapi/domestic-stock/v1/trading/order-cash",
                 headers={
                     "content-type": "application/json; charset=utf-8",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": tr_id,
@@ -641,11 +797,7 @@ async def place_order_direct(
             )
 
         if response.status_code != 200:
-            body = ""
-            try:
-                body = response.json().get("msg1", response.text[:200])
-            except Exception:
-                body = response.text[:200]
+            body = _response_summary(response)
             logger.warning("직접 주문 실패: HTTP {} — {}", response.status_code, body)
             return {"success": False, "error": f"HTTP {response.status_code}: {body}"}
 
@@ -703,12 +855,12 @@ async def cancel_order_direct(order_id: str, order_branch: str = "") -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token = await _get_access_token(client)
-            response = await client.post(
+            response = await _kis_request(
+                client,
+                "POST",
                 f"{domain}/uapi/domestic-stock/v1/trading/order-rvsecncl",
                 headers={
                     "content-type": "application/json; charset=utf-8",
-                    "authorization": f"Bearer {token}",
                     "appkey": _get_app_key(),
                     "appsecret": _get_app_secret(),
                     "tr_id": tr_id,
