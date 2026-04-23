@@ -196,7 +196,7 @@ class ClaudeCodeProvider:
             "--max-turns", "1",
             "--effort", effort,
             "--dangerously-skip-permissions",
-            "--disallowedTools", "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,Agent,NotebookEdit",
+            "--disallowedTools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Agent,NotebookEdit",
         ]
 
         actual_prompt = prompt
@@ -259,6 +259,8 @@ class ClaudeCodeProvider:
 
     async def _execute(self, cmd: list, prompt: str) -> str:
         """subprocess 실행 + JSON 파싱"""
+        from analysis.llm._process_utils import terminate_process_group
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -266,6 +268,7 @@ class ClaudeCodeProvider:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._clean_env(),
+                start_new_session=True,  # 프로세스 그룹 분리 → 타임아웃 시 자식까지 안전 종료
             )
         except OSError as e:
             raise RuntimeError(f"Claude Code 프로세스 생성 실패: {e}")
@@ -276,8 +279,11 @@ class ClaudeCodeProvider:
                 timeout=300.0,
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            await terminate_process_group(proc, force=True)
             raise RuntimeError("Claude Code 응답 시간 초과 (300초)")
+        except asyncio.CancelledError:
+            await terminate_process_group(proc, force=True)
+            raise
 
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[:500]
