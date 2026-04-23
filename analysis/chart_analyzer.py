@@ -39,6 +39,9 @@ class ChartAnalyzer:
 
         try:
             result.indicators = TechnicalIndicators.calculate_all(daily_df)
+            # 분봉 지표 병합 — AI가 review_interval_min 계산 시 분봉 ATR 사용
+            if minute_df is not None and not minute_df.empty:
+                result.indicators.update(TechnicalIndicators.calculate_minute(minute_df))
             result.patterns = ChartPatterns.detect_all(daily_df)
             result.trend = self.trend_analyzer.analyze(daily_df, minute_df)
             result.signal_summary = self._aggregate_signals(

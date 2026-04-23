@@ -176,6 +176,50 @@ class TechnicalIndicators:
         return result
 
     @staticmethod
+    def calculate_minute(minute_df: pd.DataFrame) -> dict:
+        """분봉 데이터 기반 지표 계산 — AI가 review_interval_min 정확 산출하도록 지원
+
+        Args:
+            minute_df: 분봉 OHLCV (columns: open, high, low, close, volume)
+
+        Returns:
+            dict: atr_minute_14, minute_volatility_pct, minute_rsi_14 등
+                  데이터 부족 시 해당 필드 누락 (pandas-ta NaN 반환)
+        """
+        if minute_df is None or minute_df.empty or len(minute_df) < 5:
+            return {}
+
+        result: dict = {}
+
+        try:
+            # 분봉 ATR(14) — 절대값(원). review_interval_min 계산 1차 기준
+            if len(minute_df) >= 14:
+                atr_m = ta.atr(minute_df["high"], minute_df["low"], minute_df["close"], length=14)
+                if atr_m is not None and not atr_m.empty and not pd.isna(atr_m.iloc[-1]):
+                    result["atr_minute_14"] = round(atr_m.iloc[-1], 2)
+
+            # 분봉 평균 변동률 — 최근 14개 캔들의 abs(pct_change) 평균 (%)
+            if len(minute_df) >= 15:
+                pct = minute_df["close"].pct_change().abs()
+                avg_pct = pct.tail(14).mean()
+                if not pd.isna(avg_pct):
+                    result["minute_volatility_pct"] = round(avg_pct * 100, 3)
+
+            # 분봉 RSI(14) — 단기 과매수/과매도 (일봉 RSI와 보완)
+            if len(minute_df) >= 15:
+                rsi_m = ta.rsi(minute_df["close"], length=14)
+                if rsi_m is not None and not rsi_m.empty and not pd.isna(rsi_m.iloc[-1]):
+                    result["minute_rsi_14"] = round(rsi_m.iloc[-1], 2)
+
+            # 최근 분봉 수 — AI가 데이터 신뢰도 판단 가능
+            result["minute_candle_count"] = len(minute_df)
+
+        except Exception as e:
+            logger.debug("분봉 지표 계산 오류 (무시): {}", str(e))
+
+        return result
+
+    @staticmethod
     def format_for_prompt(indicators: dict) -> str:
         """지표 딕셔너리를 프롬프트용 문자열로 변환"""
         if not indicators:
@@ -197,7 +241,11 @@ class TechnicalIndicators:
             "bb_lower": "볼린저 하단",
             "stoch_k": "Stochastic %K",
             "stoch_d": "Stochastic %D",
-            "atr_14": "ATR(14)",
+            "atr_14": "ATR(14, 일봉)",
+            "atr_minute_14": "분봉 ATR(14, 절대값 원)",
+            "minute_volatility_pct": "분봉 평균 변동률(%)",
+            "minute_rsi_14": "분봉 RSI(14)",
+            "minute_candle_count": "분봉 데이터 수",
             "price_vs_sma20": "가격 vs SMA(20)",
             "cross_signal": "크로스 시그널",
             "bb_squeeze_ratio": "볼린저 Squeeze 비율",
