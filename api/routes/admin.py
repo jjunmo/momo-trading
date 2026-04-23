@@ -419,37 +419,40 @@ async def update_settings(updates: dict):
     return SuccessResponse(data=changed, message=f"{len(changed)}개 설정 변경됨")
 
 
-# ── Claude Code 사용량 ──
+# ── LLM 사용량 ──
 @router.get("/llm/usage")
 async def get_llm_usage():
-    """Claude Code 구독 사용량 (stats-cache.json)"""
+    """Active LLM backend 사용량 + Claude Code 구독 stats (있으면)"""
     import json
     from pathlib import Path
 
-    stats_path = Path.home() / ".claude" / "stats-cache.json"
-    if not stats_path.exists():
-        return SuccessResponse(data=None, message="stats-cache.json 없음")
+    from analysis.llm.llm_factory import llm_factory
 
-    try:
-        data = json.loads(stats_path.read_text())
+    app_usage = llm_factory.get_usage_snapshot()
+    response: dict = {
+        "active_backend": settings.LLM_BACKEND,
+        "app_usage": app_usage,
+    }
 
-        # 앱의 실시간 사용량도 함께 반환
-        from analysis.llm.claude_code_provider import ClaudeCodeProvider
-        app_usage = ClaudeCodeProvider.get_usage_snapshot()
+    # claude_code backend일 때만 stats-cache.json 병합
+    if settings.LLM_BACKEND == "claude_code":
+        stats_path = Path.home() / ".claude" / "stats-cache.json"
+        if stats_path.exists():
+            try:
+                data = json.loads(stats_path.read_text())
+                response.update({
+                    "total_sessions": data.get("totalSessions", 0),
+                    "total_messages": data.get("totalMessages", 0),
+                    "first_session_date": data.get("firstSessionDate"),
+                    "last_computed_date": data.get("lastComputedDate"),
+                    "model_usage": data.get("modelUsage", {}),
+                    "daily_activity": data.get("dailyActivity", []),
+                    "daily_model_tokens": data.get("dailyModelTokens", []),
+                })
+            except Exception as e:
+                logger.warning("stats-cache.json 파싱 실패: {}", str(e))
 
-        return SuccessResponse(data={
-            "total_sessions": data.get("totalSessions", 0),
-            "total_messages": data.get("totalMessages", 0),
-            "first_session_date": data.get("firstSessionDate"),
-            "last_computed_date": data.get("lastComputedDate"),
-            "model_usage": data.get("modelUsage", {}),
-            "daily_activity": data.get("dailyActivity", []),
-            "daily_model_tokens": data.get("dailyModelTokens", []),
-            "app_usage": app_usage,
-        })
-    except Exception as e:
-        logger.error("Claude 사용량 조회 실패: {}", str(e))
-        return SuccessResponse(data=None, message=f"조회 실패: {str(e)[:100]}")
+    return SuccessResponse(data=response)
 
 
 # ── LLM 상태 ──

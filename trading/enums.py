@@ -97,6 +97,7 @@ class LLMTier(str, Enum):
 class LLMProvider(str, Enum):
     """LLM 제공자"""
     CLAUDE_CODE = "CLAUDE_CODE"  # 로컬 Claude Code CLI (구독 크레딧)
+    ANTHROPIC = "ANTHROPIC"      # Anthropic API (API 키)
 
 
 class OrderConfirmStatus(str, Enum):

@@ -25,3 +25,6 @@ holidays>=0.60
 
 # Admin SSE
 sse-starlette>=2.0.0
+
+# Anthropic API SDK (LLM_BACKEND=anthropic)
+anthropic>=0.68.0

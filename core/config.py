@@ -31,11 +31,26 @@ class Settings(BaseSettings):
     KIS_WS_URL_DOMESTIC: str = "ws://ops.koreainvestment.com:21000"
     KIS_WS_URL_OVERSEAS: str = "ws://ops.koreainvestment.com:31000"
 
-    # === AI / LLM (Claude Code CLI — 구독 크레딧 사용) ===
-    CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
-    CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
-    CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
-    CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
+    # === AI / LLM 백엔드 선택 ===
+    # "anthropic": Anthropic API 직접 호출 (기본)
+    # "claude_code": Claude Code CLI 구독 크레딧 사용 (롤백 경로)
+    LLM_BACKEND: str = "anthropic"
+
+    # --- Anthropic API (LLM_BACKEND=anthropic) ---
+    ANTHROPIC_API_KEY: str = ""
+    # Claude 4.x는 *-latest alias 미지원 (2026-04 기준). 새 모델 출시 시 env로 수동 업데이트.
+    LLM_MODEL_TIER1: str = "claude-haiku-4-5-20251001"
+    LLM_MODEL_TIER2: str = "claude-sonnet-4-6"
+    LLM_MAX_RETRIES: int = 3
+    LLM_REQUEST_TIMEOUT_SEC: int = 120
+    LLM_MAX_OUTPUT_TOKENS: int = 4096
+    LLM_CACHE_ENABLED: bool = True  # Layered prompt caching
+
+    # --- Claude Code CLI (LLM_BACKEND=claude_code) ---
+    CLAUDE_CODE_MODEL: str = "sonnet"
+    CLAUDE_CODE_MODEL_TIER1: str = "haiku"
+    CLAUDE_CODE_MODEL_TIER2: str = "sonnet"
+    CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색
 
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
@@ -94,14 +109,26 @@ class Settings(BaseSettings):
 
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
-        claude_path = self._find_claude_path()
-        if claude_path:
-            logger.debug("Claude Code CLI 감지: {} — CLAUDE_CODE 프로바이더 사용", claude_path)
+        if self.LLM_BACKEND == "anthropic":
+            if not self.ANTHROPIC_API_KEY:
+                logger.warning(
+                    "LLM_BACKEND=anthropic 이지만 ANTHROPIC_API_KEY 미설정 — "
+                    "LLM 호출 실패. .env에 키 추가 또는 LLM_BACKEND=claude_code로 전환."
+                )
+            else:
+                logger.debug("Anthropic API backend 활성 (tier1={}, tier2={})",
+                             self.LLM_MODEL_TIER1, self.LLM_MODEL_TIER2)
+        elif self.LLM_BACKEND == "claude_code":
+            claude_path = self._find_claude_path()
+            if claude_path:
+                logger.debug("Claude Code CLI 감지: {} — CLI 백엔드 활성", claude_path)
+            else:
+                logger.warning(
+                    "LLM_BACKEND=claude_code 이지만 Claude Code CLI를 찾을 수 없음. "
+                    "CLAUDE_CODE_PATH를 설정하거나 LLM_BACKEND=anthropic으로 전환."
+                )
         else:
-            logger.warning(
-                "Claude Code CLI를 찾을 수 없음. "
-                "CLAUDE_CODE_PATH를 설정하거나 claude CLI를 설치하세요."
-            )
+            logger.warning("알 수 없는 LLM_BACKEND={} — 'anthropic' 또는 'claude_code' 사용", self.LLM_BACKEND)
 
         if not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
             logger.warning(

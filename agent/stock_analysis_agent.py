@@ -14,7 +14,12 @@ from loguru import logger
 from agent.base import BaseAgent
 from analysis.chart_analyzer import ChartAnalysisResult, chart_analyzer
 from analysis.llm.llm_factory import llm_factory
-from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT, STOCK_ANALYSIS_SYSTEM
+from analysis.llm.prompts.stock_analysis import (
+    STOCK_ANALYSIS_BASELINE_BLOCK,
+    STOCK_ANALYSIS_FRESH_BLOCK,
+    STOCK_ANALYSIS_MARKET_BLOCK,
+    STOCK_ANALYSIS_SYSTEM,
+)
 from core.json_utils import parse_llm_json
 from trading.mcp_client import mcp_client
 
@@ -305,39 +310,57 @@ class StockAnalysisAgent(BaseAgent):
         # 분석 목적 컨텍스트
         purpose_text = PURPOSE_CONTEXT.get(request.purpose, PURPOSE_CONTEXT["NEW_BUY"])
 
-        # 보유종목 추가 컨텍스트
-        holding_context = ""
+        # L2b: baseline holding block — avg_price, quantity, hold_days (당일 안정)
+        holding_baseline = ""
+        pnl_line = ""
         if request.is_holding:
-            holding_context = (
-                f"\n### 보유 상태\n"
-                f"- 매입가: {request.avg_price:,.0f}원 → 현재가: {current_price:,.0f}원\n"
-                f"- 수익률: {request.pnl_rate:+.2f}%\n"
+            holding_baseline = (
+                f"\n### 보유 기본정보\n"
+                f"- 매입가: {request.avg_price:,.0f}원\n"
                 f"- 보유: {request.quantity}주 / {request.hold_days}일 (최대 {request.max_hold_days}일)\n"
-                f"- 활성 손절: {request.active_stop_loss:,.0f}원 | 익절: {request.active_take_profit:,.0f}원"
-                f" | 트레일링: {request.active_trailing_stop_pct:.1f}%\n"
+                f"- 활성 임계값: 손절 {request.active_stop_loss:,.0f}원 | 익절 {request.active_take_profit:,.0f}원"
+                f" | 트레일링 {request.active_trailing_stop_pct:.1f}%"
             )
+            # L3: 실시간 PnL
+            pnl_line = f"- 수익률: {request.pnl_rate:+.2f}%"
 
-        prompt = STOCK_ANALYSIS_PROMPT.format(
+        # L2a: market_context (사이클 공유, 5분 cache)
+        market_block = STOCK_ANALYSIS_MARKET_BLOCK.format(
+            market_context=f"{purpose_text}\n{request.market_context or '시장 컨텍스트 없음'}",
+            trading_context=request.trading_context or "매매 컨텍스트 없음",
+        )
+
+        # L2b: stock baseline (종목별, 1h cache)
+        baseline_block = STOCK_ANALYSIS_BASELINE_BLOCK.format(
+            stock_name=request.name,
+            symbol=request.symbol,
+            per=price_data.get("per", "N/A"),
+            pbr=price_data.get("pbr", "N/A"),
+            market_cap=price_data.get("market_cap", "N/A"),
+            holding_baseline=holding_baseline,
+            daily_data=chart_result.trend_text or "추세 데이터 없음",
+            feedback_context=request.feedback_context or "매매 이력 없음",
+        )
+
+        # L3: fresh (실시간, no cache)
+        fresh_block = STOCK_ANALYSIS_FRESH_BLOCK.format(
             stock_name=request.name,
             symbol=request.symbol,
             current_price=current_price or 0,
             change=float(price_data.get("change") or 0),
             change_rate=float(price_data.get("change_rate") or 0),
             volume=int(float(price_data.get("volume") or 0)),
+            pnl_line=pnl_line,
             technical_indicators=chart_result.indicators_text or "지표 없음",
             chart_patterns=chart_result.patterns_text or "패턴 없음",
-            daily_data=chart_result.trend_text or "추세 데이터 없음",
-            per=price_data.get("per", "N/A"),
-            pbr=price_data.get("pbr", "N/A"),
-            market_cap=price_data.get("market_cap", "N/A"),
-            feedback_context=request.feedback_context or "매매 이력 없음",
-            market_context=f"{purpose_text}\n{request.market_context or '시장 컨텍스트 없음'}{holding_context}",
-            trading_context=request.trading_context or "매매 컨텍스트 없음",
         )
 
         try:
             result_text, provider = await llm_factory.generate_tier2(
-                prompt, system_prompt=STOCK_ANALYSIS_SYSTEM,
+                fresh_block,
+                system_prompt=STOCK_ANALYSIS_SYSTEM,
+                market_context=market_block,
+                stock_baseline=baseline_block,
                 symbol=request.symbol, cycle_id=request.cycle_id,
             )
             parsed = parse_llm_json(result_text)
