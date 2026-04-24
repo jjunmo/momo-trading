@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
     MIN_BUY_QUANTITY: int = 1
+    # 분석-주문 간 가격 변동 허용 한도 (%). 초과 시 AI 판단 무효로 간주하고 주문 스킵
+    ORDER_PRICE_DRIFT_MAX_PCT: float = 3.0
 
     # === System Hard Limit (AI도 무시 못함) ===
     DAILY_LOSS_LIMIT_HARD: float = -7.0   # 일일 손실 -7% → 전체 매매 즉시 중단

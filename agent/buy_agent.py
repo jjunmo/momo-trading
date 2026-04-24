@@ -63,6 +63,61 @@ class BuyAgent(BaseAgent):
             if params.price <= 0:
                 return result
 
+            # 주문 직전 현재가 재조회 — 분석 레이턴시 동안 시세 변동 보정
+            # (SellAgent의 NXT 현재가 재조회 패턴과 동일 컨셉, BuyAgent 버전)
+            analysis_price = params.price
+            fresh_price = params.price
+            try:
+                from trading.mcp_client import mcp_client as _mcp
+                price_resp = await _mcp.get_current_price(params.symbol)
+                if price_resp.success and price_resp.data:
+                    fp = float(
+                        price_resp.data.get("price")
+                        or price_resp.data.get("current_price")
+                        or 0
+                    )
+                    if fp > 0:
+                        fresh_price = fp
+            except Exception as e:
+                logger.warning("[BuyAgent] 현재가 재조회 실패 ({}): {} — 분석가 유지",
+                               params.symbol, str(e))
+
+            # 드리프트 계산 — AI 분석 시점 대비 변동률
+            drift_pct = (
+                abs(fresh_price - analysis_price) / analysis_price * 100
+                if analysis_price > 0 else 0.0
+            )
+            # AI의 target/stop 경계 이탈 체크
+            # - fresh_price >= target_price: 이미 목표 도달 → 상승여력 없음
+            # - fresh_price <= stop_loss_price: 리스크 현실화 → 진입 근거 상실
+            invalid_by_bounds = (
+                (params.take_profit_price > 0 and fresh_price >= params.take_profit_price)
+                or (params.stop_loss_price > 0 and fresh_price <= params.stop_loss_price)
+            )
+
+            if drift_pct > settings.ORDER_PRICE_DRIFT_MAX_PCT or invalid_by_bounds:
+                reason = (
+                    f"변동 {drift_pct:+.1f}% > 허용 {settings.ORDER_PRICE_DRIFT_MAX_PCT}%"
+                    if drift_pct > settings.ORDER_PRICE_DRIFT_MAX_PCT
+                    else f"AI 경계 이탈 (target {params.take_profit_price:,.0f}/stop {params.stop_loss_price:,.0f})"
+                )
+                logger.info("[BuyAgent] AI 분석 무효 — 주문 스킵: {} {:,.0f}→{:,.0f} ({})",
+                            params.symbol, analysis_price, fresh_price, reason)
+                await activity_logger.log(
+                    ActivityType.DECISION, ActivityPhase.SKIP,
+                    f"⚠️ [{params.symbol}] 가격 변동으로 AI 분석 무효 → 주문 스킵: "
+                    f"{analysis_price:,.0f}→{fresh_price:,.0f}원 ({reason})",
+                    symbol=params.symbol,
+                )
+                return result  # executed=False
+
+            # 드리프트 허용 범위 내 → 최신 가격으로 주문가 확정
+            if fresh_price != analysis_price:
+                diff_pct = (fresh_price - analysis_price) / analysis_price * 100
+                logger.info("[BuyAgent] 주문가 확정: {} {:,.0f}→{:,.0f} ({:+.2f}%)",
+                            params.symbol, analysis_price, fresh_price, diff_pct)
+                params.price = fresh_price  # 이후 수량 계산도 최신 가격 기준
+
             # 실제 주문가능금액 조회 (미체결 증거금 차감된 진짜 가용 현금)
             from trading.kis_api import get_buying_power
             bp = await get_buying_power(params.symbol, price=int(params.price))
@@ -168,7 +223,7 @@ class BuyAgent(BaseAgent):
 
                 await activity_logger.log(
                     ActivityType.ORDER, ActivityPhase.COMPLETE,
-                    f"✅ 매수 실행: {params.name}({params.symbol})",
+                    f"✅ 매수 주문 접수 (체결 대기중): {params.name}({params.symbol})",
                     symbol=params.symbol,
                 )
 

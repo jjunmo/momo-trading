@@ -235,8 +235,15 @@ class DecisionMaker:
         on_settled: 체결 확인 완료 시 호출되는 콜백 (order_id, success)
         """
         try:
-            # 10초 간격 × 3회 재시도 (총 30초) — 지정가 체결 대기
-            MAX_ATTEMPTS = 3
+            # 세션별 체결 대기 시간 차등
+            # KRX 정규장: 60초 (유동성 풍부, 지정가 1분이면 대부분 체결)
+            # NXT 프리/애프터: 120초 (유동성 낮음, 호가 매치 시간 필요)
+            from scheduler.market_calendar import market_calendar
+            _session = market_calendar.get_market_session()
+            if _session in ("NXT_PRE", "NXT_AFTER"):
+                MAX_ATTEMPTS = 12  # 120초
+            else:
+                MAX_ATTEMPTS = 6   # 60초
             POLL_INTERVAL = 10
 
             filled_order = None
@@ -336,6 +343,19 @@ class DecisionMaker:
                                symbol, order_id, MAX_ATTEMPTS * POLL_INTERVAL)
                 await self._cancel_unfilled_order(order_id, symbol)
                 await self._mark_pending_failed(pending_record_id, "체결 미확인 (타임아웃)")
+                # BUY 주문 취소 → PriceGuard 임계값 제거 (미체결 종목에 본전/손절 로직 작동 방지)
+                if side == "BUY":
+                    from realtime.event_detector import price_guard
+                    price_guard.remove_levels(symbol)
+                # Admin UI에 취소 가시화 — 이전 "매수 주문 접수" 로그와 매칭되는 후속 알림
+                side_kr = "매수" if side == "BUY" else "매도"
+                await activity_logger.log(
+                    ActivityType.ORDER, ActivityPhase.ERROR,
+                    f"❌ {side_kr} 체결 실패 ({MAX_ATTEMPTS * POLL_INTERVAL}초 내 미체결) → 주문 취소: "
+                    f"{symbol} {quantity}주 @{expected_price:,.0f}원 (주문번호 {order_id})",
+                    symbol=symbol,
+                    error_message=f"체결 미확인 (타임아웃 {MAX_ATTEMPTS * POLL_INTERVAL}초)",
+                )
                 if on_settled:
                     await on_settled(order_id, False)
                 return
