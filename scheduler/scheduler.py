@@ -10,7 +10,10 @@
   14:30  신규 매수 마감 (청산 시간 확보)
   15:10  보유종목 전량 시장가 강제 청산 (종가경매 전, 병렬 실행)
   15:30  KRX 폐장
-  15:40  장 마감 성과 리뷰 (KRX 종가 기반, 피드백 학습)
+  15:30~20:00  NXT 애프터마켓 (이벤트 기반 매매, 17:00/19:00 재스캔)
+  19:45  NXT 마감 전 포지션 정리 (오버나이트 판정)
+  20:00  NXT 애프터마켓 폐장
+  20:05  장 마감 성과 리뷰 (KRX+NXT 통합, AI 피드백 + 일일 리포트 저장)
   16:00  포트폴리오 정산 (KIS ↔ DB 동기화)
   16:30  일봉 데이터 보관용 수집
 
@@ -154,15 +157,17 @@ class TradingScheduler:
             misfire_grace_time=300,
         )
 
-        # ── 장 마감 리뷰 (15:40 평일) — KRX 종가 기반 성과 리뷰 ──
+        # ── 장 마감 리뷰 (20:05 평일) — KRX+NXT 전 세션 종료 후 통합 성과 리뷰 ──
+        # NXT 애프터마켓(15:30~20:00) 종료 직후 실행 → 하루 거래 데이터 완전 반영
+        # _post_market → run_cycle → _run_after_hours_cycle(AI 리뷰 + 리포트 저장)
         self.scheduler.add_job(
             self._post_market,
             "cron",
-            hour=15, minute=40,
+            hour=20, minute=5,
             day_of_week="mon-fri",
             id="post_market",
-            name="장 마감 성과 리뷰",
-            misfire_grace_time=3600,
+            name="장 마감 성과 리뷰 (KRX+NXT 통합)",
+            misfire_grace_time=3600,  # 서버가 20:05~21:05 사이 기동되면 자동 실행
         )
 
         # ── NXT 프리마켓 스캔 (08:05 평일) — NXT 프리마켓 시작 후 스캔+매매 ──
@@ -478,7 +483,7 @@ class TradingScheduler:
             logger.warning("보유종목 점검 오류: {}", str(e))
 
     async def _post_market(self) -> None:
-        """장 마감 성과 리뷰 (15:40, KRX 종가 기반)"""
+        """장 마감 성과 리뷰 (20:05, KRX+NXT 전 세션 종료 후 통합)"""
         from agent.trading_agent import trading_agent
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
@@ -487,7 +492,7 @@ class TradingScheduler:
             logger.debug("휴장일 — 장 마감 리뷰 스킵")
             return
 
-        logger.debug("=== 장 마감 리뷰 시작 (15:40) ===")
+        logger.debug("=== 장 마감 리뷰 시작 (20:05, KRX+NXT 통합) ===")
         await activity_logger.log(
             ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
             "\U0001f319 장 마감 — 오늘 매매 성과 리뷰 시작",
