@@ -171,6 +171,18 @@ function renderAccountBalance(data) {
   const cashRatio = data.total_asset > 0
     ? ((data.cash / data.total_asset) * 100).toFixed(1)
     : '0.0';
+  const orderable = Number(data.orderable_cash) || 0;
+  const lockedT2 = Math.max(0, Number(data.cash) - orderable);
+  const orderableLine = orderable > 0 ? `
+    <div class="flex justify-between">
+      <span class="text-gray-400">주문가능</span>
+      <span class="text-gray-200">${formatKRW(orderable)}</span>
+    </div>` : '';
+  const lockedLine = lockedT2 > 0 ? `
+    <div class="flex justify-between text-xs">
+      <span class="text-yellow-500">└ T+2 대기</span>
+      <span class="text-yellow-500" title="오늘 매수 체결분이 결제완료될 때까지(2영업일) 주문에 쓸 수 없는 금액">${formatKRW(lockedT2)}</span>
+    </div>` : '';
   el.innerHTML = `
     <div class="flex justify-between">
       <span class="text-gray-400">총자산</span>
@@ -180,6 +192,8 @@ function renderAccountBalance(data) {
       <span class="text-gray-400">현금</span>
       <span>${formatKRW(data.cash)} <span class="text-gray-600">(${cashRatio}%)</span></span>
     </div>
+    ${orderableLine}
+    ${lockedLine}
     <div class="flex justify-between">
       <span class="text-gray-400">주식</span>
       <span>${formatKRW(data.stock_value)}</span>
@@ -413,20 +427,27 @@ function formatKRW(amount) {
 /**
  * 활동 1건 추가 — 종목별 카드로 라우팅
  */
-function appendActivity(data) {
-  const container = document.getElementById('chat-container');
-
-  // Remove placeholder
-  if (container.children.length === 1 && container.children[0].classList.contains('text-center')) {
-    container.innerHTML = '';
+// 2컬럼 레이아웃: 분석/판단 → 왼쪽(chat-analysis), 매매/실행 → 오른쪽(chat-trading)
+function getColumnForCategory(cat) {
+  if (cat === 'buy' || cat === 'sell' || cat === 'guard') {
+    return document.getElementById('chat-trading');
   }
+  return document.getElementById('chat-analysis');
+}
 
+function appendActivity(data) {
   const symbol = data.symbol;
   const isCycleActivity = data.activity_type === 'CYCLE';
   const isDailyPlan = data.activity_type === 'DAILY_PLAN';
   const isLLMCall = data.activity_type === 'LLM_CALL';
 
   const agentCategory = getAgentCategory(data);
+  const container = getColumnForCategory(agentCategory);
+
+  // Remove placeholder (해당 컬럼만)
+  if (container.children.length === 1 && container.children[0].classList.contains('text-center')) {
+    container.innerHTML = '';
+  }
 
   // Non-symbol activities → inline (cycle dividers, daily plan, events without symbol)
   if (!symbol || isCycleActivity || isDailyPlan) {
@@ -482,9 +503,12 @@ function appendActivity(data) {
       stockCards[cardKey] = card;
       card.agentCategories = new Set();
       container.appendChild(card.element);
-    } else if (card.element.parentNode === container &&
-               card.element !== container.lastElementChild) {
-      // 이미 존재하는 카드 → 맨 아래로 부드럽게 이동 (FLIP 애니메이션)
+    } else if (card.element.parentNode !== container) {
+      // 컬럼 전환 필요 — 분석 → 매매 (첫 매수/매도 이벤트 시)
+      card.element.parentNode?.removeChild(card.element);
+      container.appendChild(card.element);
+    } else if (card.element !== container.lastElementChild) {
+      // 같은 컬럼 내부 이동 → FLIP 애니메이션
       moveCardToBottom(card.element, container);
     }
     // 카드 카테고리: 매수/매도 확정 시 해당 탭에만 노출
@@ -949,15 +973,18 @@ function switchToReport(dateStr) {
 
 // ── Data Loading ──
 async function loadTodayActivities() {
-  const container = document.getElementById('chat-container');
-  container.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">불러오는 중...</div>';
+  const analysis = document.getElementById('chat-analysis');
+  const trading = document.getElementById('chat-trading');
+  if (analysis) analysis.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">불러오는 중...</div>';
+  if (trading) trading.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">불러오는 중...</div>';
   // Clear card tracking
   cleanupStockCards();
 
   try {
     const resp = await fetch(`${API}/activities?limit=2000`);
     const json = await resp.json();
-    container.innerHTML = '';
+    if (analysis) analysis.innerHTML = '';
+    if (trading) trading.innerHTML = '';
     activityCount = 0;
 
     if (json.data && json.data.length) {
@@ -984,13 +1011,17 @@ async function loadTodayActivities() {
       }
 
       requestAnimationFrame(() => {
-        container.scrollTop = container.scrollHeight;
+        if (analysis) analysis.scrollTop = analysis.scrollHeight;
+        if (trading) trading.scrollTop = trading.scrollHeight;
       });
     } else {
-      container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 활동 기록이 없습니다</div>';
+      if (analysis) analysis.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 분석 기록이 없습니다</div>';
+      if (trading) trading.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 매매 기록이 없습니다</div>';
     }
   } catch (err) {
-    container.innerHTML = `<div class="text-center text-red-400 text-sm py-8">로드 실패: ${err.message}</div>`;
+    const errHtml = `<div class="text-center text-red-400 text-sm py-8">로드 실패: ${err.message}</div>`;
+    if (analysis) analysis.innerHTML = errHtml;
+    if (trading) trading.innerHTML = errHtml;
   }
 }
 
@@ -1015,8 +1046,10 @@ function getProgressKey(data) {
 
 // ── Clear Chat ──
 function clearChat() {
-  const container = document.getElementById('chat-container');
-  container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
+  const analysis = document.getElementById('chat-analysis');
+  const trading = document.getElementById('chat-trading');
+  if (analysis) analysis.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
+  if (trading) trading.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">대기 중...</div>';
   activityCount = 0;
   document.getElementById('activity-count').textContent = '0건';
   cleanupStockCards();
@@ -1133,20 +1166,28 @@ function setAgentFilter(filter) {
 }
 
 function applyAgentFilter() {
-  const container = document.getElementById('chat-container');
-  for (const child of container.children) {
-    const agentCat = child.dataset.agentCategory || '';
-    if (!agentCat || currentAgentFilter === 'all') {
-      child.style.display = '';
-    } else {
-      // 카드는 여러 카테고리를 가질 수 있음 (쉼표 구분)
-      const cats = agentCat.split(',');
-      child.style.display = cats.includes(currentAgentFilter) ? '' : 'none';
+  // 2컬럼 모두 순회 — analysis / trading
+  const columns = ['chat-analysis', 'chat-trading'];
+  for (const colId of columns) {
+    const container = document.getElementById(colId);
+    if (!container) continue;
+    for (const child of container.children) {
+      const agentCat = child.dataset.agentCategory || '';
+      if (!agentCat || currentAgentFilter === 'all') {
+        child.style.display = '';
+      } else {
+        // 카드는 여러 카테고리를 가질 수 있음 (쉼표 구분)
+        const cats = agentCat.split(',');
+        child.style.display = cats.includes(currentAgentFilter) ? '' : 'none';
+      }
     }
   }
-  // 필터 적용 후 최신 항목(맨 아래)로 스크롤 (display 변경 후 scrollHeight 재계산 대기)
+  // 필터 적용 후 각 컬럼 최신 항목으로 스크롤
   requestAnimationFrame(() => {
-    container.scrollTop = container.scrollHeight;
+    for (const colId of columns) {
+      const el = document.getElementById(colId);
+      if (el) el.scrollTop = el.scrollHeight;
+    }
   });
 }
 
@@ -1158,8 +1199,11 @@ function escapeHtml(text) {
 
 // ── Reports ──
 async function loadReport(dateStr) {
-  const container = document.getElementById('chat-container');
+  // 리포트는 분석 컬럼에 표시, 매매 컬럼은 비움
+  const container = document.getElementById('chat-analysis');
+  const tradingCol = document.getElementById('chat-trading');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">리포트 불러오는 중...</div>';
+  if (tradingCol) tradingCol.innerHTML = '<div class="text-center text-gray-600 text-xs py-4">(리포트 조회 중)</div>';
   cleanupStockCards();
 
   try {
@@ -1611,8 +1655,12 @@ function setStatus(state, text) {
   if (el) el.textContent = text;
 }
 
-// Auto-scroll detection
-document.getElementById('chat-container').addEventListener('scroll', function() {
-  const el = this;
-  autoScroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50;
+// Auto-scroll detection — 2컬럼 각각 감지
+['chat-analysis', 'chat-trading'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) {
+    el.addEventListener('scroll', function() {
+      autoScroll = (this.scrollHeight - this.scrollTop - this.clientHeight) < 50;
+    });
+  }
 });
