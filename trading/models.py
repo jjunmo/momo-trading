@@ -60,7 +60,8 @@ class OrderResult(BaseModel):
 class AccountBalance(BaseModel):
     """계좌 잔고"""
     total_asset: float
-    cash: float
+    cash: float  # 장부상 총 예수금 (T+2 결제대기 포함)
+    orderable_cash: float = 0  # 즉시 주문 가능한 현금 (KIS ord_psbl_cash)
     stock_value: float
     total_pnl: float
     total_pnl_rate: float

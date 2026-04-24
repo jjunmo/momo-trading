@@ -151,6 +151,19 @@ class AccountManager:
         holdings = self._parse_holdings(data)
         balance = self._parse_balance(data, holdings=holdings)
 
+        # 주문가능금액 조회 — KIS ord_psbl_cash. cash와 차이 = T+2 결제대기·증거금 등.
+        # 실패 시 cash로 폴백 (T+2 대기가 0으로 표시되지만 UI 깨짐 방지)
+        try:
+            from trading.kis_api import get_buying_power
+            bp = await get_buying_power(symbol="005930", price=0)
+            if bp.get("success"):
+                balance.orderable_cash = float(bp.get("available_cash", 0))
+            else:
+                balance.orderable_cash = balance.cash
+        except Exception as e:
+            logger.debug("주문가능금액 조회 실패, cash로 폴백: {}", str(e))
+            balance.orderable_cash = balance.cash
+
         self._balance_cache = balance
         self._holdings_cache = holdings
         return balance, holdings

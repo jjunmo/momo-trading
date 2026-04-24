@@ -187,6 +187,7 @@ async def get_account_balance():
         return SuccessResponse(data={
             "total_asset": balance.total_asset,
             "cash": balance.cash,
+            "orderable_cash": balance.orderable_cash,
             "stock_value": balance.stock_value,
             "total_pnl": balance.total_pnl,
             "total_pnl_rate": balance.total_pnl_rate,

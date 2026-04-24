@@ -321,8 +321,20 @@ class TradingAgent:
                                 _bp = await get_buying_power(symbol, price=int(_stock_price))
                                 _avail = _bp.get("available_cash", snapshot.get("cash", 0)) if _bp.get("success") else snapshot.get("cash", 0)
                                 if _avail < _stock_price:
-                                    logger.info("[{}] 주문가능금액 부족으로 분석 스킵: {:,.0f}원 < {:,.0f}원/주",
-                                                symbol, _avail, _stock_price)
+                                    # 예수금 총액 - 주문가능금액 = 미체결/결제대기/증거금 등으로 잠긴 금액
+                                    _total_cash = float(snapshot.get("cash", 0))
+                                    _locked = max(0, _total_cash - float(_avail))
+                                    if _locked > 0:
+                                        logger.info(
+                                            "[{}] 주문가능금액 부족으로 분석 스킵: 주문가능 {:,.0f}원 < 주가 {:,.0f}원/주 "
+                                            "(예수금 {:,.0f}원 중 {:,.0f}원이 미체결 주문·결제대기 등으로 잠김)",
+                                            symbol, _avail, _stock_price, _total_cash, _locked,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "[{}] 주문가능금액 부족으로 분석 스킵: {:,.0f}원 < {:,.0f}원/주",
+                                            symbol, _avail, _stock_price,
+                                        )
                                     return {"symbol": symbol, "skipped": True, "reason": f"주문가능금액 부족 ({_avail:,.0f} < {_stock_price:,.0f})"}
                         except Exception:
                             pass
