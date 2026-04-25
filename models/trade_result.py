@@ -28,10 +28,12 @@ class TradeResult(Base, TimestampMixin):
     exit_price: Mapped[float] = mapped_column(Float, default=0.0)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # 결과
-    pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 손익 (원)
-    return_pct: Mapped[float] = mapped_column(Float, default=0.0)  # 수익률 (%)
+    # 결과 — 수수료/세금 차감 후 순손익 (2026-04-25부터)
+    pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 순손익 (원, 수수료·세금 차감)
+    return_pct: Mapped[float] = mapped_column(Float, default=0.0)  # 순수익률 (%)
     is_win: Mapped[bool] = mapped_column(Boolean, default=False)
+    commission_amt: Mapped[float] = mapped_column(Float, default=0.0)  # 매수+매도 수수료 합
+    tax_amt: Mapped[float] = mapped_column(Float, default=0.0)  # 매도 거래세
     hold_days: Mapped[int] = mapped_column(Integer, default=0)
     exit_reason: Mapped[str] = mapped_column(String(30), default="")  # SIGNAL, STOP_LOSS, TAKE_PROFIT, MAX_HOLD
 
