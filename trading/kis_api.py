@@ -885,7 +885,11 @@ async def cancel_order_direct(order_id: str, order_branch: str = "") -> dict:
         result = response.json()
         if result.get("rt_cd") != "0":
             error_msg = result.get("msg1", "취소 실패")
-            logger.warning("주문 취소 거부: {} — {}", order_id, error_msg)
+            # "원주문정보가 존재하지않습니다" = 이미 체결/취소된 주문 → 노이즈이므로 DEBUG
+            if "원주문정보" in error_msg and "존재하지" in error_msg:
+                logger.debug("주문 취소 불필요 (이미 해결됨): {} — {}", order_id, error_msg)
+            else:
+                logger.warning("주문 취소 거부: {} — {}", order_id, error_msg)
             return {"success": False, "error": error_msg}
 
         logger.info("주문 취소 성공: {}", order_id)
@@ -893,3 +897,123 @@ async def cancel_order_direct(order_id: str, order_branch: str = "") -> dict:
     except Exception as e:
         logger.error("주문 취소 오류: {} — {}", order_id, str(e))
         return {"success": False, "error": str(e)}
+
+
+async def get_daily_ccld_direct(
+    start_date: str,
+    end_date: str,
+    odno: str = "",
+    pdno: str = "",
+    sll_buy_dvsn: str = "00",
+    max_pages: int = 20,
+) -> dict:
+    """일별 주문체결내역 조회 (KIS REST API 직접 호출, 페이징 자동 처리)
+
+    공식 규격서 기반 (v1_국내주식-009):
+    엔드포인트: /uapi/domestic-stock/v1/trading/inquire-daily-ccld
+    tr_id: TTTC0081R(실전, 3개월 이내) / VTTC0081R(모의)
+
+    KIS는 응답당 100건 한도이므로 ctx_area_fk100/nk100 토큰으로 자동 페이징.
+    체결 확인 폴링 누락분 검증 + 4/22~ 누락 거래 백필에 모두 사용.
+
+    Args:
+        start_date: 조회 시작일 (YYYYMMDD)
+        end_date: 조회 종료일 (YYYYMMDD)
+        odno: 특정 주문번호 필터 (선택)
+        pdno: 특정 종목코드 필터 (선택)
+        sll_buy_dvsn: 매도매수 구분 — "00"=전체, "01"=매도, "02"=매수
+        max_pages: 페이징 안전 한도 (기본 20 → 최대 2000건)
+
+    Returns:
+        {"success": bool, "trades": [{...}], "raw": dict, "page_count": int}
+        trades 항목 키: odno, pdno, prdt_name, sll_buy_dvsn_cd, ord_qty,
+                       tot_ccld_qty, avg_prvs, tot_ccld_amt, cncl_yn, ord_dt,
+                       excg_dvsn_cd ("02"=KRX, "03"=NXT)
+    """
+    cano, acnt_prdt_cd = _get_account()
+    domain = _get_trading_domain()
+    is_paper = settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
+    tr_id = "VTTC0081R" if is_paper else "TTTC0081R"
+
+    all_trades: list[dict] = []
+    last_raw: dict = {}
+    fk100, nk100 = "", ""
+    page_count = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for _ in range(max_pages):
+                # KIS 페이징 헤더: 첫 호출은 tr_cont 비움, 이후엔 "N" (다음 데이터 요청)
+                tr_cont = "N" if page_count > 0 else ""
+                response = await _kis_request(
+                    client,
+                    "GET",
+                    f"{domain}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                    headers={
+                        "content-type": "application/json; charset=utf-8",
+                        "appkey": _get_app_key(),
+                        "appsecret": _get_app_secret(),
+                        "tr_id": tr_id,
+                        "tr_cont": tr_cont,
+                    },
+                    params={
+                        "CANO": cano,
+                        "ACNT_PRDT_CD": acnt_prdt_cd,
+                        "INQR_STRT_DT": start_date,
+                        "INQR_END_DT": end_date,
+                        "SLL_BUY_DVSN_CD": sll_buy_dvsn,
+                        "INQR_DVSN": "00",  # 역순(최신순)
+                        "PDNO": pdno,
+                        "CCLD_DVSN": "00",  # 전체(체결+미체결)
+                        "ORD_GNO_BRNO": "",
+                        "ODNO": odno,
+                        "INQR_DVSN_3": "00",  # 전체
+                        "INQR_DVSN_1": "",
+                        "CTX_AREA_FK100": fk100,
+                        "CTX_AREA_NK100": nk100,
+                    },
+                )
+
+                if response.status_code != 200:
+                    error = _response_summary(response)
+                    logger.warning("일별체결 조회 실패: HTTP {} — {}", response.status_code, error)
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status_code}: {error}",
+                        "trades": all_trades, "page_count": page_count,
+                    }
+
+                result = response.json()
+                if result.get("rt_cd") != "0":
+                    error_msg = result.get("msg1", "일별체결 조회 실패")
+                    logger.warning("일별체결 조회 거부: {}", error_msg)
+                    return {
+                        "success": False, "error": error_msg,
+                        "trades": all_trades, "page_count": page_count,
+                    }
+
+                last_raw = result
+                page = result.get("output1") or []
+                if isinstance(page, dict):
+                    page = [page]
+                all_trades.extend(page)
+                page_count += 1
+
+                # 다음 페이지 토큰. 없으면 종료
+                fk100 = (result.get("ctx_area_fk100") or "").strip()
+                nk100 = (result.get("ctx_area_nk100") or "").strip()
+                if not nk100:
+                    break
+
+        return {
+            "success": True,
+            "trades": all_trades,
+            "raw": last_raw,
+            "page_count": page_count,
+        }
+    except Exception as e:
+        logger.error("일별체결 조회 오류: {}", str(e))
+        return {
+            "success": False, "error": str(e),
+            "trades": all_trades, "page_count": page_count,
+        }

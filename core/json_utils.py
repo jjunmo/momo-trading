@@ -63,7 +63,14 @@ def parse_llm_json(text: str) -> dict:
             logger.warning("LLM JSON 잘림 복구 후 파싱 (데이터 일부 손실 가능)")
             return result
 
-    logger.warning("LLM JSON 파싱 최종 실패 — text[:200]: {}", text[:200])
+    # 진단 정보 강화 — 잘림 여부 판단 가능하도록 head+tail + 길이 로깅
+    text_len = len(text)
+    head = text[:200].replace("\n", "\\n")
+    tail = text[-200:].replace("\n", "\\n") if text_len > 200 else ""
+    logger.warning(
+        "LLM JSON 파싱 최종 실패 — 길이 {}자, head: {} | tail: {}",
+        text_len, head, tail,
+    )
     return {}
 
 
