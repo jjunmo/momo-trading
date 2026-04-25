@@ -1048,12 +1048,19 @@ class TradingScheduler:
                             pass
 
                         if exit_price > 0 and tr.entry_price > 0:
-                            tr.exit_price = exit_price
-                            tr.pnl = (exit_price - tr.entry_price) * tr.quantity
-                            tr.return_pct = round(
-                                (exit_price - tr.entry_price) / tr.entry_price * 100, 2
+                            from util.pnl_calculator import compute_pnl
+                            br = compute_pnl(
+                                entry_price=tr.entry_price,
+                                exit_price=exit_price,
+                                qty=tr.quantity,
+                                market=tr.market or "KOSPI",
                             )
-                            tr.is_win = tr.pnl > 0
+                            tr.exit_price = exit_price
+                            tr.pnl = br.net_pnl
+                            tr.return_pct = br.return_pct
+                            tr.is_win = br.is_win
+                            tr.commission_amt = br.commission
+                            tr.tax_amt = br.tax
                             from util.time_util import ensure_kst
                             tr.hold_days = (now - ensure_kst(tr.entry_at)).days if tr.entry_at else 0
 

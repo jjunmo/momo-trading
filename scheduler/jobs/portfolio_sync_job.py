@@ -122,7 +122,12 @@ async def _cancel_unfilled_order(order_id: str, symbol: str) -> None:
         if result.success:
             logger.debug("[정산] {} 미체결 주문 취소 완료: {}", symbol, order_id)
         else:
-            logger.warning("[정산] {} 미체결 주문 취소 실패: {} — {}", symbol, order_id, result.message)
+            msg = result.message or ""
+            # "원주문정보가 존재하지 않습니다" = 이미 해결된 주문 (앞선 타임아웃 취소 등) → DEBUG
+            if "원주문정보" in msg and "존재하지" in msg:
+                logger.debug("[정산] {} 주문 이미 해결됨: {} — {}", symbol, order_id, msg)
+            else:
+                logger.warning("[정산] {} 미체결 주문 취소 실패: {} — {}", symbol, order_id, msg)
     except Exception as e:
         logger.warning("[정산] {} 미체결 주문 취소 오류: {} — {}", symbol, order_id, str(e))
 
@@ -178,15 +183,22 @@ async def _check_account_db_consistency() -> None:
                         ]
 
                         if sell_record and open_buys:
-                            # SELL 체결가로 BUY 일괄 청산
+                            # SELL 체결가로 BUY 일괄 청산 (수수료/세금 차감 net_pnl)
+                            from util.pnl_calculator import compute_pnl
                             sell_price = sell_record.exit_price
                             for buy in open_buys:
+                                br = compute_pnl(
+                                    entry_price=buy.entry_price,
+                                    exit_price=sell_price,
+                                    qty=buy.quantity,
+                                    market=buy.market or "KOSPI",
+                                )
                                 buy.exit_price = sell_price
-                                buy.pnl = (sell_price - buy.entry_price) * buy.quantity
-                                buy.return_pct = round(
-                                    (sell_price - buy.entry_price) / buy.entry_price * 100, 2
-                                ) if buy.entry_price > 0 else 0.0
-                                buy.is_win = buy.pnl > 0
+                                buy.pnl = br.net_pnl
+                                buy.return_pct = br.return_pct
+                                buy.is_win = br.is_win
+                                buy.commission_amt = br.commission
+                                buy.tax_amt = br.tax
                                 buy.hold_days = (now - ensure_kst(buy.entry_at)).days if buy.entry_at else 0
                                 buy.exit_reason = buy.exit_reason or "SYNC_CLOSE"
                                 buy.exit_at = sell_record.exit_at or now

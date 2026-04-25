@@ -337,28 +337,48 @@ class DecisionMaker:
                     logger.debug("[{}] 체결수량 0 ({}회차) — 재시도", symbol, attempt)
                     filled_order = None  # 리셋하고 재시도
 
-            # 재시도 모두 실패 → 미체결 취소
+            # 재시도 모두 실패 → 안전 검증 후 처리
             if not filled_order or filled_qty <= 0:
-                logger.warning("[{}] 주문 {} — {}초간 체결 미확인 → 취소 시도",
-                               symbol, order_id, MAX_ATTEMPTS * POLL_INTERVAL)
-                await self._cancel_unfilled_order(order_id, symbol)
-                await self._mark_pending_failed(pending_record_id, "체결 미확인 (타임아웃)")
-                # BUY 주문 취소 → PriceGuard 임계값 제거 (미체결 종목에 본전/손절 로직 작동 방지)
-                if side == "BUY":
-                    from realtime.event_detector import price_guard
-                    price_guard.remove_levels(symbol)
-                # Admin UI에 취소 가시화 — 이전 "매수 주문 접수" 로그와 매칭되는 후속 알림
-                side_kr = "매수" if side == "BUY" else "매도"
-                await activity_logger.log(
-                    ActivityType.ORDER, ActivityPhase.ERROR,
-                    f"❌ {side_kr} 체결 실패 ({MAX_ATTEMPTS * POLL_INTERVAL}초 내 미체결) → 주문 취소: "
-                    f"{symbol} {quantity}주 @{expected_price:,.0f}원 (주문번호 {order_id})",
-                    symbol=symbol,
-                    error_message=f"체결 미확인 (타임아웃 {MAX_ATTEMPTS * POLL_INTERVAL}초)",
-                )
-                if on_settled:
-                    await on_settled(order_id, False)
-                return
+                # 안전장치: 폴링 race condition 방지 — KIS 일별체결 조회로 실제 체결 여부 직접 확인
+                # KIS 응답이 늦어 폴링이 놓쳤을 뿐 실제로는 체결된 주문일 수 있음 → 다중 체결 방지
+                # NXT 시간대는 KIS 일별체결 누락 가능 → side/expected_qty 전달해 잔고 폴백 활용
+                verified = await self._verify_via_daily_ccld(order_id, symbol, side=side, expected_qty=quantity)
+                if verified:
+                    filled_qty = verified["qty"]
+                    filled_price = verified.get("price") or float(expected_price)
+                    logger.warning(
+                        "[{}] 폴링 누락 체결 발견 (KIS 일별체결로 확인): {}주 @{:,.0f}원 (주문번호 {})",
+                        symbol, filled_qty, filled_price, order_id,
+                    )
+                    side_kr = "매수" if side == "BUY" else "매도"
+                    await activity_logger.log(
+                        ActivityType.ORDER, ActivityPhase.COMPLETE,
+                        f"⚠️ 폴링 누락 체결 복구 ({side_kr}): {symbol} {filled_qty}주 @{filled_price:,.0f}원 (주문번호 {order_id})",
+                        symbol=symbol,
+                    )
+                    # 아래 정상 체결 처리 흐름으로 자연스럽게 진입
+                else:
+                    # 진짜 미체결 확정 → 기존 취소/마킹 흐름
+                    logger.warning("[{}] 주문 {} — {}초간 체결 미확인 → 취소 시도",
+                                   symbol, order_id, MAX_ATTEMPTS * POLL_INTERVAL)
+                    await self._cancel_unfilled_order(order_id, symbol)
+                    await self._mark_pending_failed(pending_record_id, "체결 미확인 (타임아웃)")
+                    # BUY 주문 취소 → PriceGuard 임계값 제거 (미체결 종목에 본전/손절 로직 작동 방지)
+                    if side == "BUY":
+                        from realtime.event_detector import price_guard
+                        price_guard.remove_levels(symbol)
+                    # Admin UI에 취소 가시화 — 이전 "매수 주문 접수" 로그와 매칭되는 후속 알림
+                    side_kr = "매수" if side == "BUY" else "매도"
+                    await activity_logger.log(
+                        ActivityType.ORDER, ActivityPhase.ERROR,
+                        f"❌ {side_kr} 체결 실패 ({MAX_ATTEMPTS * POLL_INTERVAL}초 내 미체결) → 주문 취소: "
+                        f"{symbol} {quantity}주 @{expected_price:,.0f}원 (주문번호 {order_id})",
+                        symbol=symbol,
+                        error_message=f"체결 미확인 (타임아웃 {MAX_ATTEMPTS * POLL_INTERVAL}초)",
+                    )
+                    if on_settled:
+                        await on_settled(order_id, False)
+                    return
 
             logger.info(
                 "[체결확인] {} {} {}주 @{:,.0f}원 체결 완료 (주문번호: {})",
@@ -403,6 +423,61 @@ class DecisionMaker:
             # 체결 실패 콜백 → 예약 환불
             if on_settled:
                 await on_settled(order_id, False)
+
+    async def _verify_via_daily_ccld(
+        self, order_id: str, symbol: str,
+        side: str | None = None, expected_qty: int | None = None,
+    ) -> dict | None:
+        """KIS 일별 체결로 실제 체결 여부 직접 검증 (폴링 누락 안전망)
+
+        폴링 60~120초 동안 KIS 응답이 늦게 와서 미체결로 판단되었어도, 실제로는
+        KIS 서버에 체결됐을 수 있다. 그 race를 닫지 않으면 같은 주문을 재시도 →
+        다중 체결 위험. 이 메서드는 일별 체결내역에서 odno로 직접 매칭한다.
+
+        KIS API가 NXT 시간대 거래를 일부 누락하므로, 매칭 실패 시 KIS 잔고
+        평단가로 폴백 검증. NXT 단일가 매매에서 주문가 ≠ 체결가일 때 정확한
+        체결가를 entry_price에 기록하기 위함.
+
+        Returns:
+            체결 확인되면 {"qty": int, "price": float}, 아니면 None
+        """
+        if not order_id:
+            return None
+        try:
+            from datetime import datetime
+            from trading.kis_api import get_daily_ccld_direct
+            today = datetime.now().strftime("%Y%m%d")
+            result = await get_daily_ccld_direct(
+                start_date=today, end_date=today, odno=str(order_id),
+            )
+            if result.get("success"):
+                for t in result.get("trades") or []:
+                    if str(t.get("odno") or "") != str(order_id):
+                        continue
+                    if (t.get("cncl_yn") or "N").upper() == "Y":
+                        return None
+                    qty = int(float(t.get("tot_ccld_qty") or 0))
+                    if qty <= 0:
+                        return None
+                    avg = float(t.get("avg_prvs") or 0)
+                    return {"qty": qty, "price": avg}
+            # 일별체결 누락(NXT 시간대) → 잔고 평단가 폴백
+            if side == "BUY" and expected_qty and expected_qty > 0:
+                from trading.account_manager import account_manager
+                account_manager.invalidate_cache()
+                holdings = await account_manager.get_holdings()
+                h = next((x for x in holdings if x.symbol == symbol), None)
+                if h and h.quantity >= expected_qty and h.avg_buy_price > 0:
+                    logger.warning(
+                        "[{}] KIS 일별체결 누락 — 잔고로 체결 확인 (NXT race 추정): "
+                        "보유 {}주 평단가 {:,.0f}원",
+                        symbol, h.quantity, h.avg_buy_price,
+                    )
+                    return {"qty": expected_qty, "price": h.avg_buy_price}
+            return None
+        except Exception as e:
+            logger.error("[{}] 일별체결 안전 검증 오류: {}", symbol, str(e))
+            return None
 
     async def _cancel_unfilled_order(self, order_id: str, symbol: str) -> None:
         """미체결 주문 취소 시도 — order_id 없으면 종목 기준 폴백"""
@@ -472,16 +547,22 @@ class DecisionMaker:
                         tr.exit_price = filled_price
                         tr.exit_at = now
                         tr.exit_reason = exit_reason or "SIGNAL"
-                        # 매도 체결 → 미청산 BUY 전체 일괄 청산
+                        # 매도 체결 → 미청산 BUY 전체 일괄 청산 (수수료/세금 차감 net_pnl)
+                        from util.pnl_calculator import compute_pnl
                         open_buys = await repo.get_all_open_buys(symbol)
                         for open_buy in open_buys:
-                            entry_price = open_buy.entry_price
-                            pnl = (filled_price - entry_price) * open_buy.quantity
-                            return_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                            br = compute_pnl(
+                                entry_price=open_buy.entry_price,
+                                exit_price=filled_price,
+                                qty=open_buy.quantity,
+                                market=open_buy.market or "KOSPI",
+                            )
                             open_buy.exit_price = filled_price
-                            open_buy.pnl = pnl
-                            open_buy.return_pct = round(return_pct, 2)
-                            open_buy.is_win = pnl > 0
+                            open_buy.pnl = br.net_pnl
+                            open_buy.return_pct = br.return_pct
+                            open_buy.is_win = br.is_win
+                            open_buy.commission_amt = br.commission
+                            open_buy.tax_amt = br.tax
                             open_buy.hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
                             open_buy.exit_reason = exit_reason or "SIGNAL"
                             open_buy.exit_at = now
@@ -606,31 +687,33 @@ class DecisionMaker:
                             # portfolio_sync_job이 나중에 SELL 체결가로 BUY를 자동 청산
                             return
 
-                        # 모든 미청산 BUY 일괄 청산
+                        # 모든 미청산 BUY 일괄 청산 (수수료/세금 차감 net_pnl)
+                        from util.pnl_calculator import compute_pnl
                         total_pnl = 0.0
                         for open_buy in open_buys:
-                            entry_price = open_buy.entry_price
-                            pnl = (filled_price - entry_price) * open_buy.quantity
-                            return_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
-                            is_win = pnl > 0
+                            br = compute_pnl(
+                                entry_price=open_buy.entry_price,
+                                exit_price=filled_price,
+                                qty=open_buy.quantity,
+                                market=open_buy.market or "KOSPI",
+                            )
                             hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
 
                             open_buy.exit_price = filled_price
-                            open_buy.pnl = pnl
-                            open_buy.return_pct = round(return_pct, 2)
-                            open_buy.is_win = is_win
+                            open_buy.pnl = br.net_pnl
+                            open_buy.return_pct = br.return_pct
+                            open_buy.is_win = br.is_win
+                            open_buy.commission_amt = br.commission
+                            open_buy.tax_amt = br.tax
                             open_buy.hold_days = hold_days
                             open_buy.exit_reason = exit_reason or "SIGNAL"
                             open_buy.exit_at = now
-                            total_pnl += pnl
+                            total_pnl += br.net_pnl
 
-                        # 마지막 BUY 기준으로 로깅
+                        # 마지막 BUY 기준으로 로깅 (순수익률 평균)
                         last_buy = open_buys[-1]
                         pnl_sign = "+" if total_pnl >= 0 else ""
-                        avg_return = sum(
-                            ((filled_price - ob.entry_price) / ob.entry_price * 100)
-                            for ob in open_buys if ob.entry_price > 0
-                        ) / len(open_buys)
+                        avg_return = sum(ob.return_pct for ob in open_buys) / len(open_buys)
                         logger.info(
                             "[TradeResult] 매도 청산: {} {}건 BUY 일괄 청산@{:,.0f} "
                             "= {}{:,.0f}원 ({}{:.1f}%)",
