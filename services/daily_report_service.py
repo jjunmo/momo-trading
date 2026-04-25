@@ -140,13 +140,28 @@ class DailyReportService:
                     opened_trades = await trade_result_repo.get_opened_by_date(report_date)
                     # 청산된 BUY 포지션 (pnl/is_win이 정확히 기록된 레코드)
                     completed_trades = await trade_result_repo.get_completed_by_date(report_date)
+                    # 당일 SELL 레코드 전체 (BUY 매칭 안 된 매도까지 가시화)
+                    sells_today = await trade_result_repo.get_sells_by_date(report_date)
+                    # BUY가 CONFIRM_FAILED 등으로 매칭 실패한 매도 종목
+                    matched_symbols = {t.stock_symbol for t in completed_trades}
+                    unmatched_sells = [s for s in sells_today if s.stock_symbol not in matched_symbols]
 
                     buy_count = len(opened_trades)
-                    sell_count = len(completed_trades)  # 청산된 포지션 수 (대시보드와 일치)
+                    # 매도 건수는 SELL 레코드 기준 (실제 매도된 종목 빠짐없이 카운트)
+                    sell_count = len(sells_today)
                     total_orders = buy_count + sell_count
                     win_count = sum(1 for t in completed_trades if t.is_win)
                     loss_count = sum(1 for t in completed_trades if not t.is_win)
                     total_pnl = sum(t.pnl for t in completed_trades)
+                    if unmatched_sells:
+                        unmatched_summary = ", ".join(
+                            f"{s.stock_name}({s.stock_symbol}) {s.quantity}주 @{s.exit_price:,.0f}원"
+                            for s in unmatched_sells
+                        )
+                        logger.warning(
+                            "[리포트] BUY 매칭 실패 매도 {}건 — 손익 미집계: {}",
+                            len(unmatched_sells), unmatched_summary,
+                        )
 
                     # 계좌 스냅샷이 빈 경우 DB 미청산 포지션으로 보완
                     all_open = await trade_result_repo.get_all_open()

@@ -114,6 +114,29 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         result = await self.db.execute(stmt)
         return result.scalar() or 0
 
+    async def get_sells_by_date(self, target_date: date) -> list[TradeResult]:
+        """특정 날짜 SELL 레코드 전체 (BUY-SELL 매칭 여부 무관, CONFIRMED만)
+
+        리포트 누락 가시화용 — `get_completed_by_date`가 status=CONFIRMED인 BUY만
+        잡아 BUY가 CONFIRM_FAILED인 경우(폴링 race) 매도가 리포트에서 누락됐다.
+        SELL 레코드 직접 조회로 매도된 종목을 빠짐없이 가시화한다.
+        """
+        start = datetime.combine(target_date, time.min, tzinfo=KST)
+        end = datetime.combine(target_date, time.max, tzinfo=KST)
+        stmt = (
+            select(TradeResult)
+            .where(and_(
+                TradeResult.side == "SELL",
+                TradeResult.exit_at.isnot(None),
+                TradeResult.exit_at >= start,
+                TradeResult.exit_at <= end,
+                TradeResult.status == "CONFIRMED",
+            ))
+            .order_by(TradeResult.exit_at.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_opened_by_date(self, target_date: date) -> list[TradeResult]:
         """특정 날짜에 진입한 매수 기록 (entry_at 기준, CONFIRMED만)"""
         start = datetime.combine(target_date, time.min, tzinfo=KST)
