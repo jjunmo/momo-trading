@@ -6,7 +6,6 @@ from core.json_utils import parse_llm_json
 from analysis.feedback.performance_tracker import PerformanceTracker
 from analysis.llm.llm_factory import llm_factory
 from analysis.llm.prompts.risk_tuning import (
-    RISK_APPETITE_GUIDELINES,
     RISK_TUNING_PROMPT,
     RISK_TUNING_SYSTEM,
 )
@@ -74,8 +73,6 @@ class AIRiskTuner:
                 total_pnl_rate=balance.total_pnl_rate,
                 performance_summary=performance_summary,
                 risk_guideline=risk_guideline,
-                max_daily_trades=settings.MAX_DAILY_TRADES,
-                min_buy_quantity=settings.MIN_BUY_QUANTITY,
             )
 
             result_text, provider = await llm_factory.generate_tier1(
