@@ -33,10 +33,10 @@ def parse_llm_json(text: str) -> dict:
         if result is not None:
             return result
 
-    # 1.5단계: 코드블록 내 개행 수정 후 재시도
+    # 1.5단계: 코드블록 내 개행/숫자 콤마 수정 후 재시도
     if code_block:
         candidate = code_block.group(1).strip()
-        fixed = _escape_newlines_in_strings(candidate)
+        fixed = _strip_number_thousands_commas(_escape_newlines_in_strings(candidate))
         result = _try_parse(fixed)
         if result is not None:
             return result
@@ -89,6 +89,9 @@ def _fix_common_errors(text: str) -> str:
     """LLM JSON의 흔한 문법 오류 수정"""
     # 먼저 JSON 문자열 내의 리터럴 개행을 이스케이프
     s = _escape_newlines_in_strings(text)
+
+    # 숫자에 들어간 천 단위 콤마 제거 (LLM이 한국식 숫자 표기로 출력하는 케이스)
+    s = _strip_number_thousands_commas(s)
 
     # trailing comma 제거: ,] → ] , ,} → }
     s = re.sub(r",\s*([}\]])", r"\1", s)
@@ -148,6 +151,50 @@ def _escape_newlines_in_strings(text: str) -> str:
 
         result.append(ch)
 
+    return ''.join(result)
+
+
+def _strip_number_thousands_commas(text: str) -> str:
+    """JSON 문자열 외부의 숫자에서 천 단위 콤마 제거
+
+    LLM이 한국식 숫자 표기로 `"target_price": 15,630` 처럼 콤마를 넣을 때
+    JSON 스펙 위반으로 파싱 실패. 문자열 내부의 콤마는 보호.
+
+    판정 규칙: `\\d,\\d{3}` 패턴이고 직후 5번째 자리가 숫자가 아닐 때만 천단위 콤마.
+    예) `15,630,` → `15630,` (제거).  `15,6300` → 그대로 (4자리 이상이라 천단위 아님).
+    """
+    result = []
+    in_string = False
+    escape_next = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            i += 1
+            continue
+        if ch == '\\' and in_string:
+            result.append(ch)
+            escape_next = True
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+        if (not in_string and ch == ','
+                and i > 0 and i + 3 < n
+                and text[i - 1].isdigit()
+                and text[i + 1].isdigit() and text[i + 2].isdigit() and text[i + 3].isdigit()
+                and (i + 4 >= n or not text[i + 4].isdigit())):
+            # 천 단위 콤마 제거
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
     return ''.join(result)
 
 
