@@ -54,10 +54,25 @@ class DailyReportService:
     """일일 리포트 생성 서비스 (자체 세션 사용)"""
 
     async def generate_daily_report(self, report_date: date | None = None) -> DailyReport | None:
-        """일일 리포트 생성"""
+        """일일 리포트 생성
+
+        report_date 미지정 시 자정 넘김 보호:
+        - 09:00 이전(장 시작 전)에 호출되면 전일 매매를 분석하는 의도 — 전일 날짜로 처리
+        - NXT 종료 후 20:05 스케줄이 4시간 이상 지연돼 자정을 넘기는 케이스 방어
+        """
+        from datetime import timedelta
         from util.time_util import now_kst
         if report_date is None:
-            report_date = now_kst().date()
+            now = now_kst()
+            # 09:00(장 시작) 이전 호출은 전일 마감 리뷰로 간주 → 전일 날짜 사용
+            if now.hour < 9:
+                report_date = (now - timedelta(days=1)).date()
+                logger.warning(
+                    "일일 리포트 호출 시각이 자정 직후({}) — 전일({})로 보정",
+                    now.strftime("%H:%M:%S"), report_date,
+                )
+            else:
+                report_date = now.date()
 
         logger.debug("일일 리포트 생성 시작: {}", report_date)
 

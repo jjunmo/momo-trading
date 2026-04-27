@@ -1332,11 +1332,22 @@ class TradingAgent:
                     logger.warning("일일 리포트 저장 실패: {}", str(e))
 
                 # 일일 리뷰 → 트레이딩 규칙 자동 생성 (내일 코드 레벨 강제 적용)
+                # 안전장치: 분석/매매 0건은 비정상 상태(시스템 미가동·자정 넘김 등) →
+                # LLM이 추측으로 만든 PARAM_OVERRIDE는 잘못된 보정이라 무조건 skip
                 try:
                     from analysis.feedback.trading_rules import trading_rule_engine
-                    rules = await trading_rule_engine.generate_rules_from_review(
-                        parsed, today_date,
-                    )
+                    if today_analyses == 0 and today_orders == 0:
+                        await activity_logger.log(
+                            ActivityType.TRADING_RULE, ActivityPhase.SKIP,
+                            f"⚠️ 트레이딩 규칙 생성 skip — 분석 0건 + 매매 0건 (비정상 상태, "
+                            f"LLM 추측 기반 룰 생성 위험)",
+                            cycle_id=cycle_id,
+                        )
+                        rules = []
+                    else:
+                        rules = await trading_rule_engine.generate_rules_from_review(
+                            parsed, today_date,
+                        )
                     if rules:
                         rule_summary = ", ".join(
                             f"{r.param_name}={r.param_value}" for r in rules
