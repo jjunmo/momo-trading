@@ -556,6 +556,7 @@ class DecisionMaker:
                                 exit_price=filled_price,
                                 qty=open_buy.quantity,
                                 market=open_buy.market or "KOSPI",
+                                stock_name=open_buy.stock_name or "",
                             )
                             open_buy.exit_price = filled_price
                             open_buy.pnl = br.net_pnl
@@ -696,6 +697,7 @@ class DecisionMaker:
                                 exit_price=filled_price,
                                 qty=open_buy.quantity,
                                 market=open_buy.market or "KOSPI",
+                                stock_name=open_buy.stock_name or "",
                             )
                             hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
 

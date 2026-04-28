@@ -19,6 +19,20 @@ MARKET_TAX_RATES: dict[str, float] = {
     "NXT": 0.0020,      # 미확인 — KOSPI 동일 가정
 }
 
+# ETF/ETN 발행사 prefix — 거래세 면제 종목 자동 식별용
+ETF_PREFIXES: tuple[str, ...] = (
+    "KODEX", "TIGER", "ARIRANG", "HANARO", "PLUS", "KOSEF",
+    "KINDEX", "ACE", "SOL", "RISE", "히어로즈", "TIMEFOLIO",
+)
+
+
+def is_etf(stock_name: str) -> bool:
+    """종목명으로 ETF/ETN 여부 판별 (거래세 면제 종목)"""
+    if not stock_name:
+        return False
+    name_upper = stock_name.upper().strip()
+    return any(name_upper.startswith(p) for p in ETF_PREFIXES)
+
 
 @dataclass
 class PnLBreakdown:
@@ -37,9 +51,14 @@ def estimate_commission(price: float, qty: int) -> int:
     return int(price * qty * KIS_COMMISSION_RATE)
 
 
-def estimate_tax(exit_price: float, qty: int, market: str = "KOSPI") -> int:
-    """매도 세금 추정 (시장별 거래세, 원 단위 절사)"""
+def estimate_tax(exit_price: float, qty: int, market: str = "KOSPI", stock_name: str = "") -> int:
+    """매도 세금 추정 (시장별 거래세, 원 단위 절사)
+
+    ETF/ETN은 거래세 면제 (소득세법 제46조의2) — stock_name 전달 시 자동 면제 처리.
+    """
     if exit_price <= 0 or qty <= 0:
+        return 0
+    if is_etf(stock_name):
         return 0
     rate = MARKET_TAX_RATES.get(market.upper(), MARKET_TAX_RATES["KOSPI"])
     return int(exit_price * qty * rate)
@@ -69,13 +88,17 @@ def compute_pnl(
     market: str = "KOSPI",
     commission: int | None = None,
     tax: int | None = None,
+    stock_name: str = "",
 ) -> PnLBreakdown:
-    """순손익 계산 — commission/tax가 None이면 시장별 추정값 사용. 모두 원 단위 정수."""
+    """순손익 계산 — commission/tax가 None이면 시장별 추정값 사용. 모두 원 단위 정수.
+
+    stock_name 전달 시 ETF 자동 인식 → 거래세 면제 처리.
+    """
     gross = int((exit_price - entry_price) * qty)
     if commission is None:
         commission = estimate_commission(entry_price, qty) + estimate_commission(exit_price, qty)
     if tax is None:
-        tax = estimate_tax(exit_price, qty, market)
+        tax = estimate_tax(exit_price, qty, market, stock_name)
     net = gross - commission - tax
     cost_basis = entry_price * qty
     return_pct = round((net / cost_basis) * 100, 2) if cost_basis > 0 else 0.0

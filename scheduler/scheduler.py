@@ -1054,6 +1054,7 @@ class TradingScheduler:
                                 exit_price=exit_price,
                                 qty=tr.quantity,
                                 market=tr.market or "KOSPI",
+                                stock_name=tr.stock_name or "",
                             )
                             tr.exit_price = exit_price
                             tr.pnl = br.net_pnl

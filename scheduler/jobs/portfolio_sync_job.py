@@ -192,6 +192,7 @@ async def _check_account_db_consistency() -> None:
                                     exit_price=sell_price,
                                     qty=buy.quantity,
                                     market=buy.market or "KOSPI",
+                                    stock_name=buy.stock_name or "",
                                 )
                                 buy.exit_price = sell_price
                                 buy.pnl = br.net_pnl
