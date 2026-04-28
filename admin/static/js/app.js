@@ -1550,7 +1550,7 @@ async function analyzeHolding(symbol, btn) {
   const origText = btn.innerHTML;
   btn.innerHTML = '⏳';
   try {
-    const r = await fetch(`${API}/admin/holdings/${symbol}/analyze`, { method: 'POST' });
+    const r = await fetch(`${API}/holdings/${symbol}/analyze`, { method: 'POST' });
     const j = await r.json();
     const d = j.data;
     if (!d || !d.success) {
