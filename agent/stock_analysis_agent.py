@@ -176,6 +176,21 @@ class StockAnalysisAgent(BaseAgent):
                 if clamped != raw_interval:
                     logger.info("[분석] {} review_interval_min clamp: {}분 → {}분",
                                 request.symbol, raw_interval, clamped)
+                # NXT 세션 한도 (가이드 강제 안전망 — LLM이 프롬프트 무시할 때 캡)
+                from scheduler.market_calendar import market_calendar
+                session = market_calendar.get_market_session()
+                if session == "NXT_AFTER" and clamped > 60:
+                    logger.warning(
+                        "[분석] {} NXT 애프터 한도(60분) 초과 → 캡 적용 (LLM: {}분 → 60분)",
+                        request.symbol, clamped,
+                    )
+                    clamped = 60
+                elif session == "NXT_PRE" and clamped > 15:
+                    logger.warning(
+                        "[분석] {} NXT 프리 한도(15분) 초과 → 캡 적용 (LLM: {}분 → 15분)",
+                        request.symbol, clamped,
+                    )
+                    clamped = 15
                 result.review_interval_min = clamped
             else:
                 result.review_interval_min = 0
