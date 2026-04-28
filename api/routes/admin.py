@@ -583,6 +583,78 @@ async def trigger_agent_cycle():
     return SuccessResponse(message="에이전트 사이클이 트리거되었습니다")
 
 
+# ── 보유 종목 수동 Tier2 분석 ──
+@router.post("/holdings/{symbol}/analyze")
+async def analyze_holding(symbol: str):
+    """보유 종목에 대해 Tier2 분석을 강제 실행 (관리자 수동 트리거)
+
+    캐시 무시(force=True)하고 즉시 LLM 분석 → 결과 반환.
+    HOLD/SELL/ADD_BUY 권고 + 수치 임계값 + 분석 근거 포함.
+    """
+    from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
+    from agent.market_scanner import market_scanner
+
+    try:
+        holdings = await account_manager.get_holdings()
+        h = next((x for x in holdings if x.symbol == symbol), None)
+        if not h:
+            return SuccessResponse(data=None, message=f"보유 종목 미발견: {symbol}")
+
+        # 시장 컨텍스트 확보 (최근 스캔 결과 활용)
+        regime = getattr(market_scanner, "_last_market_regime", "") or "BULL"
+        market_ctx = (
+            f"【분석 관점: 보유종목 정기 재평가】 보유 중인 종목입니다.\n"
+            f"시장 국면: {regime}"
+        )
+
+        request = StockAnalysisRequest(
+            symbol=h.symbol,
+            name=h.name,
+            strategy_type="STABLE_SHORT",
+            is_holding=True,
+            avg_price=h.avg_buy_price,
+            pnl_rate=h.pnl_rate,
+            quantity=h.quantity,
+            purpose="PERIODIC_REVIEW",
+            market_context=market_ctx,
+            trading_context="현재 시각: 관리자 수동 트리거",
+        )
+
+        await activity_logger.log(
+            ActivityType.EVENT, ActivityPhase.PROGRESS,
+            f"\U0001f50d 보유종목 수동 Tier2 분석: {h.name}({symbol})",
+            symbol=symbol,
+        )
+
+        result = await stock_analysis_agent.analyze(request, force=True)
+
+        return SuccessResponse(
+            data={
+                "symbol": result.symbol,
+                "name": result.name,
+                "success": result.success,
+                "recommendation": result.recommendation,
+                "confidence": result.confidence,
+                "reason": result.reason,
+                "analysis": result.analysis,
+                "current_price": result.current_price,
+                "target_price": result.target_price,
+                "stop_loss_price": result.stop_loss_price,
+                "trailing_stop_pct": result.trailing_stop_pct,
+                "breakeven_trigger_pct": result.breakeven_trigger_pct,
+                "review_threshold_pct": result.review_threshold_pct,
+                "review_interval_min": result.review_interval_min,
+                "hold_strategy": result.hold_strategy,
+                "key_factors": result.key_factors,
+                "provider": result.provider,
+            },
+            message=f"분석 완료: {result.recommendation} (신뢰도 {result.confidence:.2f})",
+        )
+    except Exception as e:
+        logger.error("보유 종목 수동 분석 실패: {} — {}", symbol, str(e))
+        return SuccessResponse(data=None, message=f"분석 실패: {str(e)[:100]}")
+
+
 # ── 수동 일일 리포트 생성 ──
 @router.post("/reports/generate")
 async def generate_report(target_date: str | None = Query(None)):

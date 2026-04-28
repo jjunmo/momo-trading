@@ -268,10 +268,13 @@ function renderAccountHoldings(data) {
         <span class="review-countdown text-purple-300" data-review-at="${th.next_review_at}">계산 중...</span>
       </div>`;
     }
-    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5 ${bgTint}">
+    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5 ${bgTint}" data-symbol="${h.symbol}">
       <div class="flex justify-between items-center">
         <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}${h.tradeable_market === 'NXT' ? ' <span class="text-green-400 text-xs">[NXT]</span>' : h.tradeable_market === 'KRX_ONLY' ? ' <span class="text-yellow-500 text-xs">[KRX종가]</span>' : ''}</span>
-        <span class="${pnlColor} font-bold text-sm">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
+        <div class="flex items-center gap-1">
+          <button onclick="analyzeHolding('${h.symbol}', this)" class="text-[11px] px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-300 hover:bg-purple-900/70 transition" title="Tier2 강제 분석 (재평가 주기·임계값 즉시 갱신)">🔍 분석</button>
+          <span class="${pnlColor} font-bold text-sm">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
+        </div>
       </div>
       ${entryBarHtml}
       ${entryBarLabel}
@@ -285,6 +288,7 @@ function renderAccountHoldings(data) {
       </div>
       ${thresholdLine}
       ${reviewLine}
+      <div class="analysis-result hidden text-[11px] mt-1 pt-1 border-t border-gray-700/50 space-y-0.5"></div>
     </div>`;
   }).join('');
 }
@@ -1532,6 +1536,59 @@ async function generateReport() {
     loadReportList();
   } catch (err) {
     console.error('Report gen error:', err);
+  }
+}
+
+// 보유 종목 수동 Tier2 분석 — 카드 내 결과 펼침
+async function analyzeHolding(symbol, btn) {
+  const card = btn.closest('[data-symbol]');
+  const result = card?.querySelector('.analysis-result');
+  if (!result) return;
+  result.classList.remove('hidden');
+  result.innerHTML = '<div class="text-purple-300">⏳ Tier2 분석 중... (10~20초)</div>';
+  btn.disabled = true;
+  const origText = btn.innerHTML;
+  btn.innerHTML = '⏳';
+  try {
+    const r = await fetch(`${API}/admin/holdings/${symbol}/analyze`, { method: 'POST' });
+    const j = await r.json();
+    const d = j.data;
+    if (!d || !d.success) {
+      result.innerHTML = `<div class="text-red-400">${j.message || '분석 실패'}</div>`;
+      return;
+    }
+    const recColor = d.recommendation === 'BUY' ? 'text-green-400'
+                   : d.recommendation === 'SELL' ? 'text-red-400'
+                   : 'text-yellow-400';
+    const conf = (d.confidence * 100).toFixed(0);
+    const tp = d.target_price ? Number(d.target_price).toLocaleString() + '원' : '—';
+    const sl = d.stop_loss_price ? Number(d.stop_loss_price).toLocaleString() + '원' : '—';
+    const trail = d.trailing_stop_pct ? d.trailing_stop_pct.toFixed(1) + '%' : '—';
+    const be = d.breakeven_trigger_pct ? d.breakeven_trigger_pct.toFixed(1) + '%' : '—';
+    const interval = d.review_interval_min ? d.review_interval_min + '분' : '—';
+    const factors = (d.key_factors || []).map(k => `<div class="text-gray-400">• ${escapeHtml(k)}</div>`).join('');
+    result.innerHTML = `
+      <div class="flex justify-between items-center">
+        <span class="${recColor} font-bold">${d.recommendation}</span>
+        <span class="text-gray-400">신뢰도 ${conf}%</span>
+      </div>
+      <div class="text-gray-300 leading-tight">${escapeHtml(d.reason || '')}</div>
+      <div class="flex justify-between text-gray-500 mt-1">
+        <span>목표 ${tp}</span><span>손절 ${sl}</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>본전 ${be} / 트레일 ${trail}</span>
+        <span class="text-purple-300">재평가 ${interval}</span>
+      </div>
+      ${factors ? `<div class="mt-1">${factors}</div>` : ''}
+    `;
+    // 분석 후 임계값/재평가 시각이 갱신됐으니 보유종목 새로고침
+    if (typeof loadAccountInfo === 'function') setTimeout(() => loadAccountInfo(), 500);
+  } catch (e) {
+    result.innerHTML = `<div class="text-red-400">오류: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = origText;
   }
 }
 
