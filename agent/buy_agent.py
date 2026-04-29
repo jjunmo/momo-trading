@@ -111,12 +111,19 @@ class BuyAgent(BaseAgent):
                 )
                 return result  # executed=False
 
-            # 드리프트 허용 범위 내 → 최신 가격으로 주문가 확정
+            # 드리프트 허용 범위 내 → 최신 가격으로 주문가 확정 (호가 단위 정규화 필수)
+            from util.kis_price import round_to_tick
             if fresh_price != analysis_price:
                 diff_pct = (fresh_price - analysis_price) / analysis_price * 100
                 logger.info("[BuyAgent] 주문가 확정: {} {:,.0f}→{:,.0f} ({:+.2f}%)",
                             params.symbol, analysis_price, fresh_price, diff_pct)
                 params.price = fresh_price  # 이후 수량 계산도 최신 가격 기준
+            # KIS 호가 단위 정규화 (rt_cd=7 "주식주문호가단위 오류" 방지)
+            normalized = round_to_tick(params.price, mode="round")
+            if normalized != int(params.price):
+                logger.info("[BuyAgent] 호가 단위 정규화: {} {:,.0f}→{:,}원",
+                            params.symbol, params.price, normalized)
+                params.price = float(normalized)
 
             # 실제 주문가능금액 조회 (미체결 증거금 차감된 진짜 가용 현금)
             from trading.kis_api import get_buying_power
