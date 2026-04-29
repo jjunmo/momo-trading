@@ -18,6 +18,7 @@ DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
 TOKEN_FILE = Path("data/kis_token.json")
 TOKEN_EXPIRED_CODE = "EGW00123"
+RATE_LIMITED_CODE = "EGW00201"  # 초당 거래건수 초과
 TOKEN_REFRESH_SKEW = timedelta(minutes=5)
 
 # 토큰 동시 발급 방지용 Lock + 메모리 캐시
@@ -154,6 +155,14 @@ def _is_token_expired_response(response: httpx.Response) -> bool:
     return TOKEN_EXPIRED_CODE in response.text
 
 
+def _is_rate_limited_response(response: httpx.Response) -> bool:
+    """KIS 초당 거래건수 초과(EGW00201) 응답 감지"""
+    body = _json_body(response)
+    if body and body.get("msg_cd") == RATE_LIMITED_CODE:
+        return True
+    return RATE_LIMITED_CODE in response.text
+
+
 async def _get_access_token(client: httpx.AsyncClient, force_refresh: bool = False) -> str:
     """토큰 발급 (메모리 캐시 + Lock으로 동시 발급 방지)
 
@@ -266,8 +275,9 @@ async def _kis_request(
 ) -> httpx.Response:
     """KIS 인증 요청.
 
-    KIS가 로컬 만료시각보다 먼저 기존 토큰을 폐기하는 경우가 있어
-    EGW00123 응답을 받으면 캐시를 버리고 새 토큰으로 1회 재시도한다.
+    재시도 처리:
+    - EGW00123 (토큰 만료): 캐시 폐기 후 새 토큰으로 1회 재시도
+    - EGW00201 (초당 거래건수 초과): 1초 대기 후 1회 재시도
     """
     async def _send(force_refresh: bool) -> httpx.Response:
         token = await _get_access_token(client, force_refresh=force_refresh)
@@ -275,11 +285,19 @@ async def _kis_request(
         return await client.request(method, url, headers=request_headers, **kwargs)
 
     response = await _send(force_refresh=False)
-    if not _is_token_expired_response(response):
-        return response
 
-    logger.warning("KIS 토큰 만료 응답(EGW00123), 토큰 재발급 후 재시도")
-    return await _send(force_refresh=True)
+    # 토큰 만료 → 재발급 후 재시도
+    if _is_token_expired_response(response):
+        logger.warning("KIS 토큰 만료 응답(EGW00123), 토큰 재발급 후 재시도")
+        response = await _send(force_refresh=True)
+
+    # 초당 거래건수 초과 → 1초 대기 후 재시도
+    if _is_rate_limited_response(response):
+        logger.warning("KIS 초당 거래건수 초과(EGW00201), 1초 대기 후 재시도")
+        await asyncio.sleep(1.0)
+        response = await _send(force_refresh=False)
+
+    return response
 
 
 async def get_minute_chart(symbol: str, period: str = "5") -> dict:
