@@ -578,7 +578,8 @@ async def get_buying_power(symbol: str, price: int = 0, order_dvsn: str = "01") 
             )
 
             if response.status_code != 200:
-                logger.warning("매수가능조회 실패: HTTP {}", response.status_code)
+                error = _response_summary(response)
+                logger.warning("매수가능조회 실패: HTTP {} — {}", response.status_code, error)
                 return {"success": False, "max_qty": 0, "available_cash": 0}
 
             result = response.json()
