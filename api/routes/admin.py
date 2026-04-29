@@ -593,6 +593,7 @@ async def analyze_holding(symbol: str):
     """
     from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
     from agent.market_scanner import market_scanner
+    from realtime.event_detector import event_detector
 
     try:
         holdings = await account_manager.get_holdings()
@@ -607,6 +608,9 @@ async def analyze_holding(symbol: str):
             f"시장 국면: {regime}"
         )
 
+        # 현재 활성 임계값 (LLM이 적정성 판단·조정 가능)
+        th = event_detector.get_thresholds(symbol)
+
         request = StockAnalysisRequest(
             symbol=h.symbol,
             name=h.name,
@@ -615,6 +619,9 @@ async def analyze_holding(symbol: str):
             avg_price=h.avg_buy_price,
             pnl_rate=h.pnl_rate,
             quantity=h.quantity,
+            active_stop_loss=getattr(th, "stop_loss", 0) or 0,
+            active_take_profit=getattr(th, "take_profit", 0) or 0,
+            active_trailing_stop_pct=getattr(th, "trailing_stop_pct", 0) or 0,
             purpose="PERIODIC_REVIEW",
             market_context=market_ctx,
             trading_context="현재 시각: 관리자 수동 트리거",
