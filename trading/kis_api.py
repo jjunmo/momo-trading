@@ -26,6 +26,11 @@ _token_lock = asyncio.Lock()
 _cached_token: str | None = None
 _cached_expires_at: datetime | None = None
 
+# 글로벌 동시 호출 제한 — KIS 18 req/s 한계 안에서 안전 마진 두기
+# 분봉/Tier2/메인 수집 등 모든 KIS 호출이 이 Semaphore를 거침
+# 5: 동시 5건이면 0.3초당 5건 = 초당 ~15 req로 KIS 한계 안전 마진
+_kis_concurrency = asyncio.Semaphore(5)
+
 
 def _get_domain() -> str:
     """계좌 유형에 따른 도메인 반환 (조회 API는 실전 도메인 공통)"""
@@ -282,7 +287,9 @@ async def _kis_request(
     async def _send(force_refresh: bool) -> httpx.Response:
         token = await _get_access_token(client, force_refresh=force_refresh)
         request_headers = {**headers, "authorization": f"Bearer {token}"}
-        return await client.request(method, url, headers=request_headers, **kwargs)
+        # 글로벌 동시 호출 제한 — 분봉/Tier2/메인 수집 모든 KIS 호출 통합 제어
+        async with _kis_concurrency:
+            return await client.request(method, url, headers=request_headers, **kwargs)
 
     response = await _send(force_refresh=False)
 
@@ -291,55 +298,73 @@ async def _kis_request(
         logger.warning("KIS 토큰 만료 응답(EGW00123), 토큰 재발급 후 재시도")
         response = await _send(force_refresh=True)
 
-    # 초당 거래건수 초과 → 1초 대기 후 재시도
-    if _is_rate_limited_response(response):
-        logger.warning("KIS 초당 거래건수 초과(EGW00201), 1초 대기 후 재시도")
+    # 초당 거래건수 초과 → 1초 대기 후 최대 3회 재시도 (rate limit 일시 폭주 대응)
+    for attempt in range(1, 4):
+        if not _is_rate_limited_response(response):
+            break
+        logger.warning(
+            "KIS 초당 거래건수 초과(EGW00201), {}/3회 — 1초 대기 후 재시도", attempt
+        )
         await asyncio.sleep(1.0)
         response = await _send(force_refresh=False)
 
     return response
 
 
-async def get_minute_chart(symbol: str, period: str = "5") -> dict:
+async def get_minute_chart(symbol: str, period: str = "5", market: str = "J") -> dict:
     """국내 주식 분봉 차트 조회
 
     Args:
         symbol: 종목코드 (예: 005930)
         period: 분봉 간격 - "1", "5", "15", "30", "60"
+        market: 시장 구분 - "J"(KRX), "NX"(NXT). 첫 시도 후 빈 데이터면 "J"로 fallback.
 
     Returns:
         {"success": True, "prices": [{"time", "open", "high", "low", "close", "volume"}, ...]}
     """
     end_time = datetime.now().strftime("%H%M%S")
 
+    async def _fetch(mrkt_code: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await _kis_request(
+                    client,
+                    "GET",
+                    f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                    headers={
+                        "content-type": "application/json",
+                        "appkey": _get_app_key(),
+                        "appsecret": _get_app_secret(),
+                        "tr_id": "FHKST03010200",
+                    },
+                    params={
+                        "FID_ETC_CLS_CODE": "",
+                        "FID_COND_MRKT_DIV_CODE": mrkt_code,
+                        "FID_INPUT_ISCD": symbol,
+                        "FID_INPUT_HOUR_1": end_time,
+                        "FID_PW_DATA_INCU_YN": "N",
+                    },
+                )
+                if response.status_code != 200:
+                    return None
+                return response.json()
+        except Exception:
+            return None
+
+    # NXT 종목은 "NX" 시도 → 실패/빈 데이터면 "J"(KRX 동일종목)로 fallback
+    result = await _fetch(market)
+    if market == "NX":
+        out2 = (result or {}).get("output2", []) if result else []
+        if not out2:
+            logger.debug("[{}] NXT 분봉 빈 데이터 → KRX(J) fallback", symbol)
+            result = await _fetch("J")
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await _kis_request(
-                client,
-                "GET",
-                f"{DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-                headers={
-                    "content-type": "application/json",
-                    "appkey": _get_app_key(),
-                    "appsecret": _get_app_secret(),
-                    "tr_id": "FHKST03010200",
-                },
-                params={
-                    "FID_ETC_CLS_CODE": "",
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_INPUT_ISCD": symbol,
-                    "FID_INPUT_HOUR_1": end_time,
-                    "FID_PW_DATA_INCU_YN": "N",
-                },
-            )
+        if not result:
+            logger.warning("분봉 조회 실패 ({}): 응답 없음", symbol)
+            return {"success": False, "error": "응답 없음", "prices": []}
 
-            if response.status_code != 200:
-                logger.warning("분봉 조회 실패: HTTP {}", response.status_code)
-                return {"success": False, "error": f"HTTP {response.status_code}", "prices": []}
-
-            result = response.json()
-
-        if not result or "output2" not in result:
+        if "output2" not in result:
             return {"success": False, "error": "분봉 데이터 없음", "prices": []}
 
         prices = []
@@ -468,8 +493,9 @@ async def get_volume_rank(market: str = "J") -> dict:
         if not output:
             return {"success": False, "error": "거래량순위 데이터 없음", "stocks": []}
 
+        logger.debug("거래량순위 KIS 응답 길이: {}건", len(output))
         stocks = []
-        for item in output[:30]:  # 최대 30개
+        for item in output:
             stocks.append({
                 "symbol": item.get("mksc_shrn_iscd", item.get("stck_shrn_iscd", "")),
                 "name": item.get("hts_kor_isnm", ""),
@@ -482,6 +508,10 @@ async def get_volume_rank(market: str = "J") -> dict:
                 "prev_volume": item.get("prdy_vol", "0"),
                 "volume_increase_rate": item.get("vol_inrt", "0"),
                 "change_sign": item.get("prdy_vrss_sign", ""),
+                # OHLC — 갭/위꼬리/일중 변동폭 판정용
+                "open": item.get("stck_oprc", "0"),
+                "high": item.get("stck_hgpr", "0"),
+                "low": item.get("stck_lwpr", "0"),
             })
 
         logger.debug("거래량순위 조회 완료: {}건", len(stocks))
@@ -609,8 +639,11 @@ async def get_buying_power(symbol: str, price: int = 0, order_dvsn: str = "01") 
             logger.warning("매수가능조회 실패 ({}): {}", rt_cd, msg)
             return {"success": False, "max_qty": 0, "available_cash": 0}
 
+        # nrcvb_buy_amt(미수없는매수금액) = ord_psbl_cash + ruse_psbl_amt(매도자금 회전분)
+        # ord_psbl_cash만 쓰면 매도 후 결제대기 자금이 매수에 안 잡혀 회전매매 차단됨
+        # 미수(신용)는 쓰지 않으므로 nrcvb_buy_amt가 안전하면서 회전매매 자금 포함하는 정답 필드
         max_qty = int(output.get("nrcvb_buy_qty", "0"))
-        available_cash = int(output.get("ord_psbl_cash", "0"))
+        available_cash = int(output.get("nrcvb_buy_amt", "0"))
 
         logger.debug("매수가능조회 [{}]: max_qty={}, cash={:,}", symbol, max_qty, available_cash)
         return {"success": True, "max_qty": max_qty, "available_cash": available_cash}
@@ -735,8 +768,9 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
         if not output:
             return {"success": False, "error": "등락률순위 데이터 없음", "stocks": []}
 
+        logger.debug("등락률순위({}) KIS 응답 길이: {}건", sort, len(output))
         stocks = []
-        for item in output[:30]:  # 최대 30개
+        for item in output:
             stocks.append({
                 "symbol": item.get("mksc_shrn_iscd", item.get("stck_shrn_iscd", "")),
                 "name": item.get("hts_kor_isnm", ""),
@@ -747,6 +781,10 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
                 "volume": item.get("acml_vol", "0"),
                 "trade_amount": item.get("acml_tr_pbmn", "0"),
                 "change_sign": item.get("prdy_vrss_sign", ""),
+                # OHLC — 갭/위꼬리/일중 변동폭 판정용
+                "open": item.get("stck_oprc", "0"),
+                "high": item.get("stck_hgpr", "0"),
+                "low": item.get("stck_lwpr", "0"),
             })
 
         logger.debug("등락률순위({}) 조회 완료: {}건", sort, len(stocks))

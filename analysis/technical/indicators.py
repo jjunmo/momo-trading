@@ -48,12 +48,13 @@ class TechnicalIndicators:
                 if ema is not None and not ema.empty and not pd.isna(ema.iloc[-1]):
                     result[f"ema_{period}"] = round(ema.iloc[-1], 2)
 
-            # 볼린저밴드 (20, 2)
+            # 볼린저밴드 (20, 2) — pandas-ta 컬럼 순서: [BBL, BBM, BBU, BBB, BBP]
+            # 0=Lower, 1=Middle, 2=Upper (이전 코드는 0/2를 뒤바꿔 매핑하던 버그)
             bbands = ta.bbands(df["close"], length=20, std=2)
             if bbands is not None and not bbands.empty:
-                result["bb_upper"] = round(bbands.iloc[-1, 0], 2) if not pd.isna(bbands.iloc[-1, 0]) else None
+                result["bb_lower"] = round(bbands.iloc[-1, 0], 2) if not pd.isna(bbands.iloc[-1, 0]) else None
                 result["bb_middle"] = round(bbands.iloc[-1, 1], 2) if not pd.isna(bbands.iloc[-1, 1]) else None
-                result["bb_lower"] = round(bbands.iloc[-1, 2], 2) if not pd.isna(bbands.iloc[-1, 2]) else None
+                result["bb_upper"] = round(bbands.iloc[-1, 2], 2) if not pd.isna(bbands.iloc[-1, 2]) else None
 
             # 스토캐스틱 (14, 3, 3)
             stoch = ta.stoch(df["high"], df["low"], df["close"])
@@ -113,15 +114,15 @@ class TechnicalIndicators:
                             key = col.replace(" ", "_").lower()
                             result[f"ichimoku_{key}"] = round(val, 2)
 
-            # Williams %R (14일)
+            # Williams %R (14일) — 정상 범위 -100~0, 이상치 차단
             willr = ta.willr(df["high"], df["low"], df["close"], length=14)
             if willr is not None and not willr.empty and not pd.isna(willr.iloc[-1]):
-                result["williams_r"] = round(willr.iloc[-1], 2)
+                result["williams_r"] = round(max(-100.0, min(0.0, willr.iloc[-1])), 2)
 
-            # CCI (20일)
+            # CCI (20일) — 정상 범위 ±100~±300, 분모(MD) 0 근접 시 폭증 차단
             cci = ta.cci(df["high"], df["low"], df["close"], length=20)
             if cci is not None and not cci.empty and not pd.isna(cci.iloc[-1]):
-                result["cci_20"] = round(cci.iloc[-1], 2)
+                result["cci_20"] = round(max(-300.0, min(300.0, cci.iloc[-1])), 2)
 
             # OBV (On Balance Volume)
             obv = ta.obv(df["close"], df["volume"])
@@ -132,21 +133,22 @@ class TechnicalIndicators:
                     obv_slope = obv.iloc[-1] - obv.iloc[-5]
                     result["obv_trend"] = "rising" if obv_slope > 0 else "falling"
 
-            # ADX (추세 강도, 14일)
+            # ADX (추세 강도, 14일) — 정상 범위 0~100
             adx = ta.adx(df["high"], df["low"], df["close"], length=14)
             if adx is not None and not adx.empty:
                 adx_val = adx.iloc[-1, 0] if not pd.isna(adx.iloc[-1, 0]) else None
                 if adx_val is not None:
+                    adx_val = max(0.0, min(100.0, adx_val))
                     result["adx_14"] = round(adx_val, 2)
                     if adx_val >= 25:
                         result["trend_strength"] = "strong"
                     else:
                         result["trend_strength"] = "weak"
 
-            # MFI (Money Flow Index, 14일)
+            # MFI (Money Flow Index, 14일) — 정의상 0~100
             mfi = ta.mfi(df["high"], df["low"], df["close"], df["volume"], length=14)
             if mfi is not None and not mfi.empty and not pd.isna(mfi.iloc[-1]):
-                result["mfi_14"] = round(mfi.iloc[-1], 2)
+                result["mfi_14"] = round(max(0.0, min(100.0, mfi.iloc[-1])), 2)
 
             # 현재가 vs 이동평균 위치
             current_price = df["close"].iloc[-1]

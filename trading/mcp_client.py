@@ -653,8 +653,24 @@ class MCPClient:
                     })
                 resp.data["prices"] = prices
             else:
-                logger.warning("[{}] 일봉 데이터 키 누락 — keys: {}", symbol,
-                               list(resp.data.keys())[:10])
+                # KIS 응답 키 누락 — rt_cd/msg_cd 분석으로 진짜 원인 식별
+                rt_cd = resp.data.get("rt_cd", "")
+                msg_cd = resp.data.get("msg_cd", "")
+                msg1 = resp.data.get("msg1", "")
+                if rt_cd and rt_cd != "0":
+                    # KIS 비즈니스 에러 — 명시적 분기 (인증/유지보수/장애 식별)
+                    logger.warning(
+                        "[{}] 일봉 KIS 에러 응답 — rt_cd={}, msg_cd={}, msg1={}",
+                        symbol, rt_cd, msg_cd, msg1[:100],
+                    )
+                    # success=False로 강제 — 호출자가 빈 데이터 묵인 안 함
+                    resp.success = False
+                    resp.error = f"KIS 에러 ({msg_cd}): {msg1}"
+                else:
+                    logger.warning(
+                        "[{}] 일봉 데이터 키 누락 — keys: {}",
+                        symbol, list(resp.data.keys())[:10],
+                    )
         return resp
 
     async def place_order(

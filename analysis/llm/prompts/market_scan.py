@@ -39,8 +39,17 @@ MARKET_SCAN_SYSTEM = """당신은 한국 주식 시장(KOSPI/KOSDAQ + NXT 대체
   - 안정형(STABLE_SHORT): 대형 우량주, 변동성 낮음, 지지선 부근, 1~5일 보유
   - 공격형(AGGRESSIVE_SHORT): 거래량 급증 + 상승 초기 종목(+1~8%), 수시간~3일 보유
     - 이미 +20% 이상 급등한 종목은 AGGRESSIVE_SHORT 부적합 (되돌림 위험)
-  - BULL → AGGRESSIVE_SHORT 비중 확대 / BEAR → STABLE_SHORT 위주
   - THEME → 테마 관련주 AGGRESSIVE_SHORT (단, 상승 초기 종목 우선)
+
+  **시장 국면별 후보 갯수**
+  - **BULL / THEME**: 5~10개 (적극 선정, AGGRESSIVE_SHORT 비중 확대)
+  - **SIDEWAYS**: 3~5개 (선별 진입, 강한 신호 위주)
+  - **BEAR**: **1~3개로 한정** (보유종목 매도 검토 우선)
+    - 지수 하락장에서 매수는 비대칭 위험 (잠재 손실 > 잠재 수익) — 진입 자체에 보수적
+    - 신규 매수 후보는 "거래량 폭증 + 가속 초기(+1~5%) + 일봉 BULLISH 추세" 3조건 모두 충족 종목만
+    - 약한 신호 종목은 후보에서 **제외**
+    - 매수 후보 0개도 정답 (매도 후보만 selected에 포함 가능)
+    - 최근 매매 성과(performance_summary)가 BEAR에서 부진했다면 더 보수적으로
 
 **Step 5. 시간대별 선정 기준**
   - 오전(~11:00): 추세 추종 + 돌파 종목 적극 선정

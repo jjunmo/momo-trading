@@ -15,6 +15,20 @@ from trading.mcp_client import mcp_client
 # 모의투자 매매불가 종목 필터 키워드
 _EXCLUDE_NAME_KEYWORDS = ("ETN", "스팩", "SPAC")
 
+# 스캔 단계 분봉 캐시 — Tier2 분석에서 재사용해 KIS 호출 중복 제거
+# 사이클 단위로 매 scan() 호출 시 clear (stale 데이터 방지)
+_scan_minute_cache: dict[str, list[dict]] = {}
+
+
+def get_cached_minute_prices(symbol: str) -> list[dict] | None:
+    """스캔 단계에서 호출한 분봉 데이터 재사용 (Tier2 분석 진입점에서 호출)
+
+    Returns:
+        prices 리스트 (KIS 응답 형식: [{time, open, high, low, close, volume}, ...])
+        캐시 미스 시 None — 호출자가 별도 호출 결정
+    """
+    return _scan_minute_cache.get(symbol)
+
 
 class MarketScanner:
     """
@@ -189,6 +203,19 @@ class MarketScanner:
         # 시장 폭 계산: 상승/하락 종목수 → regime_agent에 전달
         self._update_market_breadth(volume_rank, surge_data, drop_data)
 
+        # 분봉 거래량 추이 enrich — LLM이 가속/정점 구분 가능하게
+        # 국면별 cap 차등 (이전 사이클 국면 기준 — 첫 사이클은 BULL default)
+        # BEAR에선 매수 자체가 비대칭 위험 → 분봉 호출 자원 절약
+        from agent.market_regime_agent import market_regime_agent
+        prev_regime = market_regime_agent.current_regime or "BULL"
+        if prev_regime == "BEAR":
+            enrich_cap = 10
+        elif prev_regime == "SIDEWAYS":
+            enrich_cap = 15
+        else:  # BULL / THEME
+            enrich_cap = 30
+        await self._enrich_with_volume_trend(volume_rank, surge_data, drop_data, cap=enrich_cap)
+
         # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
         from util.time_util import now_kst
         from core.config import settings as _settings
@@ -321,7 +348,7 @@ class MarketScanner:
             return {"selected": [], "market_summary": "스캔 실패", "available_cash": available_cash}
 
     async def _get_performance_summary(self) -> str:
-        """과거 매매 성과 요약 텍스트 생성"""
+        """과거 매매 성과 요약 — 신뢰도/국면/시간대별 분리 통계 (LLM 패턴 인식 강화)"""
         try:
             async with AsyncSessionLocal() as session:
                 tracker = PerformanceTracker(session)
@@ -346,10 +373,72 @@ class MarketScanner:
                     f"평균수익률 {stat.avg_return:+.2f}%"
                 )
 
+            # 신뢰도/국면/시간대별 분리 통계 (DB 직접 쿼리, 최근 14일)
+            try:
+                lines.extend(await self._build_segmented_stats())
+            except Exception as e:
+                logger.debug("분리 통계 생성 실패: {}", str(e))
+
             return "\n".join(lines)
         except Exception as e:
             logger.warning("성과 요약 조회 실패: {}", str(e))
             return "매매 이력 없음"
+
+    async def _build_segmented_stats(self) -> list[str]:
+        """신뢰도/국면/시간대별 승률 통계 (최근 14일)"""
+        from sqlalchemy import select, and_, func
+        from datetime import timedelta
+        from util.time_util import now_kst
+        from models.trade_result import TradeResult
+
+        cutoff = now_kst() - timedelta(days=14)
+        lines: list[str] = []
+
+        async with AsyncSessionLocal() as session:
+            # 신뢰도 구간별
+            confidence_buckets = [
+                ("<0.60", 0.0, 0.60), ("0.60~0.70", 0.60, 0.70), ("0.70+", 0.70, 1.01),
+            ]
+            conf_rows = []
+            for label, lo, hi in confidence_buckets:
+                stmt = select(
+                    func.count(TradeResult.id),
+                    func.sum(TradeResult.is_win.cast(__import__("sqlalchemy").Integer)),
+                    func.avg(TradeResult.return_pct),
+                ).where(and_(
+                    TradeResult.side == "SELL",
+                    TradeResult.created_at >= cutoff,
+                    TradeResult.ai_confidence >= lo,
+                    TradeResult.ai_confidence < hi,
+                ))
+                r = (await session.execute(stmt)).first()
+                if r and r[0] and r[0] > 0:
+                    cnt, wins, avg = r[0], r[1] or 0, r[2] or 0
+                    conf_rows.append(f"신뢰도 {label}: {cnt}건 승률 {wins / cnt * 100:.0f}% 평균 {avg:+.2f}%")
+            if conf_rows:
+                lines.append("[신뢰도별 14일] " + " | ".join(conf_rows))
+
+            # 국면별
+            regime_stmt = select(
+                TradeResult.market_regime,
+                func.count(TradeResult.id),
+                func.sum(TradeResult.is_win.cast(__import__("sqlalchemy").Integer)),
+                func.avg(TradeResult.return_pct),
+            ).where(and_(
+                TradeResult.side == "SELL",
+                TradeResult.created_at >= cutoff,
+            )).group_by(TradeResult.market_regime)
+            regime_rows = []
+            for row in (await session.execute(regime_stmt)).all():
+                regime, cnt, wins, avg = row
+                if cnt and cnt > 0 and regime:
+                    regime_rows.append(
+                        f"{regime}: {cnt}건 승률 {(wins or 0) / cnt * 100:.0f}% 평균 {(avg or 0):+.2f}%"
+                    )
+            if regime_rows:
+                lines.append("[국면별 14일] " + " | ".join(regime_rows))
+
+        return lines
 
     def _markets_to_scan(self) -> list[str]:
         """현재 세션 → 스캔할 시장 목록.
@@ -469,7 +558,7 @@ class MarketScanner:
         if not data:
             return "데이터 없음"
         lines = []
-        for i, item in enumerate(data[:15], 1):
+        for i, item in enumerate(data, 1):
             symbol = item.get("symbol", item.get("code", ""))
             name = item.get("name", "")
             price = item.get("price", item.get("current_price", ""))
@@ -486,11 +575,140 @@ class MarketScanner:
                 vol_inc_str = f"(전일비{vol_inc_f:+.0f}%)" if vol_inc_f != 0 else ""
             except (ValueError, TypeError):
                 vol_inc_str = ""
+            # OHLC — 시가/고가/저가 (갭·위꼬리·변동폭 판정)
+            ohlc_str = self._format_ohlc(item, price)
+            # 분봉 거래량 추이 (가속/정점 판정)
+            vol_trend = item.get("_volume_trend", "")
+            trend_str = f" {vol_trend}" if vol_trend else ""
             lines.append(
-                f"{i}. {market_tag}{name}({symbol}) {price}원 {change_rate}% "
-                f"거래량:{volume}{vol_inc_str}{amount_str}"
+                f"{i}. {market_tag}{name}({symbol}) {price}원 {change_rate}%{ohlc_str} "
+                f"거래량:{volume}{vol_inc_str}{trend_str}{amount_str}"
             )
         return "\n".join(lines)
+
+    async def _enrich_with_volume_trend(
+        self, *data_lists: list[dict], cap: int = 30
+    ) -> None:
+        """후보 종목에 분봉 거래량 추이 주입 + 분봉 데이터 캐시
+
+        KIS rate limit(18 req/s) 부담 줄이기 위해:
+        - unique 종목 cap개까지만 분봉 호출
+        - Semaphore(5)로 동시 호출 제한 (자동 재시도와 결합해 안정)
+        - 호출 결과를 모듈 캐시(_scan_minute_cache)에 저장 → Tier2 분석에서 재사용
+        KRX 외 시장(NXT) 호출 실패 시 빈 trend로 처리 (LLM은 그 종목 trend 없이 진행).
+        """
+        # 새 사이클 시작 — 이전 캐시 비우기
+        _scan_minute_cache.clear()
+
+        # unique symbol 추출 + 시장 정보 보존 (NXT/KRX 구분)
+        seen: set[str] = set()
+        candidates: list[tuple[str, str]] = []  # [(symbol, market), ...]
+        for data in data_lists:
+            for item in data:
+                sym = item.get("symbol", item.get("code", ""))
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    market = item.get("market", "KRX")
+                    candidates.append((sym, market))
+                    if len(candidates) >= cap:
+                        break
+            if len(candidates) >= cap:
+                break
+
+        if not candidates:
+            return
+
+        from trading.kis_api import get_minute_chart
+
+        # 동시 호출 5건으로 제한 — KIS rate limit 18 req/s에 여유 둠
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_one(sym: str, market: str):
+            async with sem:
+                try:
+                    # NXT 종목은 "NX" 시도 → 빈 데이터면 "J" fallback (get_minute_chart 내부 처리)
+                    market_code = "NX" if market == "NXT" else "J"
+                    return sym, await get_minute_chart(sym, market=market_code)
+                except Exception as e:
+                    logger.debug("분봉 enrich 실패 ({}): {}", sym, str(e))
+                    return sym, None
+
+        results = await asyncio.gather(*[fetch_one(sym, market) for sym, market in candidates])
+
+        trend_map: dict[str, str] = {}
+        for sym, resp in results:
+            if not resp or not resp.get("success"):
+                continue
+            prices = resp.get("prices", [])
+            if not prices:
+                continue
+            # 캐시 저장 — Tier2 분석에서 재사용 (분봉 중복 호출 방지)
+            _scan_minute_cache[sym] = prices
+            # KIS 응답은 최신 → 과거 순. 최근 5봉 거래량 추출
+            volumes: list[int] = []
+            for p in prices[:5]:
+                try:
+                    v = int(str(p.get("volume", "0")).replace(",", ""))
+                    volumes.append(v)
+                except (ValueError, TypeError):
+                    continue
+            if len(volumes) < 2:
+                continue
+            # 시간순 정렬 (오래된 → 최신)
+            volumes.reverse()
+            trend_map[sym] = self._format_volume_trend(volumes)
+
+        # 모든 list의 모든 item에 trend 주입 (같은 symbol이면 같은 trend)
+        for data in data_lists:
+            for item in data:
+                sym = item.get("symbol", item.get("code", ""))
+                if sym in trend_map:
+                    item["_volume_trend"] = trend_map[sym]
+
+        logger.debug(
+            "분봉 거래량 추이 enrich: {}/{} 성공, 캐시 {}건",
+            len(trend_map), len(candidates), len(_scan_minute_cache),
+        )
+
+    @staticmethod
+    def _format_volume_trend(volumes: list[int]) -> str:
+        """거래량 5분봉 추이 → 가속/정점 판정 텍스트"""
+        if len(volumes) < 2:
+            return ""
+
+        def _fmt(v: int) -> str:
+            if v >= 1_000_000:
+                return f"{v / 1_000_000:.1f}M"
+            if v >= 1_000:
+                return f"{v / 1_000:.0f}K"
+            return str(v)
+
+        seq = "/".join(_fmt(v) for v in volumes)
+        last, prev = volumes[-1], volumes[-2]
+        if prev <= 0:
+            label = ""
+        elif last > prev * 1.2:
+            label = " 가속↑"
+        elif last < prev * 0.8:
+            label = " 감속↓"
+        else:
+            label = " 보합"
+        return f"[5분봉:{seq}{label}]"
+
+    @staticmethod
+    def _format_ohlc(item: dict, current_price) -> str:
+        """OHLC 표시 — 갭/위꼬리/저점반등 패턴 LLM 노출"""
+        try:
+            o = float(str(item.get("open", "0")).replace(",", ""))
+            h = float(str(item.get("high", "0")).replace(",", ""))
+            lo = float(str(item.get("low", "0")).replace(",", ""))
+            c = float(str(current_price).replace(",", ""))
+            if o <= 0 or h <= 0 or lo <= 0:
+                return ""
+            # 시가→고가→저가→현재 형태로 일중 흐름 시각화
+            return f" (시{int(o):,}→고{int(h):,}→저{int(lo):,})"
+        except (ValueError, TypeError):
+            return ""
 
     def _format_holdings(self, holdings) -> str:
         if not holdings:
