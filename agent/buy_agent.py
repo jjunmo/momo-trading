@@ -53,9 +53,18 @@ class BuyAgent(BaseAgent):
         self._running = False
 
     async def execute(self, params: BuyParams) -> dict:
-        """매수 실행 — 리스크 검증 → 주문 → PriceGuard 등록"""
+        """매수 실행 — 리스크 검증 → 주문 → PriceGuard 등록
+
+        종목별 lock으로 동시 매수/매도/실시간 손절 race 방지.
+        """
         result = {"symbol": params.symbol, "executed": False}
 
+        # 종목별 lock — 사이클 매수 vs 실시간 손절 race 방지
+        from agent.trading_agent import trading_agent
+        async with trading_agent.get_symbol_lock(params.symbol):
+            return await self._execute_locked(params, result)
+
+    async def _execute_locked(self, params: BuyParams, result: dict) -> dict:
         try:
             from trading.account_manager import account_manager
             balance, holdings = await account_manager.get_account_snapshot()

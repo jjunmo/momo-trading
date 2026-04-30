@@ -43,10 +43,16 @@ class SellAgent(BaseAgent):
         self._running = False
 
     async def execute_sell(self, params: SellParams) -> bool:
-        """시장가 매도 실행"""
+        """시장가 매도 실행 — 종목별 lock으로 매수/매도/실시간 손절 race 방지"""
         if not settings.TRADING_ENABLED:
             return False
 
+        # 종목별 lock — buy_agent.execute, event_detector 손절과 동일 lock
+        from agent.trading_agent import trading_agent
+        async with trading_agent.get_symbol_lock(params.symbol):
+            return await self._execute_sell_locked(params)
+
+    async def _execute_sell_locked(self, params: SellParams) -> bool:
         try:
             from trading.account_manager import account_manager
             holdings = await account_manager.get_holdings()
@@ -99,6 +105,14 @@ class SellAgent(BaseAgent):
                 # NOTE: 이전에 여기서 `market_scanner.add_untradeable(params.symbol)`를
                 # 무조건 호출했음 → 매도한 종목이 영구 블록되어 재매수 불가 (버그).
                 # 매매불가 블록은 decision_maker에서 실제 에러 메시지 기반으로만 수행.
+
+                # 매도 성공 → 재진입 cooldown 등록 (손절·익절 통합)
+                try:
+                    from agent.trading_agent import trading_agent
+                    trading_agent.set_exit_cooldown(params.symbol)
+                except Exception as e:
+                    logger.debug("[SellAgent] cooldown 등록 실패 ({}): {}", params.symbol, str(e))
+
                 return True
             else:
                 # 실패 → 임계값 복원

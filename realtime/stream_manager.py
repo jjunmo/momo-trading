@@ -89,8 +89,42 @@ class StreamManager:
                         # 기존 구독 복원
                         for symbol, market in self._priority_symbols.items():
                             await kis_websocket.subscribe(symbol, market)
+
+                        # WS gap 보호: 재연결 직후 보유종목 가격 폴링 1회
+                        # 5초 gap 동안 손절선 통과한 케이스 즉시 보정
+                        await self._poll_after_reconnect()
                     except Exception as re:
                         logger.error("재연결 실패: {}", str(re))
+
+    async def _poll_after_reconnect(self) -> None:
+        """재연결 직후 보유종목 현재가 1회 폴링 → 손절/익절 임계값 즉시 체크.
+
+        WS 재연결 5초 gap 동안 손절선 통과 케이스 누락 방지.
+        """
+        try:
+            from trading.account_manager import account_manager
+            from trading.mcp_client import mcp_client
+            from realtime.event_detector import event_detector
+
+            holdings = await account_manager.get_holdings()
+            if not holdings:
+                return
+
+            logger.info("WS 재연결 gap 보호: 보유 {}종목 현재가 폴링", len(holdings))
+
+            for h in holdings:
+                try:
+                    resp = await mcp_client.get_current_price(h.symbol)
+                    if not (resp.success and resp.data):
+                        continue
+                    price = float(resp.data.get("price", resp.data.get("current_price", 0)) or 0)
+                    if price > 0:
+                        # event_detector가 손절·익절 체크 + 발동
+                        await event_detector.on_price_update({"symbol": h.symbol, "price": price})
+                except Exception as e:
+                    logger.debug("[{}] 폴링 실패: {}", h.symbol, str(e))
+        except Exception as e:
+            logger.warning("재연결 후 폴링 처리 실패: {}", str(e))
 
     @property
     def subscription_count(self) -> int:

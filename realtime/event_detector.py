@@ -170,6 +170,8 @@ class PriceGuard:
             exit_reason = "TRAILING_STOP" if is_trailing else "STOP_LOSS"
             logger.warning("{} 도달: {} (현재 {:,.0f}, 손절 {:,.0f})",
                            label, symbol, price, th.stop_loss)
+
+            # sell_agent.execute_sell 자체가 종목별 lock 잡음 → 매수/사이클 race 차단
             from agent.sell_agent import SellParams, sell_agent
             import asyncio
             asyncio.create_task(sell_agent.execute_sell(SellParams(symbol=symbol, exit_reason=exit_reason)))

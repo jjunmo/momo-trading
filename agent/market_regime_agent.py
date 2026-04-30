@@ -105,12 +105,27 @@ class MarketRegimeAgent(BaseAgent):
         self._on_scan_trigger_callback = callback
 
     def set_regime(self, regime: str) -> None:
-        """외부에서 국면 설정 (MarketScanAgent 결과 반영)"""
+        """외부에서 국면 설정 (MarketScanAgent 결과 반영) — 변화 시 콜백 트리거"""
         if regime and regime != self._current_regime:
-            self._previous_regime = self._current_regime
+            old = self._current_regime
+            self._previous_regime = old
             self._current_regime = regime
             self._regime_changed_at = time.time()
-            logger.info("시장 국면 변경: {} → {} (외부 설정)", self._previous_regime or "없음", regime)
+            logger.info("시장 국면 변경: {} → {} (외부 설정)", old or "없음", regime)
+
+            # 분석 결과 무효화 + 보유종목 즉시 재평가 콜백 (내부 감지 경로와 동일)
+            try:
+                from agent.stock_analysis_agent import stock_analysis_agent
+                stock_analysis_agent.invalidate_all()
+                logger.info("국면 변화(외부) → 분석 결과 전체 무효화")
+            except Exception:
+                pass
+
+            if self._on_regime_change_callback and old:
+                try:
+                    asyncio.create_task(self._on_regime_change_callback(regime, old))
+                except Exception as e:
+                    logger.warning("국면 변경 콜백 트리거 실패: {}", str(e))
 
     async def start(self) -> None:
         """국면 감시 + 동적 스캔 루프 시작"""

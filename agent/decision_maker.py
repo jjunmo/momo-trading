@@ -127,6 +127,13 @@ class DecisionMaker:
                 expected_price=price,
                 analysis_context=analysis_context,
             )
+            # 주문 접수 즉시 계좌 캐시 무효화 — 다음 분석이 stale cash로 과다 매수 방지
+            try:
+                from trading.account_manager import account_manager
+                account_manager.invalidate_cache()
+            except Exception as e:
+                logger.debug("주문 접수 후 계좌 캐시 무효화 실패: {}", str(e))
+
             # 체결 확인 + TradeResult 업데이트 (백그라운드, 매매 흐름 차단 안 함)
             task = asyncio.create_task(
                 self.confirm_and_record(

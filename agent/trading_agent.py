@@ -47,9 +47,12 @@ class TradingAgent:
         self._last_cycle_time = None
         # 실시간 이벤트 중복 분석 방지 (종목별 쿨다운)
         self._analyzing: set[str] = set()
-        self._cooldowns: dict[str, float] = {}  # symbol -> last_trigger_time
+        self._cooldowns: dict[str, float] = {}  # symbol -> last_trigger_time (이벤트 분석)
+        self._exit_cooldowns: dict[str, float] = {}  # symbol -> 매도 시각 (재진입 차단)
+        self._symbol_locks: dict[str, asyncio.Lock] = {}  # 종목별 lock (사이클·실시간 race 방지)
+        self._emergency_stop_until: float = 0.0  # 시장 급락 emergency stop 만료 시각 (epoch)
         self.EVENT_COOLDOWN_SEC = 120  # 동일 종목 재분석 최소 간격 (초)
-        self.EXIT_COOLDOWN_SEC = 1800  # 손절/익절 후 재진입 차단 (30분)
+        self.EXIT_COOLDOWN_SEC = 1800  # 손절/익절 후 재진입 차단 (30분, 손절·익절 통합)
         # 사이클 내 시장 컨텍스트 캐시 (Tier1/Tier2에 전달)
         self._market_context: str = ""
         # 시장 국면 (전략/리스크에 전달)
@@ -82,7 +85,51 @@ class TradingAgent:
         from agent.buy_agent import buy_agent
         await sell_agent.start()
         await buy_agent.start()
-        logger.debug("AI Trading Agent 시작 — SellAgent/BuyAgent 활성화")
+
+        # 국면 변화 콜백 등록 — 변화 감지 시 보유종목 즉시 재평가
+        from agent.market_regime_agent import market_regime_agent
+        market_regime_agent.set_regime_change_callback(self._on_regime_changed)
+
+        logger.debug("AI Trading Agent 시작 — SellAgent/BuyAgent 활성화 + 국면 콜백 등록")
+
+    async def _on_regime_changed(self, new_regime: str, old_regime: str) -> None:
+        """국면 변화 감지 시 보유종목 즉시 Tier2 재분석 트리거.
+
+        손절선 조정/매도 결정이 다음 사이클까지 늦어지지 않도록 즉시 처리.
+        """
+        try:
+            from trading.account_manager import account_manager
+            from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
+            from realtime.event_detector import event_detector
+
+            holdings = await account_manager.get_holdings()
+            if not holdings:
+                logger.info("국면 변화({}→{}) → 보유종목 없음, 재평가 스킵", old_regime, new_regime)
+                return
+
+            logger.info(
+                "국면 변화({}→{}) → 보유 {}종목 즉시 재평가 트리거",
+                old_regime, new_regime, len(holdings),
+            )
+
+            async def _reanalyze(h):
+                try:
+                    th = event_detector.get_thresholds(h.symbol)
+                    request = StockAnalysisRequest(
+                        symbol=h.symbol, name=h.name, strategy_type="STABLE_SHORT",
+                        purpose="REGIME_CHANGE", is_holding=True,
+                        avg_price=h.avg_buy_price, pnl_rate=h.pnl_rate, quantity=h.quantity,
+                        active_stop_loss=getattr(th, "stop_loss", 0) or 0,
+                        active_take_profit=getattr(th, "take_profit", 0) or 0,
+                        active_trailing_stop_pct=getattr(th, "trailing_stop_pct", 0) or 0,
+                    )
+                    await stock_analysis_agent.analyze(request, force=True)
+                except Exception as e:
+                    logger.warning("[{}] 국면 변화 재평가 실패: {}", h.symbol, str(e))
+
+            await asyncio.gather(*[_reanalyze(h) for h in holdings], return_exceptions=True)
+        except Exception as e:
+            logger.warning("국면 변화 콜백 처리 실패: {}", str(e))
 
     async def stop(self) -> None:
         """에이전트 중지"""
@@ -103,6 +150,36 @@ class TradingAgent:
     def _release_sell(self, symbol: str) -> None:
         """매도 잠금 해제"""
         self._selling.discard(symbol)
+
+    def set_exit_cooldown(self, symbol: str) -> None:
+        """매도 성공 시 호출 — 손절·익절 모두 동일 cooldown 적용 (재진입 차단)"""
+        import time as _time
+        self._exit_cooldowns[symbol] = _time.time()
+        logger.info(
+            "[{}] 매도 후 재진입 cooldown 시작 ({}분)",
+            symbol, self.EXIT_COOLDOWN_SEC // 60,
+        )
+
+    def is_in_exit_cooldown(self, symbol: str) -> bool:
+        """매도 후 cooldown 중인지 확인 (만료 시 자동 정리)"""
+        import time as _time
+        last = self._exit_cooldowns.get(symbol)
+        if last is None:
+            return False
+        elapsed = _time.time() - last
+        if elapsed < self.EXIT_COOLDOWN_SEC:
+            return True
+        # 만료 → 자동 정리
+        self._exit_cooldowns.pop(symbol, None)
+        return False
+
+    def get_symbol_lock(self, symbol: str) -> asyncio.Lock:
+        """종목별 lock — 사이클 분석/실시간 손절/매수/매도 모두 같은 lock 거침
+        Race condition 방지: 분석 중 손절 트리거되면 분석 끝날 때까지 대기.
+        """
+        if symbol not in self._symbol_locks:
+            self._symbol_locks[symbol] = asyncio.Lock()
+        return self._symbol_locks[symbol]
 
     def _resolve_name(self, symbol: str) -> str:
         """종목코드 → 종목명 반환 (캐시에 없으면 코드 그대로)"""
@@ -191,6 +268,35 @@ class TradingAgent:
                 self._daily_start_balance = snapshot["total_asset"]
 
             buy_blocked = False
+
+            # ── 시장 급락 emergency stop: KOSPI/KOSDAQ -3% 이상 → 매수 1시간 차단 ──
+            try:
+                from agent.market_regime_agent import market_regime_agent
+                kospi_rate = market_regime_agent._last_kospi.get("change_rate", 0) if market_regime_agent._last_kospi.get("success") else 0
+                kosdaq_rate = market_regime_agent._last_kosdaq.get("change_rate", 0) if market_regime_agent._last_kosdaq.get("success") else 0
+                worst = min(kospi_rate, kosdaq_rate)
+                if worst <= -3.0:
+                    import time as _t
+                    self._emergency_stop_until = _t.time() + 3600  # 1시간 차단
+                    logger.warning(
+                        "🚨 시장 급락 emergency stop: KOSPI {:.2f}% / KOSDAQ {:.2f}% → 매수 1시간 차단",
+                        kospi_rate, kosdaq_rate,
+                    )
+                    await activity_logger.log(
+                        ActivityType.CYCLE, ActivityPhase.PROGRESS,
+                        f"🚨 시장 급락 매수 차단: KOSPI {kospi_rate:+.2f}% / KOSDAQ {kosdaq_rate:+.2f}% "
+                        f"→ 매수 1시간 차단 (보유종목 매도는 정상)",
+                        cycle_id=cycle_id,
+                    )
+            except Exception:
+                pass
+
+            # emergency stop 미만료 시 매수 차단
+            import time as _t
+            if _t.time() < self._emergency_stop_until:
+                buy_blocked = True
+                remaining_sec = int(self._emergency_stop_until - _t.time())
+                logger.info("emergency stop 활성: 매수 차단 ({}초 남음)", remaining_sec)
 
             # ── 서킷브레이커: 일일 손실 한도 ──
             daily_pnl_pct = 0.0
@@ -311,6 +417,10 @@ class TradingAgent:
                     if not is_holding and buy_blocked:
                         return {"symbol": symbol, "skipped": True, "reason": "매수 차단"}
 
+                    # 비보유 + 매도 후 cooldown 중 → 스킵 (손절·익절 후 재진입 차단)
+                    if not is_holding and self.is_in_exit_cooldown(symbol):
+                        return {"symbol": symbol, "skipped": True, "reason": f"매도 cooldown ({self.EXIT_COOLDOWN_SEC // 60}분)"}
+
                     # 비보유 + 주문가능금액으로 1주도 못 사는 종목 → 분석 스킵 (LLM 비용 절감)
                     if not is_holding:
                         try:
@@ -344,7 +454,15 @@ class TradingAgent:
                     if cached and cached.success:
                         from agent.market_regime_agent import market_regime_agent
                         elapsed = _time.time() - cached.analyzed_at
-                        if elapsed < market_regime_agent.scan_interval_sec:
+                        # 국면 변화 검사 — 분석 시점 국면 != 현재면 캐시 무효화 (강제 재분석)
+                        current_regime = market_regime_agent.current_regime or ""
+                        if cached.analyzed_regime and cached.analyzed_regime != current_regime:
+                            logger.info(
+                                "[{}] 국면 변화 감지 ({} → {}) → 캐시 무효, 재분석",
+                                symbol, cached.analyzed_regime, current_regime,
+                            )
+                            stock_analysis_agent.invalidate(symbol)
+                        elif elapsed < market_regime_agent.scan_interval_sec:
                             logger.debug("[{}] 기존 분석 결과 사용 ({:.0f}초 전)", symbol, elapsed)
                             return _route_by_result(cached, symbol, is_holding)
 
