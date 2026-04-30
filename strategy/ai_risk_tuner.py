@@ -90,11 +90,14 @@ class AIRiskTuner:
 
             reasoning = limits.get("reasoning", "")
             reasoning_short = reasoning[:100] if reasoning else ""
+            # 0은 "무제한" 의미 — 사람/LLM이 "0원으로 잠금"으로 오해하지 않도록 명시
+            trades_label = f"{limits['max_daily_trades']}회" if limits['max_daily_trades'] > 0 else "무제한"
+            order_label = f"{limits['max_single_order_krw']:,.0f}원" if limits['max_single_order_krw'] > 0 else "무제한"
             await activity_logger.log(
                 ActivityType.RISK_TUNING, ActivityPhase.COMPLETE,
                 f"\U0001f3af AI 한도 결정 ({risk_appetite}): "
-                f"일일거래 {limits['max_daily_trades']}회, "
-                f"주문한도 {limits['max_single_order_krw']:,.0f}원, "
+                f"일일거래 {trades_label}, "
+                f"주문한도 {order_label}, "
                 f"포지션 {limits['max_position_pct']:.0f}%"
                 f"{f' — {reasoning_short}' if reasoning_short else ''}",
                 cycle_id=cycle_id,
