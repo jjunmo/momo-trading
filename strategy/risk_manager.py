@@ -91,12 +91,51 @@ class RiskManager:
 
         total_amount = price * quantity
 
-        # 리스크:보상 비율 검사 (다른 조정 전에 먼저 확인)
+        # 가격 무결성 + R:R 검사 (다른 조정 전에 먼저 확인)
+        # LLM reason의 R:R 표기 무시하고 코드가 직접 계산
         entry = signal.suggested_price or 0
         target = signal.target_price or 0
         stop = signal.stop_loss_price or 0
 
-        if entry > 0 and target > 0 and stop > 0:
+        # BUY signal — 가격 무결성 + 방향성 + R:R 모두 강제
+        if signal.action == SignalAction.BUY:
+            # 1. 무결성: entry/target/stop 모두 양수
+            if entry <= 0 or target <= 0 or stop <= 0:
+                result = {
+                    "approved": False,
+                    "reason": f"BUY 가격 무결성 부족 (entry={entry:.0f}, target={target:.0f}, stop={stop:.0f})",
+                    "adjusted_quantity": None,
+                }
+                await self._log_result(symbol, result, today_trade_count, cycle_id)
+                return result
+            # 2. 방향성: BUY는 target > entry, stop < entry
+            if target <= entry or stop >= entry:
+                result = {
+                    "approved": False,
+                    "reason": (
+                        f"BUY 가격 방향성 위반 (target={target:.0f} <= entry={entry:.0f} "
+                        f"또는 stop={stop:.0f} >= entry={entry:.0f})"
+                    ),
+                    "adjusted_quantity": None,
+                }
+                await self._log_result(symbol, result, today_trade_count, cycle_id)
+                return result
+            # 3. R:R 코드 직접 산출 (LLM reason 무시)
+            reward = target - entry
+            risk = entry - stop
+            if risk > 0:
+                rr_ratio = reward / risk
+                min_rr = self.RR_FLOOR.get(market_regime, 1.2)
+                if rr_ratio < min_rr:
+                    result = {
+                        "approved": False,
+                        "reason": f"리스크:보상 비율 부족 ({rr_ratio:.2f}:1, 최소 {min_rr}:1 필요, 시장국면={market_regime})",
+                        "adjusted_quantity": None,
+                    }
+                    await self._log_result(symbol, result, today_trade_count, cycle_id)
+                    return result
+        # SELL signal — 가격이 모두 입력된 경우만 R:R 참고 (LLM이 SELL에서 target/stop 안 줘도 됨)
+        elif entry > 0 and target > 0 and stop > 0:
             reward = abs(target - entry)
             risk = abs(entry - stop)
             if risk > 0:
@@ -105,7 +144,7 @@ class RiskManager:
                 if rr_ratio < min_rr:
                     result = {
                         "approved": False,
-                        "reason": f"리스크:보상 비율 부족 ({rr_ratio:.1f}:1, 최소 {min_rr}:1 필요)",
+                        "reason": f"리스크:보상 비율 부족 ({rr_ratio:.2f}:1, 최소 {min_rr}:1 필요)",
                         "adjusted_quantity": None,
                     }
                     await self._log_result(symbol, result, today_trade_count, cycle_id)

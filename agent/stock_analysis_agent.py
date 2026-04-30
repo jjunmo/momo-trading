@@ -85,6 +85,7 @@ class StockAnalysisResult:
     hold_strategy: str = "DAY_CLOSE"  # OVERNIGHT / DAY_CLOSE
     # 메타
     analyzed_at: float = 0.0
+    analyzed_regime: str = ""  # 분석 시점 시장 국면 — 국면 변화 시 캐시 무효화
     provider: str = ""
     key_factors: list = field(default_factory=list)
     raw_analysis: dict = field(default_factory=dict)
@@ -164,6 +165,31 @@ class StockAnalysisAgent(BaseAgent):
         result.analysis = parsed.get("analysis", "")
         result.target_price = float(parsed.get("target_price", 0))
         result.stop_loss_price = float(parsed.get("stop_loss_price", 0))
+
+        # LLM 응답 무결성 검증 — BUY 추천 시 target/stop 방향성 강제
+        # BUY: target > 현재가 (상승 여력), stop < 현재가 (하락 보호)
+        # 위반 시 HOLD 강등 — risk_manager 도달 전 1차 안전망
+        if result.recommendation == "BUY" and current_price > 0:
+            invalid = (
+                result.target_price <= 0
+                or result.stop_loss_price <= 0
+                or result.target_price <= current_price
+                or result.stop_loss_price >= current_price
+            )
+            if invalid:
+                original_reason = result.reason
+                result.recommendation = "HOLD"
+                result.reason = (
+                    f"⚠️ LLM 응답 무결성 위반 → BUY→HOLD 강등 "
+                    f"(target={result.target_price:,.0f} / stop={result.stop_loss_price:,.0f} / "
+                    f"현재가={current_price:,.0f}). 원래 reason: {original_reason}"
+                )
+                logger.warning(
+                    "[{}] LLM BUY 응답 무결성 위반 → HOLD 강등: "
+                    "target={:.0f}, stop={:.0f}, 현재가={:.0f}",
+                    request.symbol, result.target_price, result.stop_loss_price, current_price,
+                )
+
         result.trailing_stop_pct = float(parsed.get("trailing_stop_pct", 0))
         result.breakeven_trigger_pct = float(parsed.get("breakeven_trigger_pct", 0))
         result.review_threshold_pct = float(parsed.get("review_threshold_pct", 0))
@@ -177,17 +203,18 @@ class StockAnalysisAgent(BaseAgent):
                     logger.info("[분석] {} review_interval_min clamp: {}분 → {}분",
                                 request.symbol, raw_interval, clamped)
                 # NXT 세션 한도 (가이드 강제 안전망 — LLM이 프롬프트 무시할 때 캡)
+                # tolerance 추가: 60→70 / 15→17 (1분 noise 캡 방지)
                 from scheduler.market_calendar import market_calendar
                 session = market_calendar.get_market_session()
-                if session == "NXT_AFTER" and clamped > 60:
+                if session == "NXT_AFTER" and clamped > 70:
                     logger.warning(
-                        "[분석] {} NXT 애프터 한도(60분) 초과 → 캡 적용 (LLM: {}분 → 60분)",
+                        "[분석] {} NXT 애프터 한도(70분 tolerance) 초과 → 캡 적용 (LLM: {}분 → 60분)",
                         request.symbol, clamped,
                     )
                     clamped = 60
-                elif session == "NXT_PRE" and clamped > 15:
+                elif session == "NXT_PRE" and clamped > 17:
                     logger.warning(
-                        "[분석] {} NXT 프리 한도(15분) 초과 → 캡 적용 (LLM: {}분 → 15분)",
+                        "[분석] {} NXT 프리 한도(17분 tolerance) 초과 → 캡 적용 (LLM: {}분 → 15분)",
                         request.symbol, clamped,
                     )
                     clamped = 15
@@ -201,6 +228,12 @@ class StockAnalysisAgent(BaseAgent):
         result.key_factors = parsed.get("key_factors", [])
         result.raw_analysis = parsed
         result.analyzed_at = _time.time()
+        # 분석 시점 국면 저장 — 캐시 히트 시 국면 변화 검사용
+        try:
+            from agent.market_regime_agent import market_regime_agent
+            result.analyzed_regime = market_regime_agent.current_regime or ""
+        except Exception:
+            pass
 
         # confidence 정규화
         if result.confidence > 1.0:
@@ -273,13 +306,29 @@ class StockAnalysisAgent(BaseAgent):
     ) -> tuple[float, dict, pd.DataFrame, pd.DataFrame | None]:
         """MCP 병렬 조회: 현재가 + 일봉60일 + 분봉5분
 
+        분봉은 스캔 단계 캐시(`get_cached_minute_prices`)를 우선 사용 →
+        같은 사이클 내 KIS 분봉 중복 호출 제거 (rate limit 부담 감소).
+        캐시 미스(보유 종목·이벤트 트리거 등) 시에만 mcp 호출.
+
         Returns: (current_price, price_data, daily_df, minute_df)
         """
-        price_resp, daily_resp, minute_resp = await asyncio.gather(
-            mcp_client.get_current_price(symbol),
-            mcp_client.get_daily_price(symbol, count=60),
-            mcp_client.get_minute_price(symbol, period="5"),
-        )
+        # 분봉 캐시 hit 여부 — 스캔 단계에서 받은 데이터 재사용
+        from agent.market_scanner import get_cached_minute_prices
+        cached_minute = get_cached_minute_prices(symbol)
+
+        if cached_minute:
+            # 분봉 호출 생략 — 현재가/일봉만 호출
+            price_resp, daily_resp = await asyncio.gather(
+                mcp_client.get_current_price(symbol),
+                mcp_client.get_daily_price(symbol, count=60),
+            )
+            minute_resp = None
+        else:
+            price_resp, daily_resp, minute_resp = await asyncio.gather(
+                mcp_client.get_current_price(symbol),
+                mcp_client.get_daily_price(symbol, count=60),
+                mcp_client.get_minute_price(symbol, period="5"),
+            )
 
         current_price = 0.0
         price_data: dict = {}
@@ -299,17 +348,28 @@ class StockAnalysisAgent(BaseAgent):
                         daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
                 if "volume" in daily_df.columns:
                     daily_df["volume"] = pd.to_numeric(daily_df["volume"], errors="coerce")
+                # KIS 응답은 최신→과거 순 — pandas-ta는 과거→최신 가정
+                # 정렬 안 하면 SMA/RSI/CCI 등 시계열 지표가 잘못 계산됨 (iloc[-1]이 가장 과거 시점)
+                if "date" in daily_df.columns:
+                    daily_df = daily_df.sort_values("date").reset_index(drop=True)
 
+        # 분봉 처리: 캐시 hit이면 cached_minute 사용, 아니면 minute_resp 사용
         minute_df = None
-        if minute_resp.success and minute_resp.data:
+        minute_items: list[dict] = []
+        if cached_minute:
+            minute_items = cached_minute
+        elif minute_resp and minute_resp.success and minute_resp.data:
             minute_items = minute_resp.data.get("prices", [])
-            if minute_items:
-                minute_df = pd.DataFrame(minute_items)
-                for col in ["open", "high", "low", "close"]:
-                    if col in minute_df.columns:
-                        minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
-                if "volume" in minute_df.columns:
-                    minute_df["volume"] = pd.to_numeric(minute_df["volume"], errors="coerce")
+        if minute_items:
+            minute_df = pd.DataFrame(minute_items)
+            for col in ["open", "high", "low", "close"]:
+                if col in minute_df.columns:
+                    minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
+            if "volume" in minute_df.columns:
+                minute_df["volume"] = pd.to_numeric(minute_df["volume"], errors="coerce")
+            # 분봉도 동일하게 시간순 정렬
+            if "time" in minute_df.columns:
+                minute_df = minute_df.sort_values("time").reset_index(drop=True)
 
         return current_price, price_data, daily_df, minute_df
 
