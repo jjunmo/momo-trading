@@ -1040,7 +1040,10 @@ class TradingAgent:
                 signal.stop_loss_price = final["stop_loss_price"]
 
         # AI가 결정한 손절/익절/트레일링 스탑을 event_detector에 설정
-        self._apply_trade_thresholds(symbol, analysis, final)
+        # 변동성 적응형 트레일링 산정을 위해 종목 ATR 비율(%) 전달
+        atr = (indicators.get("atr_14") or 0)
+        atr_ratio_pct = (atr / current_price * 100) if (atr and current_price > 0) else 0.0
+        self._apply_trade_thresholds(symbol, analysis, final, atr_ratio_pct=atr_ratio_pct)
 
         # 4.5 매도 시 보유 여부 확인 — 미보유 종목 매도 차단
         if signal.action == SignalAction.SELL:
@@ -1831,12 +1834,14 @@ class TradingAgent:
             logger.debug("AI 모니터링 임계값 설정: {}종목", applied)
 
     def _apply_trade_thresholds(
-        self, symbol: str, tier1: dict, tier2: dict,
+        self, symbol: str, tier1: dict, tier2: dict, atr_ratio_pct: float = 0.0,
     ) -> None:
         """Tier1/Tier2 분석 결과에서 손절/익절/트레일링 스탑을 event_detector에 적용
 
         Tier2 값을 우선 사용하고, 없으면 Tier1 값 사용.
         trailing_stop_pct 미설정 시 전략별 기본값 자동 적용.
+        atr_ratio_pct(종목 ATR/현재가 %)가 있으면 변동성 적응 하한을 적용해
+        노이즈성 성급 청산을 방지한다.
         """
         kwargs = {}
 
@@ -1858,7 +1863,15 @@ class TradingAgent:
                              or tier1.get("strategy_type", ""))
             strategy = self.strategies.get(strategy_type)
             trailing = getattr(strategy, "DEFAULT_TRAILING_STOP_PCT", 3.0)
-        kwargs["trailing_stop_pct"] = float(trailing)
+        trailing = float(trailing)
+        # 변동성 적응 하한 — 종목 노이즈(ATR)보다 좁은 trailing은 정상 눌림에 성급 청산됨
+        if atr_ratio_pct > 0:
+            atr_floor = max(
+                settings.TRAILING_ATR_MIN_PCT,
+                min(settings.TRAILING_ATR_MAX_PCT, atr_ratio_pct * settings.TRAILING_ATR_MULT),
+            )
+            trailing = max(trailing, atr_floor)
+        kwargs["trailing_stop_pct"] = trailing
 
         # breakeven_trigger_pct: AI가 결정한 본전 보호 활성 수익률
         be_trigger = tier2.get("breakeven_trigger_pct") or tier1.get("breakeven_trigger_pct")

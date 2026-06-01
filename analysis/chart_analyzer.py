@@ -51,6 +51,10 @@ class ChartAnalyzer:
             result.indicators_text = TechnicalIndicators.format_for_prompt(result.indicators)
             result.patterns_text = ChartPatterns.format_for_prompt(result.patterns)
             result.trend_text = self.trend_analyzer.format_for_prompt(result.trend)
+            # 정점(고점) 매도 판단용 신호 — trend_text에 추가 (보유종목 리뷰/익절 재분석 LLM이 참조)
+            peak_text = self._format_peak_signals(minute_df, result.indicators)
+            if peak_text:
+                result.trend_text = f"{result.trend_text}\n{peak_text}"
             result.prompt_text = self._format_full_prompt(result)
         except Exception as e:
             logger.error("차트 종합 분석 오류: {}", str(e))
@@ -134,6 +138,54 @@ class ChartAnalyzer:
             "direction": direction,
             "confidence": min(abs(net) / 15, 1.0),
         }
+
+    def _format_peak_signals(
+        self, minute_df: pd.DataFrame | None, indicators: dict
+    ) -> str:
+        """정점(고점) 매도 판단용 신호 텍스트 — 일중 고가 대비/과매수 꺾임/거래량 정점후.
+
+        '진짜 고점에서 팔기'를 LLM이 판단하도록, 레벨이 아닌 '꺾임/되돌림' 신호를 명시한다.
+        """
+        signals: list[str] = []
+
+        # 1. 일중 고가 대비 현재가 위치 (되돌림 시작 여부)
+        cur = indicators.get("current_price") or 0
+        if (minute_df is not None and not minute_df.empty
+                and "high" in minute_df.columns and cur > 0):
+            try:
+                intraday_high = float(minute_df["high"].max())
+                if intraday_high > 0:
+                    pullback = (cur / intraday_high - 1) * 100
+                    signals.append(f"일중고가 {intraday_high:,.0f}원 대비 {pullback:+.1f}%")
+            except (ValueError, TypeError):
+                pass
+
+        # 2. 과매수 꺾임 — Stoch %K가 %D 아래로(데드크로스) + 과매수권
+        stoch_k = indicators.get("stoch_k")
+        stoch_d = indicators.get("stoch_d")
+        rsi = indicators.get("rsi_14")
+        if (stoch_k is not None and stoch_d is not None
+                and stoch_k < stoch_d and stoch_k > 70):
+            rsi_note = f", RSI {rsi:.0f}" if rsi is not None else ""
+            signals.append(f"과매수 꺾임(Stoch %K<%D{rsi_note})")
+
+        # 3. 분봉 거래량 정점후 감소 — 최근 봉이 직전 피크에서 멀어짐
+        if (minute_df is not None and not minute_df.empty
+                and "volume" in minute_df.columns and len(minute_df) >= 5):
+            try:
+                vols = minute_df["volume"].tail(10).reset_index(drop=True)
+                peak_idx = int(vols.idxmax())
+                recent_avg = float(vols.tail(2).mean())
+                peak_vol = float(vols.max())
+                # 피크가 최근 2봉 이전 + 최근 거래량이 피크의 70% 미만 → 정점후 감소
+                if peak_idx < len(vols) - 2 and peak_vol > 0 and recent_avg < peak_vol * 0.7:
+                    signals.append("분봉 거래량 정점후 감소")
+            except (ValueError, TypeError):
+                pass
+
+        if not signals:
+            return ""
+        return "[정점 신호] " + " | ".join(signals)
 
     def _format_full_prompt(self, result: ChartAnalysisResult) -> str:
         """전체 분석 결과를 프롬프트용 텍스트로"""

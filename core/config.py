@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     TRADING_ENABLED: bool = True
     FORCE_LIQUIDATION_HOUR: int = 15  # 장 마감 청산 시각
     FORCE_LIQUIDATION_MINUTE: int = 15
+    # 장 초반 시초가 노이즈 매수 차단 (KRX 정규장 개장 직후, 신규 매수만)
+    OPENING_BUY_BLOCK_HOUR: int = 9
+    OPENING_BUY_BLOCK_MINUTE: int = 30
+    # 변동성 적응형 트레일링스탑 — 종목 ATR 기반 (노이즈 청산 방지)
+    TRAILING_ATR_MULT: float = 0.8     # trailing_pct = ATR% × 0.8
+    TRAILING_ATR_MIN_PCT: float = 2.5  # 하한
+    TRAILING_ATR_MAX_PCT: float = 7.0  # 상한
     MAX_DAILY_TRADES: int = 0  # 0 = 무제한 (AI Risk Tuner가 동적 조정)
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정

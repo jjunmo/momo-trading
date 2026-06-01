@@ -16,6 +16,17 @@ HOLDINGS_REVIEW_SYSTEM = """당신은 한국 주식 장중 보유종목 재평�
 5. **시장 국면 변화**: 매수 시점 대비 현재 국면이 악화되었는지
 6. **임계값 적정성**: 현재 stop_loss/take_profit이 시장 상황에 맞는지
 
+## 정점(고점) 매도 판단 — "진짜 고점에서 팔기"
+trailing_stop_pct는 노이즈 청산을 막는 넓은 안전망일 뿐, 수익 실현의 정밀 판단은 당신이 한다.
+차트의 `[정점 신호]`(일중고가 대비/과매수 꺾임/거래량 정점후)와 모멘텀·VWAP을 근거로 판단:
+- 다음 정점 신호 **2개 이상** 동시 충족 → SELL(수익 실현) 적극 검토:
+  - 일중 고가/보유 중 최고가 대비 의미있게 하락(되돌림 시작)
+  - 과매수 꺾임(Stoch %K가 %D 아래로 + RSI 하락 전환)
+  - 분봉 거래량 정점후 감소(매수세 소진)
+  - 모멘텀 DECELERATING/REVERSING, VWAP 하향 이탈
+- 반대로 **모멘텀 ACCELERATING + 거래량 증가 + 고점 경신 중**이면 단순 눌림은 노이즈 → HOLD (성급 매도 금지)
+- 핵심: "고점에서 얼마나 빠졌나(되돌림) + 매수세가 식었나"로 정점을 판단. 레벨(RSI>70)만으로 매도하지 말 것.
+
 ## 임계값 조정 가이드
 - 시장 BULL→BEAR 전환: 손절선 타이트하게 (예: -3% → -1.5%)
 - 수익 중 + 추세 약화: 익절선 낮춰서 이익 확보 (예: +5% → +3%)
@@ -122,10 +133,17 @@ def build_holdings_review_prompt(
         trailing_text = f"{d.get('active_trailing_stop_pct', 0):.1f}%" if d.get("active_trailing_stop_pct") else "미설정"
         chart_text = d.get("chart_analysis", "")
 
+        # 보유 중 최고가 대비 되돌림 (정점 판단용)
+        highest = d.get("highest_price") or 0
+        peak_text = (
+            f"\n- 보유 중 최고가: {highest:,.0f}원 (현재가 고점 대비 {d.get('pullback_from_peak', 0):+.1f}%)"
+            if highest > 0 else ""
+        )
+
         block = (
             f"#### {i}. {d.get('stock_name', '')} ({d['symbol']})\n"
             f"- 매입가: {d.get('avg_price', 0):,.0f}원 → 현재가: {d.get('current_price', 0):,.0f}원\n"
-            f"- 수익률: {pnl_rate:+.2f}%\n"
+            f"- 수익률: {pnl_rate:+.2f}%{peak_text}\n"
             f"- 보유수량: {d.get('quantity', 0)}주\n"
             f"- 보유일수: {d.get('hold_days', 0)}일 / 최대 {d.get('max_hold_days', 0)}일\n"
             f"- AI 신뢰도: {d.get('confidence', 0):.2f}\n"

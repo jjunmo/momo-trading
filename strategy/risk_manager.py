@@ -2,9 +2,11 @@
 from loguru import logger
 
 from core.config import settings
+from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
+from util.time_util import now_kst
 
 
 class RiskManager:
@@ -67,6 +69,27 @@ class RiskManager:
             result = {"approved": True, "reason": "매도 주문", "adjusted_quantity": None}
             await self._log_result(symbol, result, today_trade_count, cycle_id)
             return result
+
+        # 장 초반 매수 차단 — 시초가 동시호가 노이즈(09:00~09:30) 추격매수 방지
+        # KRX 정규장 개장 직후 신규 매수만 제한 (매도/손절/익절은 위에서 통과, NXT 프리/애프터 제외)
+        if signal.action == SignalAction.BUY:
+            now = now_kst()
+            block_until = now.replace(
+                hour=settings.OPENING_BUY_BLOCK_HOUR,
+                minute=settings.OPENING_BUY_BLOCK_MINUTE,
+                second=0, microsecond=0,
+            )
+            if market_calendar.get_market_session(now) == "KRX_NXT" and now < block_until:
+                result = {
+                    "approved": False,
+                    "reason": (
+                        f"장 초반 매수 차단 (시초가 노이즈 회피, "
+                        f"{settings.OPENING_BUY_BLOCK_HOUR:02d}:{settings.OPENING_BUY_BLOCK_MINUTE:02d} 이후 진입)"
+                    ),
+                    "adjusted_quantity": None,
+                }
+                await self._log_result(symbol, result, today_trade_count, cycle_id)
+                return result
 
         # 매매 비활성화 검사
         if not settings.TRADING_ENABLED:

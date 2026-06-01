@@ -728,6 +728,12 @@ class TradingScheduler:
                         "active_stop_loss": th.stop_loss,
                         "active_take_profit": th.take_profit,
                         "active_trailing_stop_pct": th.trailing_stop_pct,
+                        # 보유 중 최고가 — 정점(고점) 대비 되돌림 판단용
+                        "highest_price": th.highest_price,
+                        "pullback_from_peak": (
+                            (current_price / th.highest_price - 1) * 100
+                            if th.highest_price and th.highest_price > 0 else 0.0
+                        ),
                         "chart_analysis": chart_text,
                     }
                     holdings_data.append(data)
