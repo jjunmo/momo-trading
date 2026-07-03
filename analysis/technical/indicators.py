@@ -119,10 +119,18 @@ class TechnicalIndicators:
             if willr is not None and not willr.empty and not pd.isna(willr.iloc[-1]):
                 result["williams_r"] = round(max(-100.0, min(0.0, willr.iloc[-1])), 2)
 
-            # CCI (20일) — 정상 범위 ±100~±300, 분모(MD) 0 근접 시 폭증 차단
-            cci = ta.cci(df["high"], df["low"], df["close"], length=20)
-            if cci is not None and not cci.empty and not pd.isna(cci.iloc[-1]):
-                result["cci_20"] = round(max(-300.0, min(300.0, cci.iloc[-1])), 2)
+            # CCI (20일) — 직접 계산. pandas_ta 0.4.71b0의 cci는 괄호 누락 버그로
+            # (tp - sma/(0.015*md)) ≈ 가격 자체를 반환해 전 종목이 "극단 과매수"로 보임.
+            # 분모(MD) 0 근접 폭증(NXT 단일가 세션 등)은 결측 처리 — 클리핑하면
+            # "±300 극단 과매수"라는 거짓 신호로 둔갑함
+            if len(df) >= 20:
+                tp = (df["high"] + df["low"] + df["close"]) / 3
+                sma_tp = tp.rolling(20).mean().iloc[-1]
+                md = float((tp.tail(20) - tp.tail(20).mean()).abs().mean())
+                if not pd.isna(sma_tp) and md > 0:
+                    cci_val = (tp.iloc[-1] - sma_tp) / (0.015 * md)
+                    if abs(cci_val) <= 500:
+                        result["cci_20"] = round(cci_val, 2)
 
             # OBV (On Balance Volume)
             obv = ta.obv(df["close"], df["volume"])
@@ -194,10 +202,28 @@ class TechnicalIndicators:
         result: dict = {}
 
         try:
+            # 데이터 퇴화 감지 — NXT 단일가/거래정지: 봉 범위·종가 변화 모두 0 근접.
+            # 퇴화 데이터로 ATR=0, RSI 고정 등 거짓 신호를 LLM에 주지 않도록 지표 산출 생략
+            recent = minute_df.tail(10)
+            last_close = float(recent["close"].iloc[-1]) if len(recent) else 0
+            if last_close > 0:
+                movement = float(
+                    (recent["high"] - recent["low"]).abs().sum()
+                    + recent["close"].diff().abs().sum()
+                )
+                if movement / last_close < 0.0005:
+                    return {
+                        "minute_candle_count": len(minute_df),
+                        "minute_data_note": (
+                            "퇴화(단일가 세션) — ATR/RSI/변동률 산출 불가, 판단 근거에서 제외"
+                        ),
+                    }
+
             # 분봉 ATR(14) — 절대값(원). review_interval_min 계산 1차 기준
             if len(minute_df) >= 14:
                 atr_m = ta.atr(minute_df["high"], minute_df["low"], minute_df["close"], length=14)
-                if atr_m is not None and not atr_m.empty and not pd.isna(atr_m.iloc[-1]):
+                if (atr_m is not None and not atr_m.empty
+                        and not pd.isna(atr_m.iloc[-1]) and atr_m.iloc[-1] > 0):
                     result["atr_minute_14"] = round(atr_m.iloc[-1], 2)
 
             # 분봉 평균 변동률 — 최근 14개 캔들의 abs(pct_change) 평균 (%)
@@ -212,6 +238,25 @@ class TechnicalIndicators:
                 rsi_m = ta.rsi(minute_df["close"], length=14)
                 if rsi_m is not None and not rsi_m.empty and not pd.isna(rsi_m.iloc[-1]):
                     result["minute_rsi_14"] = round(rsi_m.iloc[-1], 2)
+
+            # 분봉 거래량 가속/둔화 — 프롬프트의 가속/정점 판정 기준과 동일 (최근 5봉 vs 직전 5봉).
+            # 이 데이터가 없으면 LLM이 진입 조건(거래량 가속 중)을 판정할 근거가 없음
+            if len(minute_df) >= 10 and "volume" in minute_df.columns:
+                vols = minute_df["volume"].tail(10)
+                prev5 = float(vols.head(5).mean())
+                last5 = float(vols.tail(5).mean())
+                if prev5 > 0:
+                    ratio = last5 / prev5
+                    if ratio > 1.1:
+                        result["minute_volume_trend"] = (
+                            f"가속 중 (최근5봉 평균 {last5:,.0f} > 직전5봉 {prev5:,.0f})"
+                        )
+                    elif ratio < 0.9:
+                        result["minute_volume_trend"] = (
+                            f"정점 후 둔화 (최근5봉 평균 {last5:,.0f} < 직전5봉 {prev5:,.0f})"
+                        )
+                    else:
+                        result["minute_volume_trend"] = "보합"
 
             # 최근 분봉 수 — AI가 데이터 신뢰도 판단 가능
             result["minute_candle_count"] = len(minute_df)
@@ -247,7 +292,9 @@ class TechnicalIndicators:
             "atr_minute_14": "분봉 ATR(14, 절대값 원)",
             "minute_volatility_pct": "분봉 평균 변동률(%)",
             "minute_rsi_14": "분봉 RSI(14)",
+            "minute_volume_trend": "분봉 거래량 추이(최근5봉 vs 직전5봉)",
             "minute_candle_count": "분봉 데이터 수",
+            "minute_data_note": "분봉 데이터 상태",
             "price_vs_sma20": "가격 vs SMA(20)",
             "cross_signal": "크로스 시그널",
             "bb_squeeze_ratio": "볼린저 Squeeze 비율",
