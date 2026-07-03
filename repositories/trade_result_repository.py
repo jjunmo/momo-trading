@@ -60,7 +60,7 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         return result.scalar_one_or_none()
 
     async def get_all_open_buys(self, symbol: str) -> list[TradeResult]:
-        """특정 종목의 미청산 BUY 전체 조회 (SELL 시 일괄 청산용)"""
+        """특정 종목의 미청산 BUY 전체 조회 (entry_at 오름차순=FIFO; close_open_buys_fifo에서 사용)"""
         stmt = (
             select(TradeResult)
             .where(and_(
@@ -73,6 +73,91 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         )
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def close_open_buys_fifo(
+        self,
+        symbol: str,
+        sell_qty: int,
+        sell_price: float,
+        exit_reason: str,
+        sell_order_id: str | None,
+        now: datetime,
+    ) -> tuple[float, int]:
+        """매도 체결을 미청산 매수에 FIFO(진입 오래된 순)·수량 기준으로 매칭 청산.
+
+        - 전량 소진 매수 → 그 행을 청산 처리(매도가·시각·사유·sell_order_id·순손익 기록)
+        - 부분 소진 매수 → 분할: 소진분을 별도 청산 행으로 추가하고 원 매수는 잔량만 유지
+        sell_qty<=0이면 미청산 전량을 청산(수량 정보 없는 안전망).
+
+        Returns: (총 순손익, 실제 청산 수량)
+        """
+        from util.pnl_calculator import compute_pnl
+        from util.time_util import ensure_kst
+
+        open_buys = await self.get_all_open_buys(symbol)  # entry_at asc (FIFO)
+        remaining = sell_qty if sell_qty and sell_qty > 0 else sum(b.quantity for b in open_buys)
+        reason = exit_reason or "SIGNAL"
+        total_pnl = 0.0
+        closed_qty = 0
+
+        for buy in open_buys:
+            if remaining <= 0:
+                break
+            take = min(buy.quantity, remaining)
+            br = compute_pnl(
+                entry_price=buy.entry_price, exit_price=sell_price, qty=take,
+                market=buy.market or "KOSPI", stock_name=buy.stock_name or "",
+            )
+            hold_days = (now - ensure_kst(buy.entry_at)).days if buy.entry_at else 0
+
+            if take == buy.quantity:
+                # 전량 청산
+                buy.exit_price = sell_price
+                buy.pnl = br.net_pnl
+                buy.return_pct = br.return_pct
+                buy.is_win = br.is_win
+                buy.commission_amt = br.commission
+                buy.tax_amt = br.tax
+                buy.hold_days = hold_days
+                buy.exit_reason = reason
+                buy.exit_at = now
+                buy.sell_order_id = sell_order_id
+            else:
+                # 부분 청산 — 소진분을 별도 청산 행으로 분할, 원 매수는 잔량 유지
+                self.db.add(TradeResult(
+                    stock_symbol=buy.stock_symbol,
+                    stock_name=buy.stock_name,
+                    side="BUY",
+                    strategy_type=buy.strategy_type,
+                    entry_price=buy.entry_price,
+                    exit_price=sell_price,
+                    quantity=take,
+                    pnl=br.net_pnl,
+                    return_pct=br.return_pct,
+                    is_win=br.is_win,
+                    commission_amt=br.commission,
+                    tax_amt=br.tax,
+                    hold_days=hold_days,
+                    exit_reason=reason,
+                    sell_order_id=sell_order_id,
+                    ai_recommendation=buy.ai_recommendation,
+                    ai_confidence=buy.ai_confidence,
+                    ai_target_price=buy.ai_target_price,
+                    ai_stop_loss_price=buy.ai_stop_loss_price,
+                    market=buy.market,
+                    market_regime=buy.market_regime,
+                    status=buy.status,
+                    entry_at=buy.entry_at,
+                    exit_at=now,
+                ))
+                buy.quantity -= take
+
+            total_pnl += br.net_pnl
+            closed_qty += take
+            remaining -= take
+
+        await self.db.flush()
+        return total_pnl, closed_qty
 
     async def get_completed_by_date(self, target_date: date) -> list[TradeResult]:
         """특정 날짜에 청산 완료된 포지션 (BUY→청산 기록만, CONFIRMED)
@@ -189,3 +274,73 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         )
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_rolling_breakdown(self, days: int = 21) -> dict:
+        """롤링 성과 분해 — 일일 리뷰 프롬프트 주입용 (하루 표본 과잉반응 방지)
+
+        Returns:
+            {"total": {...}, "by_strategy": {...}, "by_hold_time": {...}, "by_confidence": {...}}
+        """
+        from datetime import timedelta
+        from util.time_util import now_kst
+
+        cutoff = now_kst() - timedelta(days=days)
+        stmt = (
+            select(TradeResult)
+            .where(and_(
+                TradeResult.side == "BUY",
+                TradeResult.status == "CONFIRMED",
+                TradeResult.exit_at.isnot(None),
+                TradeResult.entry_at >= cutoff.replace(tzinfo=None),
+            ))
+        )
+        trades = list((await self.db.execute(stmt)).scalars().all())
+
+        def _agg(items) -> dict:
+            n = len(items)
+            if n == 0:
+                return {"n": 0, "win_rate": 0.0, "pnl": 0.0, "avg_return": 0.0}
+            return {
+                "n": n,
+                "win_rate": round(100.0 * sum(1 for t in items if t.is_win) / n, 1),
+                "pnl": round(sum(t.pnl or 0 for t in items)),
+                "avg_return": round(sum(t.return_pct or 0 for t in items) / n, 2),
+            }
+
+        def _hold_bucket(t) -> str:
+            if not t.exit_at or not t.entry_at:
+                return "기타"
+            hours = (t.exit_at - t.entry_at).total_seconds() / 3600
+            if hours < 0.5:
+                return "30분 미만"
+            if hours < 2:
+                return "30분~2시간"
+            if hours < 8:
+                return "2~8시간"
+            return "오버나이트+"
+
+        def _conf_bucket(t) -> str:
+            c = t.ai_confidence or 0.0
+            if c >= 0.65:
+                return "0.65+"
+            if c >= 0.60:
+                return "0.60~0.64"
+            if c >= 0.55:
+                return "0.55~0.59"
+            return "0.55 미만"
+
+        by_strategy: dict[str, list] = {}
+        by_hold: dict[str, list] = {}
+        by_conf: dict[str, list] = {}
+        for t in trades:
+            by_strategy.setdefault(t.strategy_type or "N/A", []).append(t)
+            by_hold.setdefault(_hold_bucket(t), []).append(t)
+            by_conf.setdefault(_conf_bucket(t), []).append(t)
+
+        return {
+            "days": days,
+            "total": _agg(trades),
+            "by_strategy": {k: _agg(v) for k, v in by_strategy.items()},
+            "by_hold_time": {k: _agg(v) for k, v in by_hold.items()},
+            "by_confidence": {k: _agg(v) for k, v in by_conf.items()},
+        }

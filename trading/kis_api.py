@@ -13,6 +13,7 @@ import httpx
 from loguru import logger
 
 from core.config import settings
+from trading.kis_rate_limiter import kis_rate_limiter
 
 DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
@@ -26,9 +27,8 @@ _token_lock = asyncio.Lock()
 _cached_token: str | None = None
 _cached_expires_at: datetime | None = None
 
-# 글로벌 동시 호출 제한 — KIS 18 req/s 한계 안에서 안전 마진 두기
-# 분봉/Tier2/메인 수집 등 모든 KIS 호출이 이 Semaphore를 거침
-# 5: 동시 5건이면 0.3초당 5건 = 초당 ~15 req로 KIS 한계 안전 마진
+# 글로벌 동시 호출 제한(소켓 수 제어). 초당 요청수는 kis_rate_limiter가 담당.
+# MCP 경유 호출과 동일한 공유 limiter를 거쳐 앱키 합산 한도(EGW00201)를 함께 지킨다.
 _kis_concurrency = asyncio.Semaphore(5)
 
 
@@ -287,8 +287,9 @@ async def _kis_request(
     async def _send(force_refresh: bool) -> httpx.Response:
         token = await _get_access_token(client, force_refresh=force_refresh)
         request_headers = {**headers, "authorization": f"Bearer {token}"}
-        # 글로벌 동시 호출 제한 — 분봉/Tier2/메인 수집 모든 KIS 호출 통합 제어
+        # 동시 호출 제한 + 공유 초당 limiter (MCP 경유 호출과 앱키 한도 공유)
         async with _kis_concurrency:
+            await kis_rate_limiter.acquire()
             return await client.request(method, url, headers=request_headers, **kwargs)
 
     response = await _send(force_refresh=False)

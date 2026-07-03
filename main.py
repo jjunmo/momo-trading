@@ -72,6 +72,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("매매불가 블록리스트 복원 실패: {}", str(e))
 
+    # 체결확인 유실 복구 — 재시작 전 PENDING_CONFIRM(매수/매도)을 KIS 기준으로 즉시 재확인
+    try:
+        from agent.decision_maker import decision_maker
+        recovered = await decision_maker.check_pending_orders()
+        if recovered:
+            logger.info("startup 체결확인 복구: {}건", recovered)
+    except Exception as e:
+        logger.warning("startup 체결확인 복구 실패: {}", str(e))
+
     # 실시간 모니터 시작 (WebSocket, 실패해도 서버 기동)
     from realtime.monitor import realtime_monitor
     try:

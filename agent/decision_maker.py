@@ -1,7 +1,6 @@
-"""매매 결정 + 자율/반자율 모드 분기 + 체결 확인/기록"""
+"""매매 결정(완전자율 실행) + 체결 확인/기록"""
 import asyncio
 from collections.abc import Callable
-from datetime import timedelta
 from typing import Any
 
 from loguru import logger
@@ -9,24 +8,17 @@ from loguru import logger
 from core.config import settings
 from core.database import AsyncSessionLocal
 from core.events import Event, EventType, event_bus
-from models.order import Order
-from models.recommendation import Recommendation
 from models.trade_result import TradeResult
 from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
-from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderConfirmStatus, OrderSource, RecommendationStatus
+from trading.enums import ActivityPhase, ActivityType, OrderConfirmStatus, OrderSource
 from trading.mcp_client import mcp_client
-from util.time_util import ensure_kst, now_kst
+from util.time_util import now_kst
 
 
 class DecisionMaker:
-    """
-    자율/반자율 모드에 따라 실행 방식을 분기.
-
-    AUTONOMOUS: 스캔 → 분석 → 매매까지 전자동
-    SEMI_AUTO: 스캔 → 분석 → 추천 생성 → 사용자 승인 대기
-    """
+    """완전자율 실행: 스캔 → 분석 → 매매까지 전자동."""
 
     def __init__(self):
         self._pending_tasks: set[asyncio.Task] = set()
@@ -48,17 +40,12 @@ class DecisionMaker:
         return len(done)
 
     async def execute(
-        self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
+        self, signal: TradeSignal, cycle_id: str | None = None,
         analysis_context: dict | None = None,
         on_settled: "Callable[[str, bool], Any] | None" = None,
     ) -> dict:
-        """시그널에 따라 실행"""
-        mode = AutonomyMode(settings.AUTONOMY_MODE)
-
-        if mode == AutonomyMode.AUTONOMOUS:
-            return await self._execute_autonomous(signal, cycle_id, analysis_context, on_settled=on_settled)
-        else:
-            return await self._create_recommendation(signal, analysis_id, cycle_id)
+        """시그널에 따라 즉시 주문 실행 (완전자율)"""
+        return await self._execute_autonomous(signal, cycle_id, analysis_context, on_settled=on_settled)
 
     async def _execute_autonomous(
         self, signal: TradeSignal, cycle_id: str | None = None,
@@ -181,6 +168,7 @@ class DecisionMaker:
         quantity: int,
         expected_price: float,
         analysis_context: dict | None = None,
+        exit_reason: str = "",
     ) -> str | None:
         """PENDING_CONFIRM 상태의 TradeResult를 즉시 DB에 저장 (고아 주문 방지)"""
         ctx = analysis_context or {}
@@ -204,6 +192,7 @@ class DecisionMaker:
                         exit_price=expected_price if side == "SELL" else 0.0,
                         quantity=quantity,
                         status=OrderConfirmStatus.PENDING_CONFIRM.value,
+                        exit_reason=exit_reason if side == "SELL" else "",
                         ai_recommendation=ctx.get("ai_recommendation", ""),
                         ai_confidence=ctx.get("ai_confidence", 0.0),
                         ai_target_price=ctx.get("ai_target_price"),
@@ -295,7 +284,7 @@ class DecisionMaker:
 
                 # 폴백: order_id 매칭 실패 시 종목+방향으로 탐색
                 if not filled_order and orders:
-                    side_code = "02" if side == "SELL" else "01"
+                    side_code = "02" if side == "BUY" else "01"  # KIS: 01=매도, 02=매수
                     for order in orders:
                         if not isinstance(order, dict):
                             continue
@@ -554,28 +543,21 @@ class DecisionMaker:
                         tr.exit_price = filled_price
                         tr.exit_at = now
                         tr.exit_reason = exit_reason or "SIGNAL"
-                        # 매도 체결 → 미청산 BUY 전체 일괄 청산 (수수료/세금 차감 net_pnl)
-                        from util.pnl_calculator import compute_pnl
-                        open_buys = await repo.get_all_open_buys(symbol)
-                        for open_buy in open_buys:
-                            br = compute_pnl(
-                                entry_price=open_buy.entry_price,
-                                exit_price=filled_price,
-                                qty=open_buy.quantity,
-                                market=open_buy.market or "KOSPI",
-                                stock_name=open_buy.stock_name or "",
+                        # 매도 체결 → 미청산 BUY를 FIFO·수량 기준으로 동기화 청산
+                        total_pnl, closed_qty = await repo.close_open_buys_fifo(
+                            symbol=symbol, sell_qty=filled_qty, sell_price=filled_price,
+                            exit_reason=exit_reason, sell_order_id=tr.order_id, now=now,
+                        )
+                        if closed_qty:
+                            logger.debug(
+                                "[{}] FIFO 청산: {}주(매도 {}주) 순손익 {:,.0f}원",
+                                symbol, closed_qty, filled_qty, total_pnl,
                             )
-                            open_buy.exit_price = filled_price
-                            open_buy.pnl = br.net_pnl
-                            open_buy.return_pct = br.return_pct
-                            open_buy.is_win = br.is_win
-                            open_buy.commission_amt = br.commission
-                            open_buy.tax_amt = br.tax
-                            open_buy.hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
-                            open_buy.exit_reason = exit_reason or "SIGNAL"
-                            open_buy.exit_at = now
-                        if open_buys:
-                            logger.debug("[{}] 미청산 BUY {}건 일괄 청산 완료", symbol, len(open_buys))
+                        if filled_qty and closed_qty < filled_qty:
+                            logger.warning(
+                                "[{}] 매도 {}주 중 {}주만 매칭 — 미청산 매수 부족(데이터 정합 확인 필요)",
+                                symbol, filled_qty, closed_qty,
+                            )
 
                     tr.notes = None  # PENDING 메모 제거
                     logger.debug("[{}] PENDING → CONFIRMED: {}주 @{:,.0f}원", symbol, filled_qty, filled_price)
@@ -695,111 +677,37 @@ class DecisionMaker:
                             # portfolio_sync_job이 나중에 SELL 체결가로 BUY를 자동 청산
                             return
 
-                        # 모든 미청산 BUY 일괄 청산 (수수료/세금 차감 net_pnl)
-                        from util.pnl_calculator import compute_pnl
-                        total_pnl = 0.0
-                        for open_buy in open_buys:
-                            br = compute_pnl(
-                                entry_price=open_buy.entry_price,
-                                exit_price=filled_price,
-                                qty=open_buy.quantity,
-                                market=open_buy.market or "KOSPI",
-                                stock_name=open_buy.stock_name or "",
-                            )
-                            hold_days = (now - ensure_kst(open_buy.entry_at)).days if open_buy.entry_at else 0
-
-                            open_buy.exit_price = filled_price
-                            open_buy.pnl = br.net_pnl
-                            open_buy.return_pct = br.return_pct
-                            open_buy.is_win = br.is_win
-                            open_buy.commission_amt = br.commission
-                            open_buy.tax_amt = br.tax
-                            open_buy.hold_days = hold_days
-                            open_buy.exit_reason = exit_reason or "SIGNAL"
-                            open_buy.exit_at = now
-                            total_pnl += br.net_pnl
-
-                        # 마지막 BUY 기준으로 로깅 (순수익률 평균)
-                        last_buy = open_buys[-1]
-                        pnl_sign = "+" if total_pnl >= 0 else ""
-                        avg_return = sum(ob.return_pct for ob in open_buys) / len(open_buys)
-                        logger.info(
-                            "[TradeResult] 매도 청산: {} {}건 BUY 일괄 청산@{:,.0f} "
-                            "= {}{:,.0f}원 ({}{:.1f}%)",
-                            symbol, len(open_buys), filled_price,
-                            pnl_sign, total_pnl, pnl_sign, avg_return,
+                        # 미청산 BUY를 FIFO·수량 기준으로 동기화 청산
+                        total_pnl, closed_qty = await repo.close_open_buys_fifo(
+                            symbol=symbol, sell_qty=filled_qty, sell_price=filled_price,
+                            exit_reason=exit_reason, sell_order_id=order_id, now=now,
                         )
+                        pnl_sign = "+" if total_pnl >= 0 else ""
+                        logger.info(
+                            "[TradeResult] 매도 FIFO 청산: {} {}주(매도 {}주)@{:,.0f} = {}{:,.0f}원",
+                            symbol, closed_qty, filled_qty, filled_price, pnl_sign, total_pnl,
+                        )
+                        if filled_qty and closed_qty < filled_qty:
+                            logger.warning(
+                                "[TradeResult] {} 매도 {}주 중 {}주만 매칭 — 미청산 매수 부족(데이터 정합 확인)",
+                                symbol, filled_qty, closed_qty,
+                            )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
-                            f"{'✅' if total_pnl > 0 else '❌'} [{symbol}] 매도 청산: "
-                            f"{len(open_buys)}건 BUY 일괄 — "
-                            f"{pnl_sign}{total_pnl:,.0f}원 ({pnl_sign}{avg_return:.1f}%) "
-                            f"| {exit_reason or 'SIGNAL'}",
+                            f"{'✅' if total_pnl > 0 else '❌'} [{symbol}] 매도 청산(FIFO): "
+                            f"{closed_qty}주 — {pnl_sign}{total_pnl:,.0f}원 | {exit_reason or 'SIGNAL'}",
                             cycle_id=cycle_id,
                             symbol=symbol,
                             detail={
-                                "closed_count": len(open_buys),
+                                "closed_qty": closed_qty,
+                                "sell_qty": filled_qty,
                                 "exit_price": filled_price,
                                 "total_pnl": total_pnl,
-                                "avg_return_pct": avg_return,
                             },
                         )
 
         except Exception as e:
             logger.error("[TradeResult] 기록 실패 ({}): {}", symbol, str(e))
-
-    async def _create_recommendation(
-        self, signal: TradeSignal, analysis_id: str, cycle_id: str | None = None,
-    ) -> dict:
-        """반자율: 추천 생성 → 사용자 승인 대기"""
-        expires_at = now_kst() + timedelta(minutes=settings.RECOMMENDATION_EXPIRE_MIN)
-
-        rec_data = {
-            "stock_id": signal.stock_id,
-            "analysis_id": analysis_id,
-            "action": signal.action.value,
-            "suggested_price": signal.suggested_price or 0,
-            "suggested_quantity": signal.suggested_quantity or 0,
-            "reason": signal.reason,
-            "confidence": signal.confidence,
-            "status": RecommendationStatus.PENDING.value,
-            "expires_at": expires_at,
-        }
-
-        qty = signal.suggested_quantity or 0
-        price = signal.suggested_price or 0
-        amount = price * qty
-
-        logger.info(
-            "[SEMI_AUTO] 추천 생성: {} {} x{} (만료: {})",
-            signal.symbol, signal.action.value,
-            qty, expires_at,
-        )
-
-        await activity_logger.log(
-            ActivityType.DECISION, ActivityPhase.COMPLETE,
-            f"\U0001f4dd 매수 추천 생성: {signal.symbol} {qty}주 "
-            f"@{price:,.0f}원 ({amount:,.0f}원)"
-            f"\n   \u2192 사용자 승인 대기 (SEMI_AUTO 모드)",
-            cycle_id=cycle_id,
-            symbol=signal.symbol,
-            confidence=signal.confidence,
-            detail=rec_data,
-        )
-
-        await event_bus.publish(Event(
-            type=EventType.RECOMMENDATION_CREATED,
-            data={**rec_data, "symbol": signal.symbol},
-            source="decision_maker",
-        ))
-
-        return {
-            "mode": "SEMI_AUTO",
-            "symbol": signal.symbol,
-            "action": signal.action.value,
-            "recommendation": rec_data,
-        }
-
 
     # ── 매도 체결 확인: 보유종목 변동 감지 ──
 
@@ -853,12 +761,14 @@ class DecisionMaker:
         logger.info("[매도대기] {} 30초 내 미확인 → 정기 체크에서 재시도", symbol)
         return False
 
-    async def check_pending_sells(self) -> int:
-        """매도 체결 대기 점검 — 메모리 + DB 양쪽 확인
+    async def check_pending_orders(self) -> int:
+        """매수/매도 체결 대기 점검 — 재시작·장애로 유실된 확인을 KIS 기준으로 복구
 
-        1. 메모리 _pending_sells: 현재 세션에서 매도한 종목
-        2. DB PENDING_CONFIRM SELL: 서버 재시작 후 복구용
+        1. 메모리 _pending_sells: 현재 세션에서 매도한 종목 (보유 변동 감지)
+        2. DB PENDING_CONFIRM SELL: 보유목록에서 사라짐 → 체결 확인
+        3. DB PENDING_CONFIRM BUY: KIS 일별체결로 체결 확인 (재시작 유실 복구)
 
+        체결 확인만 수행(조기 복구). 진짜 미체결의 실패 마킹은 16:00 정산이 담당.
         Returns: 체결 확인된 건수
         """
         from trading.account_manager import account_manager
@@ -922,7 +832,40 @@ class DecisionMaker:
         except Exception as e:
             logger.warning("DB PENDING_CONFIRM 점검 오류: {}", str(e))
 
+        # 3. DB PENDING_CONFIRM BUY 레코드 점검 (재시작 유실 복구 — KIS 일별체결 기준)
+        try:
+            from sqlalchemy import select, and_
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(TradeResult).where(and_(
+                        TradeResult.side == "BUY",
+                        TradeResult.status == "PENDING_CONFIRM",
+                    ))
+                )
+                pending_buys = list(result.scalars().all())
+
+            for tr in pending_buys:
+                verified = await self._verify_via_daily_ccld(
+                    tr.order_id, tr.stock_symbol, side="BUY", expected_qty=tr.quantity,
+                )
+                if not verified:
+                    continue  # 미체결/미반영 → 16:00 정산이 최종 판정
+                fill_price = verified.get("price") or tr.entry_price or 0
+                await self._confirm_pending_record(
+                    pending_record_id=tr.id,
+                    symbol=tr.stock_symbol, side="BUY",
+                    filled_qty=verified["qty"], filled_price=fill_price,
+                )
+                logger.info("[매수확인] {} DB 복구 체결 확인: {:,.0f}원", tr.stock_symbol, fill_price)
+                account_manager.invalidate_cache()
+                confirmed += 1
+        except Exception as e:
+            logger.warning("DB PENDING_CONFIRM BUY 점검 오류: {}", str(e))
+
         return confirmed
+
+    # 하위 호환 별칭 (스케줄러/외부 호출용)
+    check_pending_sells = check_pending_orders
 
     async def _get_fill_price(self, order_id: str, symbol: str) -> float:
         """주문내역에서 체결가 조회"""
@@ -954,7 +897,7 @@ class DecisionMaker:
                     continue
                 o_symbol = order.get("pdno") or order.get("symbol") or ""
                 o_side = order.get("sll_buy_dvsn_cd") or ""
-                if o_symbol == symbol and o_side == "02":
+                if o_symbol == symbol and o_side == "01":  # KIS: 01=매도 (이 폴백은 매도 체결가 조회)
                     raw_price = (
                         order.get("avg_prvs") or order.get("ccld_pric") or order.get("filled_price")
                     )

@@ -149,7 +149,9 @@ class StockAnalysisAgent(BaseAgent):
         # 2. 차트 분석 (기술적 지표 + 패턴 + 추세)
         chart_result = ChartAnalysisResult()
         if not daily_df.empty:
-            chart_result = chart_analyzer.analyze(daily_df, minute_df)
+            chart_result = chart_analyzer.analyze(
+                daily_df, minute_df, peak_signals=request.is_holding
+            )
         result.chart_result = chart_result
 
         # 3. LLM 분석 (Tier2 Sonnet)

@@ -7,9 +7,12 @@
 - 가격 변동 추적 → 재평가 주기 조절 (review_threshold_pct 기반)
 """
 import math
+import time
 from dataclasses import dataclass
 
 from loguru import logger
+
+from core.config import settings
 
 
 @dataclass
@@ -48,8 +51,9 @@ class PriceGuard:
         self._prev_prices: dict[str, float] = {}
         # 재평가 주기 조절용 누적 변동
         self._movement_score: dict[str, float] = {}
-        # 익절 재분석 쿨다운 (종목별 진행 중 플래그)
+        # 익절 재분석 가드 (진행 중) + 쿨다운 (재트리거 최소 간격, epoch sec)
         self._review_in_progress: set[str] = set()
+        self._tp_review_cooldown_until: dict[str, float] = {}
 
     # ── 임계값 관리 ──
 
@@ -98,12 +102,14 @@ class PriceGuard:
         self._prev_prices.pop(symbol, None)
         self._movement_score.pop(symbol, None)
         self._review_in_progress.discard(symbol)
+        self._tp_review_cooldown_until.pop(symbol, None)
 
     def clear_all(self) -> None:
         self._thresholds.clear()
         self._prev_prices.clear()
         self._review_in_progress.clear()
         self._movement_score.clear()
+        self._tp_review_cooldown_until.clear()
 
     @property
     def monitored_symbols(self) -> list[str]:
@@ -176,9 +182,12 @@ class PriceGuard:
             import asyncio
             asyncio.create_task(sell_agent.execute_sell(SellParams(symbol=symbol, exit_reason=exit_reason)))
 
-        # 익절 도달 → 재분석 트리거 (즉시 매도 대신, 쿨다운 적용)
+        # 익절 도달 → 재분석 트리거 (즉시 매도 대신, 진행중 가드 + 쿨다운 적용)
         elif th.take_profit > 0 and price >= th.take_profit:
-            if symbol not in self._review_in_progress:
+            if (symbol not in self._review_in_progress
+                    and time.time() >= self._tp_review_cooldown_until.get(symbol, 0.0)):
+                # 가드를 트리거 전 동기 설정 → 빠른 틱 레이스로 인한 다중 발화 방지
+                self._review_in_progress.add(symbol)
                 logger.info("익절선 도달: {} (현재 {:,.0f}, 익절 {:,.0f}) → 재분석 트리거",
                             symbol, price, th.take_profit)
                 await self._trigger_take_profit_review(symbol, price)
@@ -193,8 +202,10 @@ class PriceGuard:
         asyncio.create_task(self._request_review(symbol))
 
     async def _request_review(self, symbol: str) -> None:
-        """분석 Agent에 재분석 요청 → 결과를 매도 Agent에 전달"""
-        self._review_in_progress.add(symbol)
+        """분석 Agent에 재분석 요청 → 결과를 매도 Agent에 전달
+
+        가드(_review_in_progress) 추가는 호출부(_check_stop_take)에서 동기로 수행됨.
+        """
         try:
             from agent.stock_analysis_agent import StockAnalysisRequest, stock_analysis_agent
             from trading.account_manager import account_manager
@@ -244,6 +255,8 @@ class PriceGuard:
         except Exception as e:
             logger.error("익절 재분석 요청 실패 ({}): {}", symbol, str(e))
         finally:
+            # 재분석 종료 → 쿨다운 설정 (HOLD로 끝나 가격이 익절가에 머물러도 재발화 차단)
+            self._tp_review_cooldown_until[symbol] = time.time() + settings.TAKE_PROFIT_REVIEW_COOLDOWN_SEC
             self._review_in_progress.discard(symbol)
 
     # ── 재평가 주기 조절 ──

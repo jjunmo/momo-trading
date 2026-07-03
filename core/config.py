@@ -52,9 +52,6 @@ class Settings(BaseSettings):
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색
 
-    # === AI Agent ===
-    AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
-    RECOMMENDATION_EXPIRE_MIN: int = 60
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
@@ -63,6 +60,8 @@ class Settings(BaseSettings):
     # 장 초반 시초가 노이즈 매수 차단 (KRX 정규장 개장 직후, 신규 매수만)
     OPENING_BUY_BLOCK_HOUR: int = 9
     OPENING_BUY_BLOCK_MINUTE: int = 30
+    # 익절 도달 후 재분석 재트리거 최소 간격(초) — 매 틱 무한 재발화 방지
+    TAKE_PROFIT_REVIEW_COOLDOWN_SEC: int = 300
     # 변동성 적응형 트레일링스탑 — 종목 ATR 기반 (노이즈 청산 방지)
     TRAILING_ATR_MULT: float = 0.8     # trailing_pct = ATR% × 0.8
     TRAILING_ATR_MIN_PCT: float = 2.5  # 하한
@@ -74,18 +73,18 @@ class Settings(BaseSettings):
     # 분석-주문 간 가격 변동 허용 한도 (%). 초과 시 AI 판단 무효로 간주하고 주문 스킵
     ORDER_PRICE_DRIFT_MAX_PCT: float = 3.0
 
+    # === 급등 감지 즉시 재스캔 (동적 스캔 주기와 무관하게 새 급등주 즉시 포착) ===
+    SURGE_RESCAN_ENABLED: bool = True
+    SURGE_RESCAN_THRESHOLD_PCT: float = 5.0   # 등락률 +5% 이상 신규 급등
+    SURGE_RESCAN_VOL_INC_PCT: float = 200.0   # AND 전일비 거래량 +200% 이상 (수급 동반 — 가격 노이즈 제외)
+    SURGE_RESCAN_COOLDOWN_SEC: int = 180      # 직전 스캔 후 최소 간격 (과도한 재스캔 방지)
+    SURGE_MONITOR_INTERVAL_SEC: int = 60      # 급등 감지 폴링 주기
+
     # === System Hard Limit (AI도 무시 못함) ===
     DAILY_LOSS_LIMIT_HARD: float = -7.0   # 일일 손실 -7% → 전체 매매 즉시 중단
 
     # === 하위 호환 (AI가 동적 판단하지만 참조 코드 존재) ===
-    DAY_TRADING_ONLY: bool = False       # deprecated: AI가 종목별 hold_strategy 판단
-    BUY_CUTOFF_HOUR: int = 15            # deprecated: AI가 판단
-    BUY_CUTOFF_MINUTE: int = 0
-    DAILY_LOSS_LIMIT_SOFT: float = -3.0  # deprecated: AI Risk Tuner가 동적 결정
-    MAX_CONSECUTIVE_LOSSES: int = 5      # deprecated: AI Risk Tuner가 동적 결정
-    AI_RISK_TUNING_ENABLED: bool = True  # deprecated: 항상 활성
-    RISK_APPETITE: str = "AGGRESSIVE"    # deprecated: AI가 국면별 판단
-    MIN_CASH_RATIO: float = 0.0          # deprecated: AI Risk Tuner가 결정
+    MIN_CASH_RATIO: float = 0.0          # risk_manager 초과매수 가드 기준 (0=준비금 없음)
     MAX_HOLD_DAYS_STABLE: int = 5        # deprecated: AI가 종목별 판단
     MAX_HOLD_DAYS_AGGRESSIVE: int = 3    # deprecated: AI가 종목별 판단
 

@@ -8,6 +8,7 @@ import httpx
 from loguru import logger
 
 from core.config import settings
+from trading.kis_rate_limiter import kis_rate_limiter
 from trading.models import MCPResponse
 
 # SSE 재연결 설정
@@ -15,9 +16,7 @@ _SSE_RECONNECT_DELAY = 2.0  # 재연결 대기 초
 _SSE_MAX_RECONNECT_DELAY = 30.0  # 최대 재연결 대기 초
 _SSE_MAX_RECONNECT_ATTEMPTS = 50  # 최대 재연결 시도 횟수
 
-# KIS API rate limit: 모의투자 초당 ~10건 (공식 20건이지만 실제 더 엄격)
-_RATE_LIMIT_PER_SEC = 8
-_RATE_LIMIT_WINDOW = 1.0  # 초
+# KIS API 초당 한도는 kis_rate_limiter(공유)가 담당 — 직접 REST 호출과 앱키 한도 공유
 _MAX_CONCURRENT_CALLS = 3  # 동시 MCP 호출 상한
 
 
@@ -42,9 +41,7 @@ class MCPClient:
         self._sse_task: asyncio.Task | None = None
         self._shutting_down = False
         self._reconnect_count = 0
-        # Rate limiter: 초당 요청 타임스탬프 + 동시 호출 세마포어
-        self._call_timestamps: list[float] = []
-        self._rate_lock = asyncio.Lock()
+        # 동시 호출 세마포어 (초당 한도는 공유 kis_rate_limiter가 담당)
         self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
         # P1-3: 주문 메타데이터 추적 (SSE 끊김 시 미확인 주문 복구용)
         self._pending_order_meta: dict[int, dict] = {}  # msg_id → {tool_name, arguments, timestamp}
@@ -314,21 +311,8 @@ class MCPClient:
         return self._session_id is not None
 
     async def _rate_limit(self) -> None:
-        """KIS API 초당 요청 한도 준수 — 초과 시 대기"""
-        async with self._rate_lock:
-            now = time.monotonic()
-            # 1초 이전 타임스탬프 제거
-            self._call_timestamps = [
-                t for t in self._call_timestamps
-                if now - t < _RATE_LIMIT_WINDOW
-            ]
-            if len(self._call_timestamps) >= _RATE_LIMIT_PER_SEC:
-                # 가장 오래된 요청이 1초 지날 때까지 대기
-                wait = _RATE_LIMIT_WINDOW - (now - self._call_timestamps[0]) + 0.05
-                if wait > 0:
-                    logger.debug("KIS rate limit 대기: {:.2f}초", wait)
-                    await asyncio.sleep(wait)
-            self._call_timestamps.append(time.monotonic())
+        """KIS API 초당 요청 한도 준수 — 직접 REST 호출과 공유 limiter 사용"""
+        await kis_rate_limiter.acquire()
 
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any] | None = None,

@@ -36,6 +36,8 @@ class TradeResult(Base, TimestampMixin):
     tax_amt: Mapped[float] = mapped_column(Float, default=0.0)  # 매도 거래세
     hold_days: Mapped[int] = mapped_column(Integer, default=0)
     exit_reason: Mapped[str] = mapped_column(String(30), default="")  # SIGNAL, STOP_LOSS, TAKE_PROFIT, MAX_HOLD
+    # 청산한 매도 주문 ID — 매수↔매도 동기화 링크 (FIFO 청산 시 BUY 행에 기록)
+    sell_order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
 
     # AI 분석 당시 컨텍스트 (피드백용)
     ai_recommendation: Mapped[str] = mapped_column(String(10), default="")  # BUY/SELL/HOLD

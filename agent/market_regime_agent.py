@@ -11,6 +11,7 @@ import time
 from loguru import logger
 
 from agent.base import BaseAgent
+from core.config import settings
 from trading.enums import ActivityPhase, ActivityType
 
 # 지수 프록시 ETF
@@ -35,6 +36,9 @@ class MarketRegimeAgent(BaseAgent):
     # 급변 오버라이드 임계값
     OVERRIDE_THRESHOLD = 1.2  # ±1.2% 이상이면 MA 무시, 즉시 전환
 
+    # 스코어 기반 전환 히스테리시스 — 같은 판정이 연속 N회 나와야 전환 (flapping 방지)
+    CONFIRM_CHECKS = 2
+
     # 국면별 시장 스캔 주기 (초)
     SCAN_INTERVAL: dict[str, int] = {
         "BULL": 1200,     # 20분 — 모멘텀 종목 빠른 포착
@@ -56,6 +60,9 @@ class MarketRegimeAgent(BaseAgent):
         self._running = False
         self._task: asyncio.Task | None = None
         self._scan_task: asyncio.Task | None = None
+        self._surge_task: asyncio.Task | None = None
+        # 급등 감지: 직전 체크에서 급등 상태였던 종목 (신규 급등만 트리거)
+        self._surge_seen: set[str] = set()
         # 콜백
         self._on_regime_change_callback = None
         self._on_scan_trigger_callback = None
@@ -73,6 +80,9 @@ class MarketRegimeAgent(BaseAgent):
         # 시장 폭 (scanner가 update_breadth()로 전달)
         self._advancing: int = 0
         self._declining: int = 0
+        # 히스테리시스 — 전환 대기 중인 국면과 연속 확인 횟수
+        self._pending_regime: str = ""
+        self._pending_count: int = 0
 
     @property
     def current_regime(self) -> str:
@@ -104,9 +114,36 @@ class MarketRegimeAgent(BaseAgent):
         """
         self._on_scan_trigger_callback = callback
 
+    def _confirm_transition(self, regime: str) -> bool:
+        """히스테리시스 — 같은 판정이 CONFIRM_CHECKS회 연속이어야 전환 승인.
+
+        모니터 체크와 외부(스캔 LLM) 판정이 카운터를 공유한다 — 두 독립 소스가
+        연속으로 동의해도 전환된다.
+        """
+        if regime == self._pending_regime:
+            self._pending_count += 1
+        else:
+            self._pending_regime, self._pending_count = regime, 1
+        if self._pending_count >= self.CONFIRM_CHECKS:
+            self._pending_regime, self._pending_count = "", 0
+            return True
+        return False
+
     def set_regime(self, regime: str) -> None:
         """외부에서 국면 설정 (MarketScanAgent 결과 반영) — 변화 시 콜백 트리거"""
+        if regime and regime == self._current_regime:
+            # 현 국면 재확인 → 전환 대기 노이즈 리셋
+            self._pending_regime, self._pending_count = "", 0
+            return
         if regime and regime != self._current_regime:
+            # 최초 설정(하루 시작)은 즉시, 그 외는 연속 확인 필요 (flapping 방지)
+            if self._current_regime and not self._confirm_transition(regime):
+                logger.info(
+                    "국면 전환 보류(외부): {} → {} (확인 {}/{})",
+                    self._current_regime, regime,
+                    self._pending_count, self.CONFIRM_CHECKS,
+                )
+                return
             old = self._current_regime
             self._previous_regime = old
             self._current_regime = regime
@@ -132,19 +169,23 @@ class MarketRegimeAgent(BaseAgent):
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
         self._scan_task = asyncio.create_task(self._dynamic_scan_loop())
+        if settings.SURGE_RESCAN_ENABLED:
+            self._surge_task = asyncio.create_task(self._surge_monitor_loop())
         logger.info(
-            "MarketRegimeAgent 시작 (국면 체크 {}초, 스캔 {}초)",
+            "MarketRegimeAgent 시작 (국면 체크 {}초, 스캔 {}초, 급등감지 {})",
             self.DEFAULT_INTERVAL_SEC, self.DEFAULT_SCAN_INTERVAL,
+            f"{settings.SURGE_MONITOR_INTERVAL_SEC}초" if settings.SURGE_RESCAN_ENABLED else "off",
         )
 
     async def stop(self) -> None:
         """감시 루프 중지"""
         self._running = False
-        for task in (self._task, self._scan_task):
+        for task in (self._task, self._scan_task, self._surge_task):
             if task:
                 task.cancel()
         self._task = None
         self._scan_task = None
+        self._surge_task = None
 
     async def _monitor_loop(self) -> None:
         """주기적 국면 체크 루프"""
@@ -186,12 +227,84 @@ class MarketRegimeAgent(BaseAgent):
 
             await asyncio.sleep(self.scan_interval_sec)
 
+    async def _surge_monitor_loop(self) -> None:
+        """급등 감지 → 즉시 재스캔 (동적 스캔 주기와 무관, 새 급등주 빠른 포착)"""
+        await asyncio.sleep(settings.SURGE_MONITOR_INTERVAL_SEC)
+        while self._running:
+            try:
+                await self._check_surge()
+            except Exception as e:
+                logger.warning("급등 감지 오류: {}", str(e))
+            await asyncio.sleep(settings.SURGE_MONITOR_INTERVAL_SEC)
+
+    async def _check_surge(self) -> None:
+        """등락률 상위에서 '거래량 동반 신규 급등'을 찾아 즉시 재스캔 트리거."""
+        from scheduler.market_calendar import market_calendar
+        from util.time_util import now_kst
+
+        if not market_calendar.is_domestic_trading_hours():
+            return
+        if now_kst().time() >= market_calendar.get_trading_cutoff():
+            return
+        if not self._on_scan_trigger_callback:
+            return
+
+        from agent.market_scanner import market_scanner
+        surges = await market_scanner._get_fluctuation_rank("top")
+
+        hot: set[str] = set()
+        for s in surges:
+            symbol = s.get("symbol") or s.get("code") or ""
+            if not symbol:
+                continue
+            try:
+                rate = float(str(s.get("change_rate", 0)).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+            if rate < settings.SURGE_RESCAN_THRESHOLD_PCT:
+                continue
+            # 거래량 동반 확인 — 수급 없는 가격 노이즈 제외 (선정 프롬프트의 '초기 급등' 기준과 정렬)
+            try:
+                vol_inc = float(str(s.get("volume_increase_rate", 0)).replace(",", ""))
+            except (ValueError, TypeError):
+                vol_inc = 0.0
+            if vol_inc < settings.SURGE_RESCAN_VOL_INC_PCT:
+                continue
+            hot.add(symbol)
+
+        new_surges = hot - self._surge_seen
+        self._surge_seen = hot
+        if not new_surges:
+            return
+
+        # 쿨다운: 직전 스캔(동적/급등 무관) 후 충분히 지났을 때만 → 과도한 재스캔 방지
+        if time.time() - self._last_scan_at < settings.SURGE_RESCAN_COOLDOWN_SEC:
+            logger.debug("급등 {}건 감지 — 쿨다운 중, 재스캔 보류", len(new_surges))
+            return
+
+        preview = ", ".join(sorted(new_surges)[:5])
+        logger.info("급등 감지 → 즉시 재스캔: {}", preview)
+        from services.activity_logger import activity_logger
+        await activity_logger.log(
+            ActivityType.SCAN, ActivityPhase.START,
+            f"⚡ 급등 감지 → 즉시 재스캔 ({len(new_surges)}건: {preview})",
+        )
+        self._last_scan_at = time.time()
+        await self._on_scan_trigger_callback()
+
     async def check_regime(self) -> str:
         """시장 지수 조회 → 국면 판단 → 변화 시 트리거"""
         from trading.kis_api import get_market_index
         from scheduler.market_calendar import market_calendar
 
         if not market_calendar.is_domestic_trading_hours():
+            return self._current_regime
+
+        # 시초가 노이즈 가드 — 09:10 이전 지수 데이터는 신뢰 불가
+        # (동시호가 직후 왜곡된 등락률이 하루 국면 앵커를 오염시키는 것 방지)
+        from util.time_util import now_kst
+        from datetime import time as dtime
+        if now_kst().time() < dtime(9, 10):
             return self._current_regime
 
         # 지수 데이터 수집 + 일봉 캐시 갱신
@@ -210,16 +323,39 @@ class MarketRegimeAgent(BaseAgent):
         await self._ensure_daily_cache()
 
         # 국면 판단 (복합 스코어링 — 등락률 + MA + 시장폭 + 거래량)
-        new_regime = self._classify_regime(kospi, kosdaq)
+        new_regime, is_override = self._classify_regime(kospi, kosdaq)
         self._last_check_at = time.time()
 
+        if new_regime and new_regime == self._current_regime:
+            # 현 국면 재확인 → 전환 대기 노이즈 리셋
+            self._pending_regime, self._pending_count = "", 0
+
         if new_regime and new_regime != self._current_regime:
+            # 히스테리시스: 급변 오버라이드(±1.2%)·최초 설정은 즉시, 그 외 연속 확인 필요
+            if (self._current_regime and not is_override
+                    and not self._confirm_transition(new_regime)):
+                logger.info(
+                    "국면 전환 보류: {} → {} (확인 {}/{})",
+                    self._current_regime, new_regime,
+                    self._pending_count, self.CONFIRM_CHECKS,
+                )
+                return self._current_regime
+
             old = self._current_regime
             self._previous_regime = old
             self._current_regime = new_regime
             self._regime_changed_at = time.time()
 
             logger.info("시장 국면 변경 감지: {} → {}", old or "없음", new_regime)
+
+            # 판단 기록 — 장 마감 후 지수 등락률과 대조해 채점 (judgment_verifier)
+            try:
+                from analysis.feedback.judgment_verifier import judgment_verifier
+                await judgment_verifier.record_regime_judgment(
+                    new_regime, kospi.get("change_rate"),
+                )
+            except Exception as e:
+                logger.debug("국면 판단 기록 실패: {}", str(e))
 
             # 활동 로그
             try:
@@ -327,12 +463,12 @@ class MarketRegimeAgent(BaseAgent):
             return 0.0
         return ((current_volume - prev) / prev) * 100
 
-    def _classify_regime(self, kospi: dict, kosdaq: dict) -> str:
-        """복합 스코어링 국면 판단
+    def _classify_regime(self, kospi: dict, kosdaq: dict) -> tuple[str, bool]:
+        """복합 스코어링 국면 판단 → (국면, 급변 오버라이드 여부)
 
         시그널 조합 (최대 bull/bear 각 8점):
         1. 당일 등락률: ±0.5% 기준 (1점)
-        2. 급변 오버라이드: ±1.2% 이상이면 즉시 반환
+        2. 급변 오버라이드: ±1.2% 이상이면 즉시 반환 (히스테리시스 미적용)
         3. MA 위치 3일/10일: KOSPI+KOSDAQ 각각 (2점)
         4. 시장 폭: 상승비율 60%↑/40%↓ (1점)
         5. 거래량 추이: 전일 대비 (1점)
@@ -347,11 +483,11 @@ class MarketRegimeAgent(BaseAgent):
         if kospi_rate >= self.OVERRIDE_THRESHOLD or kosdaq_rate >= self.OVERRIDE_THRESHOLD:
             logger.info("국면 급변 오버라이드 → BULL (KOSPI {:+.2f}%, KOSDAQ {:+.2f}%)",
                         kospi_rate, kosdaq_rate)
-            return "BULL"
+            return "BULL", True
         if kospi_rate <= -self.OVERRIDE_THRESHOLD or kosdaq_rate <= -self.OVERRIDE_THRESHOLD:
             logger.info("국면 급변 오버라이드 → BEAR (KOSPI {:+.2f}%, KOSDAQ {:+.2f}%)",
                         kospi_rate, kosdaq_rate)
-            return "BEAR"
+            return "BEAR", True
 
         score_bull = 0
         score_bear = 0
@@ -417,13 +553,15 @@ class MarketRegimeAgent(BaseAgent):
             score_bull, score_bear, regime, ",".join(details) if details else "중립",
             kospi_rate, kosdaq_rate,
         )
-        return regime
+        return regime, False
 
     def get_status(self) -> dict:
         """현재 상태 (Admin API용)"""
         return {
             "current_regime": self._current_regime,
             "previous_regime": self._previous_regime,
+            "pending_regime": self._pending_regime,
+            "pending_count": self._pending_count,
             "last_check_at": self._last_check_at,
             "regime_changed_at": self._regime_changed_at,
             "regime_check_interval_sec": self.interval_sec,
