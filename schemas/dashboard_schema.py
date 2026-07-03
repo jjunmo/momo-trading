@@ -33,7 +33,6 @@ class RiskAlert(BaseModel):
 
 class SystemStatus(BaseModel):
     trading_enabled: bool
-    autonomy_mode: str
     mcp_connected: bool
     websocket_connected: bool
     scheduler_running: bool

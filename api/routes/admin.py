@@ -375,10 +375,8 @@ async def cancel_all_pending():
 
 # ── 설정 조회/변경 ──
 MUTABLE_SETTINGS = [
-    "TRADING_ENABLED", "AUTONOMY_MODE",
-    "RECOMMENDATION_EXPIRE_MIN",
+    "TRADING_ENABLED",
     "SCHEDULER_ENABLED",
-    "RISK_APPETITE",
 ]
 
 
@@ -475,7 +473,6 @@ async def get_system_status():
 
     return SuccessResponse(data={
         "trading_enabled": settings.TRADING_ENABLED,
-        "autonomy_mode": settings.AUTONOMY_MODE,
         "mcp_connected": mcp_client.is_connected,
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,

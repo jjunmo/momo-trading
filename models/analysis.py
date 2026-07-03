@@ -25,4 +25,3 @@ class AnalysisResult(Base, TimestampMixin):
 
     # Relationships
     stock: Mapped["Stock"] = relationship(back_populates="analyses")  # noqa: F821
-    recommendations: Mapped[list["Recommendation"]] = relationship(back_populates="analysis")  # noqa: F821

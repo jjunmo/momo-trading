@@ -6,12 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_async_db, get_async_db_with_transaction
 from repositories.stock_repository import StockRepository
-from repositories.portfolio_repository import PortfolioRepository, PortfolioHoldingRepository
-from repositories.order_repository import OrderRepository
 from repositories.market_data_repository import MarketDataDailyRepository, MarketSnapshotRepository
 from repositories.analysis_repository import AnalysisRepository
 from repositories.strategy_repository import StrategyConfigRepository, StrategySignalRepository
-from repositories.recommendation_repository import RecommendationRepository
 from repositories.agent_activity_repository import AgentActivityRepository
 from repositories.daily_report_repository import DailyReportRepository
 
@@ -25,39 +22,6 @@ async def get_stock_repo_tx(db: AsyncSession = Depends(get_async_db_with_transac
 
 StockRepoDep = Annotated[StockRepository, Depends(get_stock_repo)]
 StockRepoTxDep = Annotated[StockRepository, Depends(get_stock_repo_tx)]
-
-
-# === Portfolio ===
-async def get_portfolio_repo(db: AsyncSession = Depends(get_async_db)) -> PortfolioRepository:
-    return PortfolioRepository(db)
-
-async def get_portfolio_repo_tx(db: AsyncSession = Depends(get_async_db_with_transaction)) -> PortfolioRepository:
-    return PortfolioRepository(db)
-
-PortfolioRepoDep = Annotated[PortfolioRepository, Depends(get_portfolio_repo)]
-PortfolioRepoTxDep = Annotated[PortfolioRepository, Depends(get_portfolio_repo_tx)]
-
-
-# === PortfolioHolding ===
-async def get_holding_repo(db: AsyncSession = Depends(get_async_db)) -> PortfolioHoldingRepository:
-    return PortfolioHoldingRepository(db)
-
-async def get_holding_repo_tx(db: AsyncSession = Depends(get_async_db_with_transaction)) -> PortfolioHoldingRepository:
-    return PortfolioHoldingRepository(db)
-
-HoldingRepoDep = Annotated[PortfolioHoldingRepository, Depends(get_holding_repo)]
-HoldingRepoTxDep = Annotated[PortfolioHoldingRepository, Depends(get_holding_repo_tx)]
-
-
-# === Order ===
-async def get_order_repo(db: AsyncSession = Depends(get_async_db)) -> OrderRepository:
-    return OrderRepository(db)
-
-async def get_order_repo_tx(db: AsyncSession = Depends(get_async_db_with_transaction)) -> OrderRepository:
-    return OrderRepository(db)
-
-OrderRepoDep = Annotated[OrderRepository, Depends(get_order_repo)]
-OrderRepoTxDep = Annotated[OrderRepository, Depends(get_order_repo_tx)]
 
 
 # === MarketDataDaily ===
@@ -113,17 +77,6 @@ async def get_strategy_signal_repo_tx(db: AsyncSession = Depends(get_async_db_wi
 
 StrategySignalRepoDep = Annotated[StrategySignalRepository, Depends(get_strategy_signal_repo)]
 StrategySignalRepoTxDep = Annotated[StrategySignalRepository, Depends(get_strategy_signal_repo_tx)]
-
-
-# === Recommendation ===
-async def get_recommendation_repo(db: AsyncSession = Depends(get_async_db)) -> RecommendationRepository:
-    return RecommendationRepository(db)
-
-async def get_recommendation_repo_tx(db: AsyncSession = Depends(get_async_db_with_transaction)) -> RecommendationRepository:
-    return RecommendationRepository(db)
-
-RecommendationRepoDep = Annotated[RecommendationRepository, Depends(get_recommendation_repo)]
-RecommendationRepoTxDep = Annotated[RecommendationRepository, Depends(get_recommendation_repo_tx)]
 
 
 # === AgentActivity ===

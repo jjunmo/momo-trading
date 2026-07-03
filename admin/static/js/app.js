@@ -1458,7 +1458,6 @@ async function loadSystemStatus() {
     const s = json.data;
     if (!s) return;
     updateBadge('badge-trading', s.trading_enabled ? '매매:ON' : '매매:OFF', s.trading_enabled ? 'green' : 'red');
-    if (s.autonomy_mode) updateBadge('badge-mode', s.autonomy_mode, 'purple');
     updateBadge('badge-mcp', s.mcp_connected ? 'MCP:✓' : 'MCP:✗', s.mcp_connected ? 'green' : 'red');
     const statusEl = document.getElementById('sys-status');
     const isHoliday = !!s.market_holiday;

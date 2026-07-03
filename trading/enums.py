@@ -52,12 +52,6 @@ class TradingMode(str, Enum):
     LIVE = "LIVE"
 
 
-class AutonomyMode(str, Enum):
-    """자율 모드"""
-    AUTONOMOUS = "AUTONOMOUS"
-    SEMI_AUTO = "SEMI_AUTO"
-
-
 class AnalysisType(str, Enum):
     """분석 유형"""
     TECHNICAL = "TECHNICAL"
@@ -77,15 +71,6 @@ class SignalUrgency(str, Enum):
     """시그널 긴급도"""
     IMMEDIATE = "IMMEDIATE"
     WAIT = "WAIT"
-
-
-class RecommendationStatus(str, Enum):
-    """AI 추천 상태 (반자율 모드)"""
-    PENDING = "PENDING"
-    APPROVED = "APPROVED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
-    EXECUTED = "EXECUTED"
 
 
 class LLMTier(str, Enum):

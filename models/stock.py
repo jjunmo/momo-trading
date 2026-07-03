@@ -18,10 +18,7 @@ class Stock(Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(default=True)
 
     # Relationships
-    holdings: Mapped[list["PortfolioHolding"]] = relationship(back_populates="stock")  # noqa: F821
-    orders: Mapped[list["Order"]] = relationship(back_populates="stock")  # noqa: F821
     daily_data: Mapped[list["MarketDataDaily"]] = relationship(back_populates="stock")  # noqa: F821
     snapshot: Mapped["MarketSnapshot | None"] = relationship(back_populates="stock", uselist=False)  # noqa: F821
     analyses: Mapped[list["AnalysisResult"]] = relationship(back_populates="stock")  # noqa: F821
     signals: Mapped[list["StrategySignal"]] = relationship(back_populates="stock")  # noqa: F821
-    recommendations: Mapped[list["Recommendation"]] = relationship(back_populates="stock")  # noqa: F821

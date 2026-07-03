@@ -6,7 +6,7 @@
   09:05  장 시작 스캔 → 종목 선정 → 실시간 모니터링 돌입
   09:00~14:30  WebSocket 실시간 이벤트 → AI 분석/매매 (이벤트 기반)
               + 1시간 간격 보유종목 안전 점검 (시간 기반 조기 청산 포함)
-  11:00/13:00  장중 재스캔 — 새로운 기회 탐색
+  장중 재스캔  — 국면별 동적 주기(THEME 15·BULL 20·SIDEWAYS/BEAR 30분) + 국면 변화·급등 감지 시 즉시
   14:30  신규 매수 마감 (청산 시간 확보)
   15:10  보유종목 전량 시장가 강제 청산 (종가경매 전, 병렬 실행)
   15:30  KRX 폐장
@@ -15,10 +15,6 @@
   20:00  NXT 애프터마켓 폐장
   20:05  장 마감 성과 리뷰 (KRX+NXT 통합, AI 피드백 + 일일 리포트 저장)
   16:00  포트폴리오 정산 (KIS ↔ DB 동기화)
-  16:30  일봉 데이터 보관용 수집
-
-※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
-※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
 import asyncio
 
@@ -91,7 +87,6 @@ class TradingScheduler:
 
     def _setup_jobs(self) -> None:
         from scheduler.jobs.portfolio_sync_job import portfolio_sync_job
-        from scheduler.jobs.market_data_job import market_data_job
 
         # ── 장 시작 전 준비 (08:50 평일) — KRX 개장 10분 전 ──
         self.scheduler.add_job(
@@ -116,9 +111,9 @@ class TradingScheduler:
         )
 
         # ── 장중 재스캔: MarketRegimeAgent가 국면별 동적 주기로 트리거 ──
-        # 고정 cron(11:00, 13:00) 대신 국면별 동적 스캔:
-        #   BULL: 30분, THEME: 20분, SIDEWAYS: 60분, BEAR: 90분
+        # 국면별 동적 스캔 주기: THEME 15분 · BULL 20분 · SIDEWAYS/BEAR 30분
         # + 국면 변화 시 즉시 재스캔
+        # + 거래량 동반 급등 감지 시 즉시 재스캔 (SURGE_RESCAN_*)
 
         # ── 보유종목 점검 (15분 간격, 08:00~19:00) — WebSocket 구독 갱신 + 체결 대기 확인 ──
         self.scheduler.add_job(
@@ -222,25 +217,6 @@ class TradingScheduler:
             id="portfolio_sync",
             name="포트폴리오 정산",
             misfire_grace_time=3600,
-        )
-
-        # ── 일봉 데이터 수집 (16:30) ──
-        self.scheduler.add_job(
-            market_data_job,
-            "cron",
-            hour=16, minute=30,
-            id="market_data",
-            name="일봉 데이터 수집",
-            misfire_grace_time=3600,
-        )
-
-        # ── 만료 추천 정리 (1시간 간격) ──
-        self.scheduler.add_job(
-            self._expire_recommendations,
-            "interval",
-            hours=1,
-            id="expire_recommendations",
-            name="만료 추천 처리",
         )
 
     # ─────────── 스케줄 작업 구현 ───────────
@@ -401,7 +377,7 @@ class TradingScheduler:
             logger.error("장 시작 스캔 오류: {}", str(e))
 
     async def _intraday_rescan(self) -> None:
-        """장중 재스캔 (11:00, 13:00) — 새로운 기회 탐색
+        """장중 재스캔 (국면별 동적 주기 / 국면변화·급등 감지 시 즉시) — 새로운 기회 탐색
 
         기존 run_cycle()을 재사용하여 시장 재스캔 → 분석 → 매매.
         cycle_lock이 잡혀있으면 자동 스킵.
@@ -1043,15 +1019,36 @@ class TradingScheduler:
                         tr.exit_at = now
                         tr.exit_reason = "ORPHAN_CLEANUP"
 
-                        # exit_price 추정: 현재가 또는 마지막 SELL 레코드
+                        # exit_price: 실제 KIS 매도 체결가 우선 → 없으면 현재가 폴백
                         exit_price = 0.0
+                        price_source = "현재가(추정)"
                         try:
-                            from trading.mcp_client import mcp_client
-                            resp = await mcp_client.get_current_price(tr.stock_symbol)
-                            if resp.success and resp.data:
-                                exit_price = float(resp.data.get("price", 0))
+                            from trading.kis_api import get_daily_ccld_direct
+                            today_str = now.strftime("%Y%m%d")
+                            res = await get_daily_ccld_direct(
+                                start_date=today_str, end_date=today_str,
+                                pdno=tr.stock_symbol, sll_buy_dvsn="01",  # 01=매도
+                            )
+                            if res.get("success"):
+                                for t in res.get("trades") or []:
+                                    if (t.get("cncl_yn") or "N").upper() == "Y":
+                                        continue
+                                    avg = float(t.get("avg_prvs") or 0)
+                                    if avg > 0:
+                                        exit_price = avg
+                                        price_source = "KIS매도체결가"
+                                        break
                         except Exception:
                             pass
+                        if exit_price <= 0:
+                            try:
+                                from trading.mcp_client import mcp_client
+                                resp = await mcp_client.get_current_price(tr.stock_symbol)
+                                if resp.success and resp.data:
+                                    exit_price = float(resp.data.get("price", 0))
+                            except Exception:
+                                pass
+                        tr.notes = f"ORPHAN_CLEANUP: exit={price_source}"
 
                         if exit_price > 0 and tr.entry_price > 0:
                             from util.pnl_calculator import compute_pnl
@@ -1163,10 +1160,6 @@ class TradingScheduler:
             await trading_agent.run_cycle()
         except Exception as e:
             logger.warning("매도 후 재스캔 실패: {}", str(e))
-
-    async def _expire_recommendations(self) -> None:
-        """만료된 추천 처리"""
-        logger.debug("만료 추천 처리 실행")
 
     # ── NXT 잡 구현 ──
 

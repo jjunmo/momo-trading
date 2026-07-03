@@ -5,23 +5,16 @@ from fastapi import Depends
 
 from dependencies.repositories import (
     StockRepoDep, StockRepoTxDep,
-    PortfolioRepoDep, PortfolioRepoTxDep,
-    HoldingRepoDep, HoldingRepoTxDep,
-    OrderRepoDep, OrderRepoTxDep,
     DailyRepoDep, DailyRepoTxDep,
     SnapshotRepoDep, SnapshotRepoTxDep,
     AnalysisRepoDep, AnalysisRepoTxDep,
     StrategyConfigRepoDep, StrategyConfigRepoTxDep,
     StrategySignalRepoDep, StrategySignalRepoTxDep,
-    RecommendationRepoDep, RecommendationRepoTxDep,
 )
 from services.stock_service import StockService
-from services.portfolio_service import PortfolioService
-from services.order_service import OrderService
 from services.market_data_service import MarketDataService
 from services.analysis_service import AnalysisService
 from services.strategy_service import StrategyService
-from services.recommendation_service import RecommendationService
 from services.trading_service import TradingService
 
 
@@ -34,40 +27,6 @@ def get_stock_service_tx(stock_repo: StockRepoTxDep) -> StockService:
 
 StockServiceDep = Annotated[StockService, Depends(get_stock_service)]
 StockServiceTxDep = Annotated[StockService, Depends(get_stock_service_tx)]
-
-
-# === Portfolio ===
-def get_portfolio_service(
-    portfolio_repo: PortfolioRepoDep,
-    holding_repo: HoldingRepoDep,
-) -> PortfolioService:
-    return PortfolioService(portfolio_repo=portfolio_repo, holding_repo=holding_repo)
-
-def get_portfolio_service_tx(
-    portfolio_repo: PortfolioRepoTxDep,
-    holding_repo: HoldingRepoTxDep,
-) -> PortfolioService:
-    return PortfolioService(portfolio_repo=portfolio_repo, holding_repo=holding_repo)
-
-PortfolioServiceDep = Annotated[PortfolioService, Depends(get_portfolio_service)]
-PortfolioServiceTxDep = Annotated[PortfolioService, Depends(get_portfolio_service_tx)]
-
-
-# === Order ===
-def get_order_service(
-    order_repo: OrderRepoDep,
-    stock_repo: StockRepoDep,
-) -> OrderService:
-    return OrderService(order_repo=order_repo, stock_repo=stock_repo)
-
-def get_order_service_tx(
-    order_repo: OrderRepoTxDep,
-    stock_repo: StockRepoTxDep,
-) -> OrderService:
-    return OrderService(order_repo=order_repo, stock_repo=stock_repo)
-
-OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
-OrderServiceTxDep = Annotated[OrderService, Depends(get_order_service_tx)]
 
 
 # === MarketData ===
@@ -113,17 +72,6 @@ def get_strategy_service_tx(
 
 StrategyServiceDep = Annotated[StrategyService, Depends(get_strategy_service)]
 StrategyServiceTxDep = Annotated[StrategyService, Depends(get_strategy_service_tx)]
-
-
-# === Recommendation ===
-def get_recommendation_service(recommendation_repo: RecommendationRepoDep) -> RecommendationService:
-    return RecommendationService(recommendation_repo=recommendation_repo)
-
-def get_recommendation_service_tx(recommendation_repo: RecommendationRepoTxDep) -> RecommendationService:
-    return RecommendationService(recommendation_repo=recommendation_repo)
-
-RecommendationServiceDep = Annotated[RecommendationService, Depends(get_recommendation_service)]
-RecommendationServiceTxDep = Annotated[RecommendationService, Depends(get_recommendation_service_tx)]
 
 
 # === Trading (MCP 기반, DI 불필요 - 싱글톤) ===
