@@ -29,9 +29,14 @@ class ChartAnalyzer:
         self.trend_analyzer = TrendAnalyzer()
 
     def analyze(
-        self, daily_df: pd.DataFrame, minute_df: pd.DataFrame | None = None
+        self, daily_df: pd.DataFrame, minute_df: pd.DataFrame | None = None,
+        peak_signals: bool = True,
     ) -> ChartAnalysisResult:
-        """기술적 지표 + 차트 패턴 + 추세 분석을 통합"""
+        """기술적 지표 + 차트 패턴 + 추세 분석을 통합
+
+        peak_signals: 정점(고점) 신호 주입 여부 — 보유종목 매도 판단 전용.
+        신규 매수 후보 분석에 주입하면 급등 후보가 전부 '정점' 프레임에 걸려 매수가 차단되므로 False.
+        """
         result = ChartAnalysisResult()
 
         if daily_df.empty or len(daily_df) < 5:
@@ -52,9 +57,10 @@ class ChartAnalyzer:
             result.patterns_text = ChartPatterns.format_for_prompt(result.patterns)
             result.trend_text = self.trend_analyzer.format_for_prompt(result.trend)
             # 정점(고점) 매도 판단용 신호 — trend_text에 추가 (보유종목 리뷰/익절 재분석 LLM이 참조)
-            peak_text = self._format_peak_signals(minute_df, result.indicators)
-            if peak_text:
-                result.trend_text = f"{result.trend_text}\n{peak_text}"
+            if peak_signals:
+                peak_text = self._format_peak_signals(minute_df, result.indicators)
+                if peak_text:
+                    result.trend_text = f"{result.trend_text}\n{peak_text}"
             result.prompt_text = self._format_full_prompt(result)
         except Exception as e:
             logger.error("차트 종합 분석 오류: {}", str(e))

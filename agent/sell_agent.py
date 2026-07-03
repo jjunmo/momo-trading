@@ -28,6 +28,12 @@ class SellParams:
 class SellAgent(BaseAgent):
     """매도 실행 전담 — 분석 없음, 실행만"""
 
+    # 정점 판단 매도(ANALYSIS_SELL) 게이트 — 검증 데이터상 조기매도 편향(매도 후 더 비싸게 재매수)
+    # 적중률이 입증되기 전에는 수익 중인 종목만 정점 매도 허용 (러너 조기 청산 차단)
+    PEAK_SELL_MIN_PROFIT_PCT = 2.0   # 미입증 상태에서 정점 매도 허용 최소 수익률
+    PEAK_SELL_TRUST_RATE = 50.0      # 적중률 이 이상이면 게이트 해제
+    PEAK_SELL_TRUST_SAMPLES = 10     # 적중률 판단 최소 표본
+
     @property
     def name(self) -> str:
         return "SellAgent"
@@ -60,6 +66,12 @@ class SellAgent(BaseAgent):
             if not holding or holding.quantity <= 0:
                 return False
 
+            # 권한 가중 게이트: LLM 정점 판단 매도는 적중률 입증 전까지 수익 게이트 통과 필요
+            # (차단돼도 손절/트레일링 등 코드 로직이 하방 방어)
+            if params.exit_reason == "ANALYSIS_SELL":
+                if not await self._peak_sell_allowed(holding):
+                    return False
+
             saved = event_detector.get_thresholds(params.symbol)
             event_detector.remove_levels(params.symbol)
 
@@ -90,6 +102,7 @@ class SellAgent(BaseAgent):
                     symbol=params.symbol, side="SELL",
                     order_id=order_id, quantity=holding.quantity,
                     expected_price=expected_price,
+                    exit_reason=params.exit_reason,
                 )
 
                 # 보유종목 변동 감지로 체결 확인 (백그라운드)
@@ -130,6 +143,37 @@ class SellAgent(BaseAgent):
             logger.error("[SellAgent] 매도 실행 실패 ({}): {}", params.symbol, str(e))
             return False
 
+    async def _peak_sell_allowed(self, holding) -> bool:
+        """정점 판단 매도 게이트 — 적중률 입증 시 무조건 허용, 아니면 수익 +2% 이상만"""
+        pnl_rate = holding.pnl_rate or 0.0
+
+        proven = False
+        try:
+            from analysis.feedback.judgment_verifier import judgment_verifier
+            stats = await judgment_verifier.get_accuracy_stats()
+            s = stats.get("PEAK_SELL")
+            proven = bool(
+                s and s["n"] >= self.PEAK_SELL_TRUST_SAMPLES
+                and s["rate"] >= self.PEAK_SELL_TRUST_RATE
+            )
+        except Exception as e:
+            logger.debug("[SellAgent] 정점 판단 적중률 조회 실패: {}", str(e))
+
+        if proven or pnl_rate >= self.PEAK_SELL_MIN_PROFIT_PCT:
+            return True
+
+        logger.info(
+            "[SellAgent] 정점 판단 매도 보류: {} 수익률 {:+.2f}% < +{:.1f}% "
+            "(적중률 미입증 — 손절/트레일링이 하방 방어)",
+            holding.symbol, pnl_rate, self.PEAK_SELL_MIN_PROFIT_PCT,
+        )
+        await activity_logger.log(
+            ActivityType.ORDER, ActivityPhase.PROGRESS,
+            f"⏸️ 정점 판단 매도 보류: {holding.symbol} 수익률 {pnl_rate:+.2f}% "
+            f"< +{self.PEAK_SELL_MIN_PROFIT_PCT:.1f}% 게이트 (조기매도 편향 방지)",
+            symbol=holding.symbol,
+        )
+        return False
 
 
 # 싱글톤

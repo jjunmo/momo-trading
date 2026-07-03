@@ -666,11 +666,14 @@ class TradingAgent:
                 if "volume" in minute_df.columns:
                     minute_df["volume"] = pd.to_numeric(minute_df["volume"], errors="coerce")
 
+        holding_syms = (portfolio_snapshot or {}).get("holding_symbols", [])
         if not daily_df.empty:
-            chart_result = chart_analyzer.analyze(daily_df, minute_df)
+            # 정점 신호는 보유종목 매도 판단 전용 — 신규 후보에 주입 시 매수 전량 차단됨
+            chart_result = chart_analyzer.analyze(
+                daily_df, minute_df, peak_signals=symbol in holding_syms
+            )
 
         # 비보유종목 + 현금으로 1주 매수 불가 → Tier1 스킵 (LLM 비용 절감)
-        holding_syms = (portfolio_snapshot or {}).get("holding_symbols", [])
         if symbol not in holding_syms and current_price > 0:
             available_cash = (portfolio_snapshot or {}).get("cash", 0)
             min_buy_cost = current_price * (
@@ -1275,6 +1278,60 @@ class TradingAgent:
             except Exception as e:
                 logger.warning("성과 요약 실패: {}", str(e))
 
+            # 5-1-1. 판단 검증 실행 + 롤링 통계·적중률 텍스트 (하네스 채점 결과 주입)
+            rolling_stats_text = "데이터 없음"
+            judgment_accuracy_text = "아직 채점된 판단 없음"
+            rule_verification_text = "검증된 규칙 없음"
+            try:
+                from analysis.feedback.judgment_verifier import judgment_verifier
+
+                # 오늘 판단 채점 (일봉 저장 포함) — 리뷰 직전 최신화
+                await judgment_verifier.verify_all()
+
+                stats = await judgment_verifier.get_accuracy_stats()
+                judgment_accuracy_text = judgment_verifier.format_stats_for_prompt(stats)
+
+                async with AsyncSessionLocal() as session:
+                    from repositories.trade_result_repository import TradeResultRepository
+                    breakdown = await TradeResultRepository(session).get_rolling_breakdown(days=21)
+
+                if breakdown["total"]["n"] > 0:
+                    _lines = [
+                        f"전체: {breakdown['total']['n']}건, 승률 {breakdown['total']['win_rate']}%, "
+                        f"손익 {breakdown['total']['pnl']:+,.0f}원, 평균수익률 {breakdown['total']['avg_return']:+.2f}%",
+                    ]
+                    for title, key in (("전략별", "by_strategy"), ("보유시간별", "by_hold_time"),
+                                       ("진입 신뢰도별", "by_confidence")):
+                        _lines.append(f"[{title}]")
+                        for bucket, s in sorted(breakdown[key].items()):
+                            _lines.append(
+                                f"  - {bucket}: {s['n']}건, 승률 {s['win_rate']}%, "
+                                f"손익 {s['pnl']:+,.0f}원, 평균 {s['avg_return']:+.2f}%"
+                            )
+                    rolling_stats_text = "\n".join(_lines)
+
+                # 직전 규칙 검증 결과 (최근 7일 채점분)
+                from datetime import timedelta as _td
+                from models import JudgmentVerification
+                from sqlalchemy import select as _select
+                async with AsyncSessionLocal() as session:
+                    rule_jvs = (await session.execute(
+                        _select(JudgmentVerification)
+                        .where(JudgmentVerification.judgment_type == "TRADING_RULE")
+                        .where(JudgmentVerification.verified_at >= now_kst() - _td(days=7))
+                        .order_by(JudgmentVerification.verified_at.desc())
+                        .limit(10)
+                    )).scalars().all()
+                if rule_jvs:
+                    _rl = []
+                    for jv in rule_jvs:
+                        mark = {"CORRECT": "✅ 효과 있음", "WRONG": "❌ 역효과",
+                                "EXPIRED": "➖ 판정 불가(표본 부족/차이 없음)"}.get(jv.verdict, jv.verdict)
+                        _rl.append(f"- {jv.rationale[:80]} → {mark}")
+                    rule_verification_text = "\n".join(_rl)
+            except Exception as e:
+                logger.warning("판단 검증 통계 생성 실패: {}", str(e))
+
             # 5-2. 오버나이트 보유종목 현황
             overnight_holdings_text = "없음"
             if True:  # AI가 hold_strategy 판단하므로 항상 체크
@@ -1386,6 +1443,9 @@ class TradingAgent:
                 today_realized_pnl=today_realized_pnl,
                 activity_summary=activity_summary,
                 performance_summary=performance_summary,
+                rolling_stats_text=rolling_stats_text,
+                judgment_accuracy_text=judgment_accuracy_text,
+                rule_verification_text=rule_verification_text,
                 overnight_holdings_text=overnight_holdings_text,
             )
 
@@ -1901,18 +1961,19 @@ class TradingAgent:
             )
 
     async def _get_today_trade_count(self) -> int:
-        """당일 체결 건수 조회"""
+        """당일 신규 진입(매수 체결) 건수 — trade_results 기준"""
         try:
-            from models.order import Order
+            from models.trade_result import TradeResult
             from sqlalchemy import select, func
             from util.time_util import now_kst
 
             today = now_kst().date()
             async with AsyncSessionLocal() as session:
                 result = await session.execute(
-                    select(func.count(Order.id)).where(
-                        func.date(Order.created_at) == today,
-                        Order.status == "FILLED",
+                    select(func.count(TradeResult.id)).where(
+                        TradeResult.side == "BUY",
+                        TradeResult.status == "CONFIRMED",
+                        func.date(TradeResult.entry_at) == today,
                     )
                 )
                 return result.scalar() or 0

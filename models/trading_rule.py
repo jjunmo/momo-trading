@@ -37,6 +37,8 @@ class TradingRule(Base, TimestampMixin):
     # 출처 + 근거
     source: Mapped[str] = mapped_column(String(30), default="DAILY_REVIEW")
     reason: Mapped[str] = mapped_column(Text, default="")
+    # 이 규칙으로 기대하는 효과 (JSON: 대상 지표·방향) — 만료 시 하네스가 전/중 데이터로 채점
+    expected_effect: Mapped[str] = mapped_column(Text, default="")
     source_report_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     priority: Mapped[str] = mapped_column(String(10), default="MEDIUM")
 

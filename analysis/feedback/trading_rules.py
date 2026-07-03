@@ -1,4 +1,5 @@
 """트레이딩 규칙 엔진 — 일일 리뷰 피드백 → 코드 레벨 하드 강제 자동화"""
+import json
 from datetime import timedelta
 
 from loguru import logger
@@ -12,15 +13,19 @@ from util.time_util import now_kst
 # ──────────────────────────────────────────────
 # 안전 범위: 파라미터별 (min, max)
 # ──────────────────────────────────────────────
+# 규칙 철학: LLM 규칙은 진입 제어(무엇을 사지 않을지) 전용.
+# 청산 파라미터(stop_loss_pct/take_profit_pct)는 전략 코드 소유 — LLM 일일 조정 금지.
+# (2026-07 whipsaw 사고: 하루 표본으로 손절 -6→-1% 진동 → 8전 8패 유발)
 SAFETY_BOUNDS: dict[str, tuple[float, float]] = {
-    "min_confidence": (0.50, 0.75),
-    "stop_loss_pct": (-8.0, -1.0),
-    "take_profit_pct": (2.0, 15.0),
+    "min_confidence": (0.50, 0.62),  # 상한 0.62 — 과도 차단 시 매수 붕괴 회귀
     "rr_floor": (0.8, 3.0),
     # 토글 (0=off, 1=on)
     "revalidate_rr_ratio": (0.0, 1.0),
     "require_stop_loss_logging": (0.0, 1.0),
 }
+
+# 진입 제어 전용에서 제외된 청산 파라미터 — 제안 시 명시적 거부 로그
+EXIT_PARAMS_CODE_OWNED = {"stop_loss_pct", "take_profit_pct"}
 
 MAX_ACTIVE_RULES = 20
 DEFAULT_EXPIRY_DAYS = 2
@@ -64,6 +69,12 @@ class TradingRuleEngine:
 
         for item in action_items:
             param_name = item.get("param_name", "")
+            if param_name in EXIT_PARAMS_CODE_OWNED:
+                logger.warning(
+                    "[TradingRule] 청산 파라미터({})는 코드 소유 — LLM 규칙 거부 (whipsaw 방지)",
+                    param_name,
+                )
+                continue
             if param_name not in SAFETY_BOUNDS:
                 logger.warning("[TradingRule] 미지원 파라미터: {}", param_name)
                 continue
@@ -80,6 +91,11 @@ class TradingRuleEngine:
             raw_expires = item.get("expires_days")
             expires_days = max(1, min(5, int(raw_expires))) if raw_expires is not None else DEFAULT_EXPIRY_DAYS
 
+            # expected_effect: 규칙의 예상 효과 (만료 시 judgment_verifier가 채점)
+            expected_effect = item.get("expected_effect") or {}
+            if not isinstance(expected_effect, dict):
+                expected_effect = {}
+
             rule = TradingRule(
                 rule_type=item.get("rule_type", "PARAM_OVERRIDE"),
                 strategy_type=item.get("strategy_type", "ALL"),
@@ -87,6 +103,7 @@ class TradingRuleEngine:
                 param_value=clamped,
                 source="DAILY_REVIEW",
                 reason=item.get("reason", ""),
+                expected_effect=json.dumps(expected_effect, ensure_ascii=False) if expected_effect else "",
                 source_report_date=report_date,
                 priority=item.get("priority", "MEDIUM"),
                 is_active=True,

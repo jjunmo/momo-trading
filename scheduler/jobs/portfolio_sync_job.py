@@ -12,6 +12,13 @@ async def portfolio_sync_job() -> None:
     # 2. 정산 현황 로깅 (계좌 vs DB 비교, 강제 변경 없음)
     await _check_account_db_consistency()
 
+    # 3. 판단 검증: 일봉 저장 + 미채점 판단 채점 (매수/정점매도/국면/규칙)
+    try:
+        from analysis.feedback.judgment_verifier import judgment_verifier
+        await judgment_verifier.verify_all()
+    except Exception as e:
+        logger.warning("판단 검증 실패: {}", str(e))
+
     logger.debug("포트폴리오 정산 완료")
 
 
@@ -84,6 +91,20 @@ async def _recover_pending_confirms() -> None:
                                     tr.entry_price = filled_price
                                 elif tr.side == "SELL":
                                     tr.exit_price = filled_price
+                                    # 원 매도 사유 보존 + 미청산 BUY FIFO 청산
+                                    # (누락 시 BUY가 고아로 남아 ORPHAN_CLEANUP으로 사유 유실)
+                                    from util.time_util import now_kst
+                                    _now = now_kst()
+                                    tr.exit_at = tr.exit_at or _now
+                                    tr.exit_reason = tr.exit_reason or "RECOVERED"
+                                    await repo.close_open_buys_fifo(
+                                        symbol=tr.stock_symbol,
+                                        sell_qty=filled_qty,
+                                        sell_price=filled_price,
+                                        exit_reason=tr.exit_reason,
+                                        sell_order_id=str(tr.order_id or "") or None,
+                                        now=_now,
+                                    )
                             tr.notes = None
                             recovered += 1
                             logger.debug(

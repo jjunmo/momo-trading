@@ -67,6 +67,15 @@ DAILY_PLAN_PROMPT = """## 장 마감 매매 성과 리뷰
 ### 과거 매매 성과 요약
 {performance_summary}
 
+### 최근 3주 롤링 성과 통계 (판단 기준 — 하루 표본이 아닌 이 통계로 판단할 것)
+{rolling_stats_text}
+
+### 판단 유형별 적중률 (하네스 자동 채점: 예상 vs 실제 결과)
+{judgment_accuracy_text}
+
+### 직전 규칙 검증 결과 (네가 만든 규칙이 실제로 효과가 있었는지)
+{rule_verification_text}
+
 ### 오버나이트 보유종목
 {overnight_holdings_text}
 
@@ -91,21 +100,17 @@ DAILY_PLAN_PROMPT = """## 장 마감 매매 성과 리뷰
 - 리스크: 손절/익절 기준이 적절했는지
 - 시스템 개선: 스캔/분석/매매 과정에서 개선할 점
 
-### 4. 액션 아이템 (내일 코드에 자동 적용될 규칙)
-위 피드백에서 도출된 **구체적 파라미터 변경**을 action_items에 기록하세요.
-- 시스템이 코드 레벨에서 자동으로 강제 적용합니다 (프롬프트 제안이 아닌 하드 강제)
+### 4. 액션 아이템 (내일 코드에 자동 적용될 규칙 — 손실 제어 전용)
+**규칙 철학**: 규칙은 나쁜 패턴을 차단하는 **진입 제어** 용도로만 사용합니다.
+좋은 성과를 확대하려는 규칙, 손절/익절 폭 조정은 금지 — 청산 파라미터는 전략 코드가 소유하며 제안해도 거부됩니다.
 - 사용 가능한 param_name:
-  - min_confidence: 최소 신뢰도 임계값 (0.50~0.75) — 매수에만 적용 (매도 미적용). 내일 시장 국면이 오늘과 다를 수 있으므로 보수적 설정 시 기회 손실 주의
-    ⚠️ 0.65 이상이면 대부분의 매수 기회가 차단됩니다. 0.70 이상은 폭락장에서만 사용하세요.
-    시장 국면에 따라 자동 조정됩니다 (BULL: -5%p 완화, BEAR: +3%p 강화)
-  - stop_loss_pct: 손절 % (음수, -8.0~-1.0)
-  - take_profit_pct: 익절 % (2.0~15.0)
-  - rr_floor: 최소 리스크:보상 비율 (0.8~3.0)
-- expires_days: 규칙 유효 기간 (1~5일, 기본 2일). 시장 상황은 빠르게 변하므로 짧게 설정 권장
-- 변경이 불필요하면 빈 배열 []로 두세요
-- 예시 (올리기): 저신뢰 종목 연속 손실 → {{"param_name": "min_confidence", "param_value": 0.62, "expires_days": 2}}
-- 예시 (내리기): 과도한 차단으로 기회 손실 → {{"param_name": "min_confidence", "param_value": 0.55, "expires_days": 1}}
-- 예시 (유지): 현재 기준이 적절하게 작동 중 → action_items를 빈 배열 []로
+  - min_confidence: 최소 신뢰도 임계값 (0.50~0.62) — 매수 진입 필터. 상한 0.62 초과는 매수 붕괴를 유발하므로 시스템이 거부
+  - rr_floor: 최소 리스크:보상 비율 (0.8~3.0) — 진입 필터
+- **단일일 표본으로 제안 금지**: 위 "최근 3주 롤링 성과 통계"와 방향이 일치할 때만 제안하세요.
+  오늘 하루 결과만으로 어제 규칙을 뒤집는 것은 whipsaw이며 실제 손실 사고의 원인이었습니다.
+- **expected_effect 필수**: 이 규칙으로 개선될 지표와 방향을 명시 — 하네스가 만료 시 실제 데이터로 채점하고, 틀린 규칙 제안이 반복되면 규칙 권한이 축소됩니다
+- expires_days: 규칙 유효 기간 (1~5일, 기본 2일)
+- 변경이 불필요하면 빈 배열 []로 두세요 (규칙 없음이 기본값)
 
 JSON 형식으로 답변:
 ```json
@@ -146,10 +151,11 @@ JSON 형식으로 답변:
     {{
       "rule_type": "PARAM_OVERRIDE",
       "strategy_type": "ALL 또는 STABLE_SHORT 또는 AGGRESSIVE_SHORT",
-      "param_name": "min_confidence | stop_loss_pct | take_profit_pct | rr_floor",
+      "param_name": "min_confidence | rr_floor",
       "param_value": 0.0,
       "expires_days": 2,
-      "reason": "구체적 근거 (오늘 어떤 문제에서 이 규칙이 필요한지)",
+      "reason": "구체적 근거 — 롤링 통계의 어떤 패턴을 차단하는지",
+      "expected_effect": {{"metric": "avg_return | win_rate", "direction": "UP"}},
       "priority": "HIGH/MEDIUM/LOW"
     }}
   ]
