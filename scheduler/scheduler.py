@@ -877,6 +877,12 @@ class TradingScheduler:
             quiet_pushed = []
             for h in sellable:
                 th = event_detector.get_thresholds(h.symbol)
+
+                # 러너는 정기 재평가 제외 — 기계적 트레일링 전용 (LLM SELL/ADD_BUY 원천 차단)
+                if th.is_runner:
+                    skipped.append(f"{h.name or h.symbol}(러너)")
+                    continue
+
                 next_review = getattr(th, "next_review_at", 0) or 0
 
                 # 첫 체크(next_review_at 미설정) → 즉시 분석
@@ -988,6 +994,17 @@ class TradingScheduler:
         """
         from services.activity_logger import activity_logger
 
+        # 고아 판정 전에 미확정 매도부터 KIS 기준으로 복구 — 순서가 바뀌면
+        # 고아 정리가 open BUY를 추정가로 선청산해 FIFO 링크가 영구 유실됨
+        # (2026-08-07 심텍: NXT_CLOSE 매도 미확인 상태로 밤샘 → 고아 정리가 선점)
+        try:
+            from agent.decision_maker import decision_maker
+            recovered = await decision_maker.check_pending_orders()
+            if recovered:
+                logger.info("프리마켓 체결 복구: {}건 (고아 정리 전 선행)", recovered)
+        except Exception as e:
+            logger.warning("프리마켓 체결 복구 실패: {}", str(e))
+
         try:
             from core.database import AsyncSessionLocal
             from realtime.event_detector import event_detector
@@ -1014,6 +1031,29 @@ class TradingScheduler:
                 # SELL 레코드나 현재가로 exit_price/pnl 계산
                 for tr in open_positions:
                     if tr.stock_symbol not in actual_symbols:
+                        # 매수 체결 실체 검증 — 미체결 매수를 체결로 간주한 허위 손익 방지
+                        from agent.decision_maker import decision_maker
+                        fill = await decision_maker.verify_buy_fill(
+                            tr.order_id, tr.stock_symbol, tr.entry_at,
+                        )
+                        if fill is not None and fill["qty"] <= 0:
+                            tr.status = "CONFIRM_FAILED"
+                            tr.notes = "ORPHAN_CLEANUP: KIS 매수 체결 실체 없음 → 손익 미계상"
+                            orphan_count += 1
+                            logger.warning(
+                                "[{}] 프리마켓 고아 — KIS 체결 실체 없음 → CONFIRM_FAILED 마킹 (주문 {})",
+                                tr.stock_symbol, tr.order_id,
+                            )
+                            continue
+                        if fill and fill["qty"] > 0 and fill["qty"] != tr.quantity:
+                            logger.warning(
+                                "[{}] 프리마켓 고아 수량 보정: {} → {}주 (KIS 실체결)",
+                                tr.stock_symbol, tr.quantity, fill["qty"],
+                            )
+                            tr.quantity = fill["qty"]
+                            if fill.get("price"):
+                                tr.entry_price = fill["price"]
+
                         from util.time_util import now_kst
                         now = now_kst()
                         tr.exit_at = now
@@ -1087,20 +1127,23 @@ class TradingScheduler:
                 if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
                     kwargs["stop_loss"] = tr.ai_stop_loss_price
                     kwargs["initial_stop_loss"] = tr.ai_stop_loss_price
-                if tr.ai_target_price and tr.ai_target_price > 0:
+                # 러너: take_profit 미복원 (익절 재검토 중단 유지)
+                if tr.ai_target_price and tr.ai_target_price > 0 and not tr.is_runner:
                     kwargs["take_profit"] = tr.ai_target_price
                     kwargs["initial_take_profit"] = tr.ai_target_price
                 # 트레일링 스탑 복원 (전략별 기본값)
                 if tr.entry_price and tr.entry_price > 0:
                     kwargs["entry_price"] = tr.entry_price
                 if tr.strategy_type:
-                    kwargs["strategy_type"] = tr.strategy_type
                     # 전략별 기본 trailing_stop_pct
                     from agent.trading_agent import trading_agent
                     strategy = trading_agent.strategies.get(tr.strategy_type)
                     default_trailing = getattr(strategy, "DEFAULT_TRAILING_STOP_PCT", 3.0)
                     kwargs["trailing_stop_pct"] = default_trailing
                     kwargs["breakeven_trigger_pct"] = 1.5
+                if tr.is_runner:
+                    kwargs["is_runner"] = True
+                    kwargs.setdefault("trailing_stop_pct", settings.RUNNER_TRAILING_FALLBACK_PCT)
                 if kwargs:
                     event_detector.set_thresholds(tr.stock_symbol, **kwargs)
                     restored += 1

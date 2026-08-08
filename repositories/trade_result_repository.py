@@ -253,15 +253,28 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_by_order_id(self, order_id: str) -> TradeResult | None:
-        """주문번호로 TradeResult 조회"""
+    async def get_by_order_id(
+        self,
+        order_id: str,
+        symbol: str | None = None,
+        side: str | None = None,
+        since=None,
+    ) -> TradeResult | None:
+        """주문번호로 TradeResult 조회 (최신 순)
+
+        KIS 주문번호(odno)는 일 단위로만 유일 — 중복 판정 시 symbol/side/since를
+        함께 넘겨 같은 주문인지 좁혀야 함 (과거 다른 종목의 동일 번호 오탐 방지).
+        """
         if not order_id:
             return None
-        stmt = (
-            select(TradeResult)
-            .where(TradeResult.order_id == order_id)
-            .limit(1)
-        )
+        stmt = select(TradeResult).where(TradeResult.order_id == order_id)
+        if symbol:
+            stmt = stmt.where(TradeResult.stock_symbol == symbol)
+        if side:
+            stmt = stmt.where(TradeResult.side == side)
+        if since is not None:
+            stmt = stmt.where(TradeResult.created_at >= since)
+        stmt = stmt.order_by(TradeResult.created_at.desc()).limit(1)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 

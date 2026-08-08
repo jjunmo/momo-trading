@@ -177,8 +177,13 @@ class DecisionMaker:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     repo = TradeResultRepository(session)
-                    # 중복 체크 (P2-7)
-                    existing = await repo.get_by_order_id(order_id)
+                    # 중복 체크 — 같은 (주문번호+종목+방향+당일)만 진짜 중복
+                    # (KIS odno는 일 단위 유일: 과거 다른 종목의 동일 번호에 걸리면 기록 유실됨)
+                    from datetime import datetime as _dt
+                    today_start = _dt.combine(now.date(), _dt.min.time())
+                    existing = await repo.get_by_order_id(
+                        order_id, symbol=symbol, side=side, since=today_start,
+                    )
                     if existing:
                         logger.warning("[{}] 주문번호 {} 이미 존재 → pending 생성 스킵", symbol, order_id)
                         return existing.id
@@ -327,11 +332,37 @@ class DecisionMaker:
                         symbol, expected_price, str(filled_order)[:300],
                     )
 
-                if filled_qty > 0:
-                    break  # 체결 확인 완료
+                if filled_qty >= quantity:
+                    break  # 전량 체결 완료
+                elif filled_qty > 0:
+                    # 부분체결 — 즉시 확정하면 이후 추가 체결분이 유실됨 (2026-08-07 이랜시스
+                    # 205주 중 112주만 기록된 사고). 마지막 회차까지 추가 체결 대기.
+                    if attempt >= MAX_ATTEMPTS:
+                        break  # 타임아웃 → 아래에서 부분체결 확정 처리
+                    logger.info("[{}] 부분체결 {}/{}주 ({}회차) — 추가 체결 대기",
+                                symbol, filled_qty, quantity, attempt)
+                    # filled_order 유지 (transient 조회 실패 시에도 부분체결 상태 보존)
                 else:
                     logger.debug("[{}] 체결수량 0 ({}회차) — 재시도", symbol, attempt)
                     filled_order = None  # 리셋하고 재시도
+
+            # 부분체결 타임아웃 → 최신 수량 재확인 + 잔량 취소 (기록 후 수량 증가 방지)
+            if 0 < filled_qty < quantity:
+                verified = await self._verify_via_daily_ccld(order_id, symbol)
+                if verified and verified["qty"] > filled_qty:
+                    filled_qty = verified["qty"]
+                    filled_price = verified.get("price") or filled_price
+                if filled_qty < quantity:
+                    await self._cancel_unfilled_order(order_id, symbol)
+                    logger.warning(
+                        "[{}] 부분체결 확정: {}/{}주 — 잔량 취소 (주문번호 {})",
+                        symbol, filled_qty, quantity, order_id,
+                    )
+                    await activity_logger.log(
+                        ActivityType.ORDER, ActivityPhase.PROGRESS,
+                        f"⚠️ 부분체결 확정: {symbol} {filled_qty}/{quantity}주 — 잔량 취소",
+                        symbol=symbol,
+                    )
 
             # 재시도 모두 실패 → 안전 검증 후 처리
             if not filled_order or filled_qty <= 0:
@@ -475,6 +506,39 @@ class DecisionMaker:
             logger.error("[{}] 일별체결 안전 검증 오류: {}", symbol, str(e))
             return None
 
+    async def verify_buy_fill(self, order_id: str, symbol: str, entry_at=None) -> dict | None:
+        """주문번호의 실제 매수 체결 여부를 KIS 일별체결로 확인 (고아 정리용)
+
+        고아 정리가 미체결 매수를 "체결된 것"으로 간주해 추정가 손익을 만드는 사고 방지
+        (2026-07-10 KB금융: KIS에 없는 주문 3건이 ORPHAN_CLEANUP으로 -33,600원 허위 계상).
+
+        Returns:
+            {"qty": n, "price": p} — 체결 확인
+            {"qty": 0}            — 조회 성공했으나 미체결/취소 (NXT 누락 가능성 있음)
+            None                  — 조회 실패 (판단 불가)
+        """
+        if not order_id:
+            return None
+        try:
+            from trading.kis_api import get_daily_ccld_direct
+            d = (entry_at or now_kst()).strftime("%Y%m%d")
+            res = await get_daily_ccld_direct(start_date=d, end_date=d, odno=str(order_id))
+            if not res.get("success"):
+                return None
+            for t in res.get("trades") or []:
+                if str(t.get("odno") or "") != str(order_id):
+                    continue
+                if (t.get("cncl_yn") or "N").upper() == "Y":
+                    return {"qty": 0}
+                return {
+                    "qty": int(float(t.get("tot_ccld_qty") or 0)),
+                    "price": float(t.get("avg_prvs") or 0),
+                }
+            return {"qty": 0}
+        except Exception as e:
+            logger.warning("[{}] 매수 체결 실체 확인 실패: {}", symbol, str(e))
+            return None
+
     async def _cancel_unfilled_order(self, order_id: str, symbol: str) -> None:
         """미체결 주문 취소 시도 — order_id 없으면 종목 기준 폴백"""
         from trading.kis_api import cancel_order_direct
@@ -606,9 +670,13 @@ class DecisionMaker:
                 async with session.begin():
                     repo = TradeResultRepository(session)
 
-                    # 중복 체크 (P2-7: order_id UNIQUE)
+                    # 중복 체크 — 같은 (주문번호+종목+방향+당일)만 진짜 중복 (odno 일 단위 유일)
                     if order_id:
-                        existing = await repo.get_by_order_id(order_id)
+                        from datetime import datetime as _dt
+                        today_start = _dt.combine(now.date(), _dt.min.time())
+                        existing = await repo.get_by_order_id(
+                            order_id, symbol=symbol, side=side, since=today_start,
+                        )
                         if existing:
                             logger.debug("[{}] 주문번호 {} 이미 기록됨 → 스킵", symbol, order_id)
                             return
@@ -714,6 +782,7 @@ class DecisionMaker:
     def register_pending_sell(
         self, symbol: str, order_id: str, quantity: int,
         expected_price: float, exit_reason: str = "",
+        held_qty: int = 0,
     ) -> None:
         """매도 주문 후 체결 대기 등록"""
         import time
@@ -722,25 +791,40 @@ class DecisionMaker:
             "expected_price": expected_price,
             "quantity": quantity,
             "exit_reason": exit_reason,
+            "held_qty": held_qty,  # 주문 시점 보유수량 (부분 매도 체결 감지용)
             "timestamp": time.time(),
         }
         logger.info("[매도대기] {} 등록: order_id={}, qty={}, price={:,.0f}",
                      symbol, order_id, quantity, expected_price)
 
+    @staticmethod
+    def _sell_filled_by_holdings(holding, quantity: int, held_qty: int) -> bool:
+        """보유종목 변동으로 매도 체결 판정 — 소멸(전량) 또는 수량 감소(부분)"""
+        if holding is None:
+            return True  # 보유목록에서 사라짐 → 전량 매도 체결
+        if held_qty > 0 and quantity < held_qty:
+            return holding.quantity <= held_qty - quantity  # 부분 매도: 수량 감소 확인
+        return False
+
     async def wait_for_sell_confirmation(
         self, symbol: str, order_id: str, quantity: int,
         expected_price: float, exit_reason: str = "",
+        held_qty: int = 0,
     ) -> bool:
-        """매도 직후 보유종목 변동 감지 (빠른 확인, 최대 30초)"""
+        """매도 직후 보유종목 변동 감지 (빠른 확인, 최대 30초)
+
+        held_qty: 주문 시점 보유수량. 부분 매도(quantity < held_qty)는
+        symbol이 보유목록에 남으므로 수량 감소로 체결을 판정한다.
+        """
         from trading.account_manager import account_manager
 
         for attempt in range(3):
             await asyncio.sleep(10)
             try:
+                account_manager.invalidate_cache()  # 캐시 stale 방지 (부분 매도 수량 감지)
                 holdings = await account_manager.get_holdings()
-                holding_symbols = {h.symbol for h in holdings if h.symbol}
-                if symbol not in holding_symbols:
-                    # 보유목록에서 사라짐 → 매도 체결 확인
+                h = next((x for x in holdings if x.symbol == symbol), None)
+                if self._sell_filled_by_holdings(h, quantity, held_qty):
                     fill_price = await self._get_fill_price(order_id, symbol)
                     actual_price = fill_price or expected_price
                     await self._record_trade_result(
@@ -757,7 +841,7 @@ class DecisionMaker:
                 logger.warning("[매도확인] {} 보유종목 조회 실패 ({}/3): {}", symbol, attempt + 1, str(e))
 
         # 30초 내 미확인 → pending_sells에 유지 (정기 체크에서 재시도)
-        self.register_pending_sell(symbol, order_id, quantity, expected_price, exit_reason)
+        self.register_pending_sell(symbol, order_id, quantity, expected_price, exit_reason, held_qty=held_qty)
         logger.info("[매도대기] {} 30초 내 미확인 → 정기 체크에서 재시도", symbol)
         return False
 
@@ -778,14 +862,19 @@ class DecisionMaker:
             return 0
 
         holding_symbols = {h.symbol for h in holdings if h.symbol}
+        holdings_by_symbol = {h.symbol: h for h in holdings if h.symbol}
         confirmed = 0
 
-        # 1. 메모리 pending sells 점검
+        # 1. 메모리 pending sells 점검 (전량 소멸 또는 부분 매도 수량 감소)
         for symbol in list(self._pending_sells.keys()):
-            if symbol in holding_symbols:
+            pending = self._pending_sells[symbol]
+            h = holdings_by_symbol.get(symbol)
+            if not self._sell_filled_by_holdings(
+                h, pending["quantity"], pending.get("held_qty", 0)
+            ):
                 continue
 
-            pending = self._pending_sells.pop(symbol)
+            self._pending_sells.pop(symbol)
             fill_price = await self._get_fill_price(pending["order_id"], symbol)
             actual_price = fill_price or pending["expected_price"]
 
@@ -812,18 +901,26 @@ class DecisionMaker:
 
                 for tr in pending_db:
                     symbol = tr.stock_symbol
-                    if symbol in holding_symbols:
-                        continue  # 아직 보유 → 미체결
+                    filled_qty = tr.quantity
+                    actual_price = 0.0
 
-                    # 보유목록에서 사라짐 → 체결 확인
-                    fill_price = await self._get_fill_price(tr.order_id, symbol)
-                    actual_price = fill_price or tr.exit_price or 0
+                    if symbol not in holding_symbols:
+                        # 보유목록에서 사라짐 → 전량 매도 체결 확인
+                        fill_price = await self._get_fill_price(tr.order_id, symbol)
+                        actual_price = fill_price or tr.exit_price or 0
+                    else:
+                        # 아직 보유 중 — 부분 매도일 수 있음 → KIS 일별체결 odno 직접 매칭
+                        verified = await self._verify_via_daily_ccld(tr.order_id, symbol)
+                        if not verified:
+                            continue  # 미체결 → 16:00 정산이 최종 판정
+                        filled_qty = verified["qty"]
+                        actual_price = verified.get("price") or tr.exit_price or 0
 
                     if actual_price > 0:
                         await self._confirm_pending_record(
                             pending_record_id=tr.id,
                             symbol=symbol, side="SELL",
-                            filled_qty=tr.quantity, filled_price=actual_price,
+                            filled_qty=filled_qty, filled_price=actual_price,
                             exit_reason=tr.exit_reason or "RECOVERED",
                         )
                         logger.info("[매도확인] {} DB 복구 체결 확인: {:,.0f}원", symbol, actual_price)
