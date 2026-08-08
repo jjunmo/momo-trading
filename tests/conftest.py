@@ -37,6 +37,9 @@ async def create_tables():
     yield
     async with test_async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+    # aiosqlite 워커 스레드 종료 — dispose 없으면 StaticPool 연결이 살아남아
+    # 인터프리터 종료(Py_FinalizeEx)가 SimpleQueue.get 대기 스레드를 기다리며 영구 hang
+    await test_async_engine.dispose()
 
 
 @pytest.fixture()
