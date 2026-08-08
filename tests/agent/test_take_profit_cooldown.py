@@ -58,3 +58,13 @@ async def test_retrigger_after_cooldown(guard):
     await _hit(g)
     await asyncio.sleep(0)
     assert len(calls) == 2
+
+
+async def test_runner_no_tp_review(guard):
+    """러너 전환(take_profit=0) 후에는 가격이 아무리 올라도 익절 재검토 미발화"""
+    g, calls = guard
+    g.set_thresholds("AAA", is_runner=True, take_profit=0.0)
+    await _hit(g, price=99999.0)
+    await asyncio.sleep(0)
+    assert len(calls) == 0
+    assert g.get_thresholds("AAA").is_runner is True

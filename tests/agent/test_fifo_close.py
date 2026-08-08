@@ -96,3 +96,31 @@ async def test_sell_exceeds_open_qty():
         )
         await s.commit()
     assert closed == 10  # 미청산 10주만 (초과 5주는 매칭 불가 → 경고)
+
+
+async def test_partial_close_keeps_runner_flag_on_open_row():
+    """분할 익절(러너 전환 후) 부분 청산: 잔량 원행의 is_runner 유지, 청산 분할행은 기본값"""
+    async with TestAsyncSessionLocal() as s:
+        buy = _buy("DDD", 10, 1000, 10, "DDD-B1")
+        buy.is_runner = True  # 러너 전환된 포지션
+        s.add(buy)
+        await s.commit()
+    async with TestAsyncSessionLocal() as s:
+        repo = TradeResultRepository(s)
+        _, closed = await repo.close_open_buys_fifo(
+            "DDD", sell_qty=5, sell_price=1100, exit_reason="TAKE_PROFIT_REVIEW",
+            sell_order_id="DDD-S1", now=NOW,
+        )
+        await s.commit()
+    assert closed == 5
+    async with TestAsyncSessionLocal() as s:
+        open_rows = await _open_buys(s, "DDD")
+        assert len(open_rows) == 1
+        assert open_rows[0].quantity == 5
+        assert open_rows[0].is_runner is True  # 재시작 복원용 플래그 유지
+        closed_rows = (await s.execute(
+            select(TradeResult).where(
+                TradeResult.stock_symbol == "DDD", TradeResult.exit_at.isnot(None))
+        )).scalars().all()
+        assert len(closed_rows) == 1
+        assert closed_rows[0].quantity == 5

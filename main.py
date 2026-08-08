@@ -50,7 +50,8 @@ async def lifespan(app: FastAPI):
             if tr.side != "BUY":
                 continue
             kwargs = {}
-            if tr.ai_target_price and tr.ai_target_price > 0:
+            # 러너: take_profit 미복원 (익절 재검토 중단 유지)
+            if tr.ai_target_price and tr.ai_target_price > 0 and not tr.is_runner:
                 kwargs["take_profit"] = tr.ai_target_price
                 kwargs["initial_take_profit"] = tr.ai_target_price
             if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
@@ -58,6 +59,9 @@ async def lifespan(app: FastAPI):
                 kwargs["initial_stop_loss"] = tr.ai_stop_loss_price
             if tr.entry_price and tr.entry_price > 0:
                 kwargs["entry_price"] = tr.entry_price
+            if tr.is_runner:
+                kwargs["is_runner"] = True
+                kwargs.setdefault("trailing_stop_pct", settings.RUNNER_TRAILING_FALLBACK_PCT)
             if kwargs:
                 event_detector.set_thresholds(tr.stock_symbol, **kwargs)
                 restored += 1

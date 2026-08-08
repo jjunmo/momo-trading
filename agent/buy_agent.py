@@ -72,6 +72,23 @@ class BuyAgent(BaseAgent):
             if params.price <= 0:
                 return result
 
+            # 최소 신뢰도 게이트 — TradingRule(min_confidence)의 유일한 실집행 지점
+            # (규칙 엔진이 전략 인스턴스 속성에 오버라이드 → 여기서 읽음.
+            #  구 Strategy.evaluate() 게이트는 라이브 미호출로 제거됨)
+            from agent.trading_agent import trading_agent
+            strategy = trading_agent.strategies.get(params.strategy_type)
+            min_conf = getattr(strategy, "min_confidence", 0.5) if strategy else 0.5
+            if 0 < params.confidence < min_conf:
+                logger.info("[BuyAgent] 신뢰도 미달 — 주문 스킵: {} {:.2f} < {:.2f}",
+                            params.symbol, params.confidence, min_conf)
+                await activity_logger.log(
+                    ActivityType.DECISION, ActivityPhase.SKIP,
+                    f"⚠️ [{params.symbol}] 최소 신뢰도 미달 → 매수 스킵 "
+                    f"({params.confidence:.2f} < {min_conf:.2f})",
+                    symbol=params.symbol,
+                )
+                return result
+
             # 주문 직전 현재가 재조회 — 분석 레이턴시 동안 시세 변동 보정
             # (SellAgent의 NXT 현재가 재조회 패턴과 동일 컨셉, BuyAgent 버전)
             analysis_price = params.price
@@ -216,6 +233,10 @@ class BuyAgent(BaseAgent):
             )
 
             if exec_result.get("success"):
+                # 러너 종목 추가 매수 → 러너 해제 (신규 목표가로 정상 관리 재개)
+                if event_detector.get_thresholds(params.symbol).is_runner:
+                    await self._clear_runner(params.symbol)
+
                 # PriceGuard에 LLM 수치 설정
                 kwargs = {}
                 if params.stop_loss_price > 0:
@@ -257,6 +278,22 @@ class BuyAgent(BaseAgent):
             logger.error("[BuyAgent] 매수 실행 오류 ({}): {}", params.symbol, str(e))
 
         return result
+
+    async def _clear_runner(self, symbol: str) -> None:
+        """러너 해제 — 메모리 플래그 + DB open BUY 행 동기화 (재시작 복원 일관성)"""
+        event_detector.set_thresholds(symbol, is_runner=False)
+        try:
+            from core.database import AsyncSessionLocal
+            from repositories.trade_result_repository import TradeResultRepository
+
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    repo = TradeResultRepository(session)
+                    for tr in await repo.get_all_open_buys(symbol):
+                        tr.is_runner = False
+            logger.info("러너 해제: {} (추가 매수 — 정상 관리 재개)", symbol)
+        except Exception as e:
+            logger.warning("[BuyAgent] 러너 해제 DB 동기화 실패 ({}): {}", symbol, str(e))
 
 
 # 싱글톤

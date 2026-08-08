@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     LLM_MODEL_TIER2: str = "claude-sonnet-4-6"
     LLM_MAX_RETRIES: int = 3
     LLM_REQUEST_TIMEOUT_SEC: int = 120
-    LLM_MAX_OUTPUT_TOKENS: int = 4096
+    LLM_MAX_OUTPUT_TOKENS: int = 8192
     LLM_CACHE_ENABLED: bool = True  # Layered prompt caching
 
     # --- Claude Code CLI (LLM_BACKEND=claude_code) ---
@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     TRAILING_ATR_MULT: float = 0.8     # trailing_pct = ATR% × 0.8
     TRAILING_ATR_MIN_PCT: float = 2.5  # 하한
     TRAILING_ATR_MAX_PCT: float = 7.0  # 상한
+    # 분할 익절 + 러너 — LLM 매도 판단 시 일부만 실현, 잔량은 트레일링 전용 러너
+    PARTIAL_TP_RATIO: float = 0.5              # LLM 매도 판단 시 매도 비율 (잔량=러너)
+    RUNNER_TRAILING_FALLBACK_PCT: float = 3.0  # 러너 전환 시 트레일링 미설정이면 이 값 사용
+    # PEAK_SELL 채점 지평 — 매도 후 N거래일 내 최고 종가 기준 조기매도 판정
+    PEAK_SELL_VERIFY_TRADING_DAYS: int = 5     # 채점 대상 거래일 수
+    PEAK_SELL_MISSED_RALLY_PCT: float = 2.0    # 최고 종가가 매도가 대비 이 % 초과 상승 시 WRONG
     MAX_DAILY_TRADES: int = 0  # 0 = 무제한 (AI Risk Tuner가 동적 조정)
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정
     MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정

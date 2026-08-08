@@ -2,7 +2,8 @@
 
 설계 원칙: LLM은 제안자, 하네스는 집행·검증자.
 - 매수 판단: 보유기간 고가/저가 기준 목표가·손절가 터치 여부 채점
-- 정점 판단 매도(ANALYSIS_SELL): 매도 후 종가 대비 조기매도 여부 채점
+- LLM 판단 매도(ANALYSIS_SELL·HOLDINGS_REVIEW·TAKE_PROFIT_REVIEW):
+  매도 후 5거래일 내 최고 종가 대비 조기매도 여부 채점
 - 시장 국면: 선언 시점 기록 → 장 마감 지수 등락률과 대조
 - 트레이딩 규칙: 만료 시 규칙 활성 전/중 성과 비교
 
@@ -17,7 +18,7 @@ from sqlalchemy import select
 from util.time_util import now_kst
 
 # 채점 기준 상수
-PEAK_SELL_TOLERANCE_PCT = 0.5   # 매도 후 종가가 이보다 더 오르면 조기매도(WRONG)
+# PEAK_SELL 채점 지평·허용치는 settings(PEAK_SELL_VERIFY_TRADING_DAYS/MISSED_RALLY_PCT) 참조
 RULE_MIN_SAMPLES = 3            # 규칙 전/중 비교 최소 표본
 RULE_EFFECT_EPS = 0.05          # 규칙 효과 판정 임계 (평균 수익률 %p)
 SIDEWAYS_BAND_PCT = 1.2         # SIDEWAYS 국면 허용 지수 등락 범위
@@ -233,10 +234,18 @@ class JudgmentVerifier:
     # ── 정점 판단 매도 채점 ──
 
     async def _verify_peak_sells(self, lookback_days: int) -> int:
-        """ANALYSIS_SELL: 매도 후 다음 종가가 매도가보다 높으면 조기매도(WRONG)"""
+        """LLM 판단 매도: 매도 후 N거래일 내 최고 종가가 매도가 +X% 초과면 조기매도(WRONG)
+
+        비대칭 조기확정: WRONG은 초과 즉시 확정, CORRECT는 N거래일 관찰 완료 필요.
+        (기존 '익일 종가' 기준은 급등주의 하루 눌림을 정답으로 오채점 → 5거래일 지평으로 교체)
+        """
+        from core.config import settings
         from core.database import AsyncSessionLocal
         from models import JudgmentVerification, TradeResult
+        from trading.enums import LLM_SELL_REASONS
 
+        horizon = settings.PEAK_SELL_VERIFY_TRADING_DAYS
+        threshold = settings.PEAK_SELL_MISSED_RALLY_PCT
         cutoff = now_kst() - timedelta(days=lookback_days)
         count = 0
         async with AsyncSessionLocal() as session:
@@ -245,7 +254,7 @@ class JudgmentVerifier:
                 trades = (await session.execute(
                     select(TradeResult)
                     .where(TradeResult.side == "BUY")
-                    .where(TradeResult.exit_reason == "ANALYSIS_SELL")
+                    .where(TradeResult.exit_reason.in_(LLM_SELL_REASONS))
                     .where(TradeResult.exit_at.isnot(None))
                     .where(TradeResult.exit_price > 0)
                     .where(TradeResult.exit_at >= cutoff)
@@ -255,26 +264,35 @@ class JudgmentVerifier:
                     if tr.id in done:
                         continue
                     exit_d = tr.exit_at.date()
-                    # 매도 다음 거래일 종가 필요 → 없으면 다음 실행 때 채점
+                    # 달력일 +14일 조회 → 앞 N거래일 슬라이스 (주말/휴일 커버)
                     candles = await self._get_candles(
                         session, tr.stock_symbol, exit_d + timedelta(days=1),
-                        exit_d + timedelta(days=7),
+                        exit_d + timedelta(days=14),
                     )
-                    if not candles:
-                        continue
-                    next_close = candles[0].close
-                    diff_pct = (next_close - tr.exit_price) / tr.exit_price * 100
-                    verdict = "WRONG" if diff_pct > PEAK_SELL_TOLERANCE_PCT else "CORRECT"
+                    window = candles[:horizon]
+                    if not window:
+                        continue  # 캔들 없음 → 다음 실행 대기
+                    max_close = max(c.close for c in window)
+                    diff_pct = (max_close - tr.exit_price) / tr.exit_price * 100
+                    if diff_pct > threshold:
+                        verdict = "WRONG"  # 놓친 상승 확정 (관찰일 부족해도 즉시)
+                    elif len(window) >= horizon:
+                        verdict = "CORRECT"  # 지평 완주 + 미초과
+                    else:
+                        continue  # 관찰 미완 + 미초과 → 채점 보류
                     session.add(JudgmentVerification(
                         judgment_type="PEAK_SELL", source_id=tr.id,
                         symbol=tr.stock_symbol,
-                        rationale=f"정점 판단 매도 @{tr.exit_price:,.0f}",
+                        rationale=f"LLM 판단 매도 @{tr.exit_price:,.0f} ({tr.exit_reason})",
                         expected=json.dumps({"direction": "DOWN_AFTER_SELL",
                                              "sell_price": tr.exit_price}, ensure_ascii=False),
-                        actual=json.dumps({"next_close": next_close,
-                                           "diff_pct": round(diff_pct, 2)}, ensure_ascii=False),
+                        actual=json.dumps({"max_close": max_close,
+                                           "diff_pct": round(diff_pct, 2),
+                                           "days_observed": len(window),
+                                           "exit_reason": tr.exit_reason}, ensure_ascii=False),
                         verdict=verdict,
-                        score=max(0.0, min(1.0, 0.5 - diff_pct / 10)),
+                        # 놓친 상승폭 반비례: diff 0% → 1.0, +10% 이상 → 0.0
+                        score=max(0.0, min(1.0, 1.0 - max(diff_pct, 0.0) / 10.0)),
                         judged_at=tr.exit_at, verified_at=now_kst(),
                     ))
                     count += 1
@@ -483,12 +501,51 @@ class JudgmentVerifier:
             logger.warning("[검증] 적중률 조회 실패 ({}): {}", judgment_type, str(e))
             return True
 
+    async def get_peak_sell_missed_summary(self, days: int = 28) -> str:
+        """조기매도로 놓친 상승 요약 — 일일 리뷰 프롬프트 주입용
+
+        PEAK_SELL 채점의 actual.diff_pct(매도 후 5거래일 내 최고 종가 대비 상승률)를 집계.
+        표본 없으면 빈 문자열.
+        """
+        from core.database import AsyncSessionLocal
+        from models import JudgmentVerification
+
+        cutoff = now_kst() - timedelta(days=days)
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(
+                select(JudgmentVerification.verdict, JudgmentVerification.actual)
+                .where(JudgmentVerification.judgment_type == "PEAK_SELL")
+                .where(JudgmentVerification.verified_at >= cutoff)
+                .where(JudgmentVerification.verdict.in_(["CORRECT", "WRONG"]))
+            )).all()
+
+        if not rows:
+            return ""
+
+        wrong_diffs = []
+        for verdict, actual in rows:
+            if verdict != "WRONG" or not actual:
+                continue
+            try:
+                diff = float(json.loads(actual).get("diff_pct", 0))
+                wrong_diffs.append(diff)
+            except (ValueError, TypeError):
+                continue
+
+        if not wrong_diffs:
+            return f"- LLM 매도 후 5거래일 추적: {len(rows)}건 모두 적절 (조기매도 없음)"
+        return (
+            f"- LLM 매도 후 5거래일 추적: {len(rows)}건 중 조기매도 {len(wrong_diffs)}건, "
+            f"놓친 상승 평균 +{sum(wrong_diffs) / len(wrong_diffs):.1f}% "
+            f"(최대 +{max(wrong_diffs):.1f}%) — 매도 판단 시 추세 지속 가능성을 더 무겁게 볼 것"
+        )
+
     def format_stats_for_prompt(self, stats: dict) -> str:
         """리뷰 프롬프트 주입용 텍스트"""
         if not stats:
             return "아직 채점된 판단 없음 (검증 루프 초기 가동)"
         labels = {
-            "BUY_ANALYSIS": "매수 분석", "PEAK_SELL": "정점 판단 매도",
+            "BUY_ANALYSIS": "매수 분석", "PEAK_SELL": "LLM 판단 매도(조기매도 여부)",
             "MARKET_REGIME": "시장 국면", "TRADING_RULE": "트레이딩 규칙",
         }
         lines = []

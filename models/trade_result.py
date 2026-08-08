@@ -17,7 +17,9 @@ class TradeResult(Base, TimestampMixin):
     __tablename__ = "trade_results"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, unique=True, index=True)
+    # KIS 주문번호(odno)는 "일 단위"로만 유일 — UNIQUE 금지 (2026-07-30 HD현대 매수 유실 사고:
+    # 과거 다른 종목이 같은 번호를 선점해 insert가 스킵됨). 중복 판정은 (order_id+종목+당일)로 수행.
+    order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     stock_symbol: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     stock_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
@@ -60,6 +62,9 @@ class TradeResult(Base, TimestampMixin):
 
     # 체결 확인 상태: PENDING_CONFIRM → CONFIRMED / CONFIRM_FAILED
     status: Mapped[str] = mapped_column(String(20), default="CONFIRMED", index=True)
+
+    # 러너 여부 — LLM 분할 익절 후 잔량 (재시작 시 take_profit 미복원 + LLM SELL 무시)
+    is_runner: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
     entry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     exit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

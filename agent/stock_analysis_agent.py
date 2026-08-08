@@ -258,6 +258,15 @@ class StockAnalysisAgent(BaseAgent):
             if result.review_interval_min > 0:
                 kwargs["review_interval_min"] = result.review_interval_min
                 logger.info("[분석] {} 다음 재평가: {}분 후", request.symbol, result.review_interval_min)
+
+            # 러너 보호: take_profit 부활 금지 + 스탑 하향 금지 (트레일링 폭 조정만 허용)
+            th = event_detector.get_thresholds(request.symbol)
+            is_runner = th.is_runner
+            if is_runner:
+                kwargs.pop("take_profit", None)
+                if kwargs.get("stop_loss", 0) < th.stop_loss:
+                    kwargs.pop("stop_loss", None)
+
             if kwargs:
                 event_detector.set_thresholds(request.symbol, **kwargs)
                 logger.info("[분석] {} 임계값 설정: {}", request.symbol, kwargs)
@@ -275,9 +284,12 @@ class StockAnalysisAgent(BaseAgent):
                             open_positions = await repo.get_all_open()
                             for tr in open_positions:
                                 if tr.stock_symbol == request.symbol and tr.side == "BUY":
-                                    if result.target_price > 0:
+                                    # 러너: ai_target_price 갱신 스킵 (TP 부활 방지) + 스탑 하향 금지
+                                    if result.target_price > 0 and not is_runner:
                                         tr.ai_target_price = result.target_price
-                                    if result.stop_loss_price > 0:
+                                    if result.stop_loss_price > 0 and not (
+                                        is_runner and result.stop_loss_price < (tr.ai_stop_loss_price or 0)
+                                    ):
                                         tr.ai_stop_loss_price = result.stop_loss_price
                                     if result.review_interval_min > 0:
                                         tr.next_review_at = now_kst() + timedelta(minutes=result.review_interval_min)

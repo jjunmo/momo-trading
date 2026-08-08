@@ -92,6 +92,15 @@ class OrderConfirmStatus(str, Enum):
     CONFIRM_FAILED = "CONFIRM_FAILED"
 
 
+# LLM 판단 매도 exit_reason 집합 — 조기매도 게이트·PEAK_SELL 채점 공통 기준
+# (STOP_LOSS/TRAILING_STOP/DAY_CLOSE 등 코드·정책 매도는 제외)
+LLM_SELL_REASONS: frozenset[str] = frozenset({
+    "ANALYSIS_SELL",       # 사이클 내 보유 재평가 (trading_agent)
+    "HOLDINGS_REVIEW",     # 장중 정기 재평가 (scheduler)
+    "TAKE_PROFIT_REVIEW",  # 익절선 도달 재검토 (event_detector)
+})
+
+
 class ActivityType(str, Enum):
     """에이전트 활동 유형"""
     CYCLE = "CYCLE"

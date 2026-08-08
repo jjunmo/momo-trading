@@ -29,6 +29,9 @@ class StockThresholds:
     initial_stop_loss: float = 0.0
     breakeven_trigger_pct: float = 0.0
 
+    # 러너 모드 — LLM 분할 익절 후 잔량: take_profit 없음, 트레일링 전용, LLM SELL 무시
+    is_runner: bool = False
+
     # 재평가 주기 조절 (LLM이 ATR 기반 결정, 가격 변동 트리거)
     review_threshold_pct: float = 0.0
 
@@ -74,8 +77,12 @@ class PriceGuard:
             except (TypeError, ValueError):
                 pass
 
+        from dataclasses import fields as _fields
+        known = {f.name for f in _fields(StockThresholds)}
         validated = {}
         for k, v in kwargs.items():
+            if k not in known:
+                continue  # 미지원 키 무시 (strategy_type 등 — 신규 등록 시 TypeError 방지)
             if isinstance(v, str):
                 validated[k] = v
             elif isinstance(v, (int, float)) and not math.isnan(v):
@@ -136,12 +143,14 @@ class PriceGuard:
         if th.trailing_stop_pct > 0:
             if th.entry_price > 0:
                 profit_pct = (price - th.entry_price) / th.entry_price * 100
-                if (th.breakeven_trigger_pct > 0
-                        and profit_pct >= th.breakeven_trigger_pct
-                        and th.stop_loss < th.entry_price):
-                    th.stop_loss = th.entry_price
-                    logger.info("본전 보호 활성: {} 손절 → {:,.0f}원 (수익률 {:.1f}%)",
-                                symbol, th.entry_price, profit_pct)
+                if th.breakeven_trigger_pct > 0 and profit_pct >= th.breakeven_trigger_pct:
+                    # 진짜 본전 = 매입가 + 왕복 수수료·거래세 (~0.2%) — 매입가에 팔면 실손실
+                    from util.pnl_calculator import breakeven_price
+                    be = breakeven_price(th.entry_price)
+                    if th.stop_loss < be:
+                        th.stop_loss = be
+                        logger.info("본전 보호 활성: {} 손절 → {:,.0f}원 (비용 반영 본전, 수익률 {:.1f}%)",
+                                    symbol, be, profit_pct)
 
             if price > th.highest_price:
                 th.highest_price = price

@@ -128,17 +128,22 @@ class TestBuyJudgment:
 
 
 class TestPeakSellJudgment:
-    async def test_wrong_when_price_rises_after_sell(self, clean_tables):
-        """정점 매도 후 다음 종가가 더 높음 → WRONG (조기매도)"""
+    """매도 후 5거래일 지평 채점 — 최고 종가가 매도가 +2% 초과면 WRONG (조기매도)"""
+
+    async def test_wrong_early_confirm_before_horizon(self, clean_tables):
+        """관찰 2일 만에 +2% 초과 → 지평 미완이어도 WRONG 즉시 확정"""
         from analysis.feedback.judgment_verifier import judgment_verifier
 
-        exit_at = datetime.now() - timedelta(days=2)
+        exit_at = datetime.now() - timedelta(days=4)
         async with TestAsyncSessionLocal() as session:
             async with session.begin():
                 session.add(_make_trade(exit_reason="ANALYSIS_SELL", exit_at=exit_at,
                                         entry_at=exit_at - timedelta(hours=3)))
-                await _add_candle(session, "000001",
-                                  (exit_at + timedelta(days=1)).date(),
+                d0 = exit_at.date()
+                await _add_candle(session, "000001", d0 + timedelta(days=1),
+                                  high=10200.0, low=9900.0, close=10000.0)
+                # 매도가 10100 대비 +3.96% > +2% → WRONG
+                await _add_candle(session, "000001", d0 + timedelta(days=2),
                                   high=10600.0, low=10200.0, close=10500.0)
 
         count = await judgment_verifier._verify_peak_sells(lookback_days=14)
@@ -150,21 +155,25 @@ class TestPeakSellJudgment:
                 .where(JudgmentVerification.judgment_type == "PEAK_SELL")
             )).scalars().one()
             assert jv.verdict == "WRONG"
+            # score = 1 - diff/10 (diff≈3.96%)
+            assert 0.55 < jv.score < 0.65
 
-    async def test_correct_when_price_drops(self, clean_tables):
-        """정점 매도 후 다음 종가 하락 → CORRECT"""
+    async def test_correct_requires_full_horizon(self, clean_tables):
+        """5거래일 전부 +2% 이하 → CORRECT"""
         from analysis.feedback.judgment_verifier import judgment_verifier
 
-        exit_at = datetime.now() - timedelta(days=2)
+        exit_at = datetime.now() - timedelta(days=10)
         async with TestAsyncSessionLocal() as session:
             async with session.begin():
                 session.add(_make_trade(exit_reason="ANALYSIS_SELL", exit_at=exit_at,
                                         entry_at=exit_at - timedelta(hours=3)))
-                await _add_candle(session, "000001",
-                                  (exit_at + timedelta(days=1)).date(),
-                                  high=10100.0, low=9700.0, close=9800.0)
+                d0 = exit_at.date()
+                for i, close in enumerate([9800.0, 10000.0, 10100.0, 10200.0, 10250.0]):
+                    await _add_candle(session, "000001", d0 + timedelta(days=1 + i),
+                                      high=close + 100, low=close - 100, close=close)
 
-        await judgment_verifier._verify_peak_sells(lookback_days=14)
+        count = await judgment_verifier._verify_peak_sells(lookback_days=14)
+        assert count == 1
 
         async with TestAsyncSessionLocal() as session:
             jv = (await session.execute(
@@ -173,8 +182,24 @@ class TestPeakSellJudgment:
             )).scalars().one()
             assert jv.verdict == "CORRECT"
 
-    async def test_skipped_without_next_candle(self, clean_tables):
-        """다음 거래일 일봉 없음 → 채점 보류 (다음 실행 대기)"""
+    async def test_pending_when_horizon_incomplete(self, clean_tables):
+        """4일치 캔들 + 미초과 → 채점 보류 (다음 실행 대기)"""
+        from analysis.feedback.judgment_verifier import judgment_verifier
+
+        exit_at = datetime.now() - timedelta(days=6)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(_make_trade(exit_reason="ANALYSIS_SELL", exit_at=exit_at,
+                                        entry_at=exit_at - timedelta(hours=3)))
+                d0 = exit_at.date()
+                for i, close in enumerate([9800.0, 9900.0, 10000.0, 10100.0]):
+                    await _add_candle(session, "000001", d0 + timedelta(days=1 + i),
+                                      high=close + 100, low=close - 100, close=close)
+
+        assert await judgment_verifier._verify_peak_sells(lookback_days=14) == 0
+
+    async def test_skipped_without_any_candle(self, clean_tables):
+        """일봉 전혀 없음 → 채점 보류"""
         from analysis.feedback.judgment_verifier import judgment_verifier
 
         async with TestAsyncSessionLocal() as session:
@@ -182,6 +207,37 @@ class TestPeakSellJudgment:
                 session.add(_make_trade(exit_reason="ANALYSIS_SELL"))
 
         assert await judgment_verifier._verify_peak_sells(lookback_days=14) == 0
+
+    async def test_covers_all_llm_sell_reasons(self, clean_tables):
+        """HOLDINGS_REVIEW·TAKE_PROFIT_REVIEW도 채점 대상, TRAILING_STOP은 비대상"""
+        from analysis.feedback.judgment_verifier import judgment_verifier
+
+        exit_at = datetime.now() - timedelta(days=4)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                for i, reason in enumerate(
+                    ["HOLDINGS_REVIEW", "TAKE_PROFIT_REVIEW", "TRAILING_STOP"]
+                ):
+                    symbol = f"00000{i + 2}"
+                    session.add(_make_trade(
+                        stock_symbol=symbol, exit_reason=reason, exit_at=exit_at,
+                        entry_at=exit_at - timedelta(hours=3),
+                    ))
+                    # +2% 초과 상승 → LLM 매도 2건만 WRONG 채점
+                    await _add_candle(session, symbol,
+                                      exit_at.date() + timedelta(days=1),
+                                      high=10600.0, low=10200.0, close=10500.0)
+
+        count = await judgment_verifier._verify_peak_sells(lookback_days=14)
+        assert count == 2  # TRAILING_STOP 제외
+
+        async with TestAsyncSessionLocal() as session:
+            jvs = (await session.execute(
+                __import__("sqlalchemy").select(JudgmentVerification)
+                .where(JudgmentVerification.judgment_type == "PEAK_SELL")
+            )).scalars().all()
+            assert {jv.verdict for jv in jvs} == {"WRONG"}
+            assert {jv.symbol for jv in jvs} == {"000002", "000003"}
 
 
 class TestAccuracyStats:
